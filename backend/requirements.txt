@@ -1,0 +1,46 @@
+# Web API
+fastapi[standard-no-fastapi-cloud-cli]
+uvicorn[standard]
+
+# Config / schema
+pydantic
+pydantic-settings
+python-dotenv
+
+# Database: MySQL
+SQLAlchemy
+PyMySQL
+alembic
+
+# Async task: Celery + Redis
+celery[redis]
+redis
+
+# Agent orchestration
+langgraph
+langchain-core
+langchain-openai
+langchain-text-splitters
+
+# Web collection: MVP Firecrawl
+firecrawl-py
+
+# Vector DB: Milvus
+pymilvus
+
+# HTTP / parsing fallback
+httpx
+beautifulsoup4
+lxml
+trafilatura
+
+# Utils
+tenacity
+loguru
+orjson
+markdown
+
+# Dev / test
+pytest
+ruff
+black

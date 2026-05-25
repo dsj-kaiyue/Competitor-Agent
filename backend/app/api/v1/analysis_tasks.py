@@ -1,9 +1,13 @@
+from threading import Thread
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.database import get_db
-from app.graph.workflow import run_competitive_analysis
+from app.core.celery_app import CELERY_QUEUE_NAME
+from app.core.database import SessionLocal, get_db
+from app.core.redis_runtime import get_worker_heartbeat
+from app.graph.workflow import _console
 from app.schemas.agent_node import AgentLogListResponse, AgentLogResponse, AgentNodeListResponse
 from app.schemas.analysis_task import AnalysisTaskCreateRequest, AnalysisTaskCreateResponse, AnalysisTaskResponse
 from app.schemas.claim import ClaimItem, ClaimListResponse
@@ -15,20 +19,72 @@ from app.services.evidence_service import list_evidence
 from app.services.log_service import list_logs
 from app.services.qa_service import get_qa_result
 from app.services.report_service import get_report
-from app.services.task_service import DAG_EDGES, create_task, get_task, get_task_plan, list_nodes
+from app.services.task_service import DAG_EDGES, create_task, get_task, get_task_plan, list_nodes, update_task_status
 from app.worker import run_analysis_task
 
 router = APIRouter()
 
 
+def _run_analysis_in_local_thread(task_id: int) -> None:
+    def runner() -> None:
+        from app.graph.workflow import run_competitive_analysis
+        from app.services.task_service import update_task_status
+
+        db = SessionLocal()
+        try:
+            _console("local background task started", {"task_id": task_id})
+            run_competitive_analysis(db, task_id)
+            _console("local background task completed", {"task_id": task_id})
+        except Exception as exc:
+            update_task_status(db, task_id, "failed", str(exc))
+            _console("local background task failed", {"task_id": task_id, "error": str(exc)})
+        finally:
+            db.close()
+
+    Thread(target=runner, daemon=True, name=f"analysis-task-{task_id}").start()
+
+
 @router.post("", response_model=AnalysisTaskCreateResponse)
 def create_analysis_task(request: AnalysisTaskCreateRequest, db: Session = Depends(get_db)) -> AnalysisTaskCreateResponse:
+    _console("analysis task create requested", {"topic": request.task_plan.topic, "competitors": request.task_plan.competitors})
     task = create_task(db, request)
+    _console("analysis task created", {"task_id": task.id, "run_tasks_inline": settings.run_tasks_inline})
     if settings.run_tasks_inline:
+        from app.graph.workflow import run_competitive_analysis
+
         run_competitive_analysis(db, task.id)
     else:
-        run_analysis_task.delay(task.id)
+        try:
+            worker_heartbeat = get_worker_heartbeat()
+            if worker_heartbeat is None:
+                message = "Celery Worker heartbeat missing; worker is not ready to consume tasks"
+                _console("analysis task worker unavailable", {"task_id": task.id, "queue": CELERY_QUEUE_NAME})
+                if settings.fallback_to_local_thread_when_worker_unavailable:
+                    update_task_status(db, task.id, "running")
+                    _console("falling back to local background thread", {"task_id": task.id, "reason": message})
+                    _run_analysis_in_local_thread(task.id)
+                else:
+                    update_task_status(db, task.id, "failed", message)
+                    raise HTTPException(status_code=503, detail=message)
+            else:
+                async_result = run_analysis_task.apply_async(args=[task.id], queue=CELERY_QUEUE_NAME, routing_key=CELERY_QUEUE_NAME)
+                _console(
+                    "analysis task enqueued",
+                    {"task_id": task.id, "celery_task_id": async_result.id, "queue": CELERY_QUEUE_NAME, "worker": worker_heartbeat},
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _console("analysis task enqueue failed", {"task_id": task.id, "error": str(exc)})
+            if settings.fallback_to_local_thread_on_celery_error:
+                update_task_status(db, task.id, "running")
+                _console("falling back to local background thread", {"task_id": task.id})
+                _run_analysis_in_local_thread(task.id)
+            else:
+                update_task_status(db, task.id, "failed", f"Celery enqueue failed: {exc}")
+                raise HTTPException(status_code=503, detail=f"Celery/Redis enqueue failed: {exc}") from exc
     db.refresh(task)
+    _console("analysis task create response", {"task_id": task.id, "status": task.status})
     return AnalysisTaskCreateResponse(task_id=task.id, status=task.status)
 
 

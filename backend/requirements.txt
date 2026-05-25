@@ -30,6 +30,7 @@ pymilvus
 
 # HTTP / parsing fallback
 httpx
+socksio
 beautifulsoup4
 lxml
 trafilatura

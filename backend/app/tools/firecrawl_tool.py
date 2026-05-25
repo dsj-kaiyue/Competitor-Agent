@@ -11,11 +11,14 @@ class FirecrawlTool:
         if not self.api_key:
             return []
         try:
-            from firecrawl import FirecrawlApp
+            from firecrawl import V1FirecrawlApp
 
-            app = FirecrawlApp(api_key=self.api_key)
+            app = V1FirecrawlApp(api_key=self.api_key)
             result = app.search(query=query, limit=max_results)
-            return result.get("data", result) if isinstance(result, dict) else result
+            data = getattr(result, "data", None)
+            if data is None and isinstance(result, dict):
+                data = result.get("data", [])
+            return [dict(item) for item in (data or [])]
         except Exception:
             return []
 
@@ -23,9 +26,18 @@ class FirecrawlTool:
         if not self.api_key:
             return None
         try:
-            from firecrawl import FirecrawlApp
+            from firecrawl import V1FirecrawlApp
 
-            app = FirecrawlApp(api_key=self.api_key)
-            return app.scrape_url(url)
+            app = V1FirecrawlApp(api_key=self.api_key)
+            result = app.scrape_url(url, formats=["markdown"], only_main_content=True, timeout=30000)
+            if not getattr(result, "success", False):
+                return None
+            metadata = getattr(result, "metadata", None) or {}
+            return {
+                "markdown": getattr(result, "markdown", None) or "",
+                "html": getattr(result, "html", None),
+                "metadata": metadata,
+                "title": metadata.get("title") if isinstance(metadata, dict) else None,
+            }
         except Exception:
             return None

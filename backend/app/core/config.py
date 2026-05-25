@@ -26,7 +26,13 @@ class Settings(BaseSettings):
     embedding_dim: int = 1536
 
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
-    run_tasks_inline: bool = True
+    run_tasks_inline: bool = False
+    fallback_to_local_thread_on_celery_error: bool = True
+    fallback_to_local_thread_when_worker_unavailable: bool = True
+    celery_worker_heartbeat_ttl_seconds: int = 45
+    celery_worker_heartbeat_interval_seconds: int = 10
+    celery_visibility_timeout_seconds: int = 120
+    celery_queued_recovery_max_age_seconds: int = 1800
 
     @field_validator("database_url")
     @classmethod

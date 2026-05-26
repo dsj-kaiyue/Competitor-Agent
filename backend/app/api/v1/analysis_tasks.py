@@ -9,7 +9,13 @@ from app.core.database import SessionLocal, get_db
 from app.core.redis_runtime import get_worker_heartbeat
 from app.graph.workflow import _console
 from app.schemas.agent_node import AgentLogListResponse, AgentLogResponse, AgentNodeListResponse
-from app.schemas.analysis_task import AnalysisTaskCreateRequest, AnalysisTaskCreateResponse, AnalysisTaskResponse
+from app.schemas.analysis_task import (
+    AnalysisTaskCreateRequest,
+    AnalysisTaskCreateResponse,
+    AnalysisTaskHistoryItem,
+    AnalysisTaskHistoryResponse,
+    AnalysisTaskResponse,
+)
 from app.schemas.claim import ClaimItem, ClaimListResponse
 from app.schemas.evidence import EvidenceListResponse
 from app.schemas.qa import QAResultItem, QAResultResponse
@@ -19,10 +25,27 @@ from app.services.evidence_service import list_evidence
 from app.services.log_service import list_logs
 from app.services.qa_service import get_qa_result
 from app.services.report_service import get_report
-from app.services.task_service import DAG_EDGES, create_task, get_task, get_task_plan, list_nodes, update_task_status
+from app.services.task_service import DAG_EDGES, create_task, get_task, get_task_plan, list_nodes, list_tasks, update_task_status
 from app.worker import run_analysis_task
 
 router = APIRouter()
+
+
+def _to_task_response(task) -> AnalysisTaskResponse:
+    return AnalysisTaskResponse(
+        id=task.id,
+        user_input=task.user_input,
+        topic=task.topic,
+        industry=task.industry,
+        target_product=task.target_product,
+        status=task.status,
+        report_depth=task.report_depth,
+        output_language=task.output_language,
+        task_plan=get_task_plan(task),
+        error_message=task.error_message,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
 
 
 def _run_analysis_in_local_thread(task_id: int) -> None:
@@ -88,25 +111,26 @@ def create_analysis_task(request: AnalysisTaskCreateRequest, db: Session = Depen
     return AnalysisTaskCreateResponse(task_id=task.id, status=task.status)
 
 
+@router.get("", response_model=AnalysisTaskHistoryResponse)
+def get_analysis_tasks(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> AnalysisTaskHistoryResponse:
+    items = []
+    for task in list_tasks(db, limit=limit, offset=offset):
+        task_response = _to_task_response(task)
+        nodes = sorted(task.nodes, key=lambda node: node.id)
+        items.append(AnalysisTaskHistoryItem(**task_response.model_dump(), nodes=nodes))
+    return AnalysisTaskHistoryResponse(items=items)
+
+
 @router.get("/{task_id}", response_model=AnalysisTaskResponse)
 def get_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
     task = get_task(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    return AnalysisTaskResponse(
-        id=task.id,
-        user_input=task.user_input,
-        topic=task.topic,
-        industry=task.industry,
-        target_product=task.target_product,
-        status=task.status,
-        report_depth=task.report_depth,
-        output_language=task.output_language,
-        task_plan=get_task_plan(task),
-        error_message=task.error_message,
-        created_at=task.created_at,
-        updated_at=task.updated_at,
-    )
+    return _to_task_response(task)
 
 
 @router.get("/{task_id}/nodes", response_model=AgentNodeListResponse)

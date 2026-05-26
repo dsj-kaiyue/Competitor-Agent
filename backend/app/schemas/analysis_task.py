@@ -2,6 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from app.schemas.agent_node import AgentNodeResponse
 from app.schemas.task_plan import TaskPlan
 
 
@@ -28,3 +29,11 @@ class AnalysisTaskResponse(BaseModel):
     error_message: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class AnalysisTaskHistoryItem(AnalysisTaskResponse):
+    nodes: list[AgentNodeResponse]
+
+
+class AnalysisTaskHistoryResponse(BaseModel):
+    items: list[AnalysisTaskHistoryItem]

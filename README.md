@@ -337,6 +337,7 @@ Claim 与 Evidence 的多对多关联表。
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/api/v1/task-plans/parse` | 解析自然语言需求为 TaskPlan |
+| `GET` | `/api/v1/analysis-tasks` | 查询历史分析任务和各 Agent 节点状态 |
 | `POST` | `/api/v1/analysis-tasks` | 创建分析任务 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}` | 查询任务详情 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/nodes` | 查询 DAG 节点和边 |
@@ -387,9 +388,11 @@ CELERY_RESULT_BACKEND=redis://:password@43.143.122.92:6379/1
 
 FIRECRAWL_API_KEY=你的 Firecrawl Key
 
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_API_KEY=你的 LLM Key
-LLM_MODEL=deepseek-v4-flash
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_API_KEY=你的 DeepSeek Key
+LLM_MODEL=deepseek-v4-pro
+EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+EMBEDDING_API_KEY=你的 DashScope Key
 EMBEDDING_MODEL=text-embedding-v4
 EMBEDDING_DIM=1536
 

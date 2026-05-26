@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Session
 
 from app.agents.planner_agent import parse_task_plan
@@ -57,6 +58,18 @@ def create_task(db: Session, request: AnalysisTaskCreateRequest) -> AnalysisTask
 
 def get_task(db: Session, task_id: int) -> AnalysisTask | None:
     return db.get(AnalysisTask, task_id)
+
+
+def list_tasks(db: Session, limit: int = 50, offset: int = 0) -> list[AnalysisTask]:
+    return list(
+        db.scalars(
+            select(AnalysisTask)
+            .options(selectinload(AnalysisTask.nodes))
+            .order_by(AnalysisTask.created_at.desc(), AnalysisTask.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    )
 
 
 def update_task_status(db: Session, task_id: int, status: str, error_message: str | None = None) -> None:

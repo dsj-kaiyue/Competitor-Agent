@@ -3,6 +3,10 @@
     <el-header class="app-header">
       <RouterLink to="/" class="brand">Competitive Agent</RouterLink>
       <span>AI 驱动的通用竞品分析 Agent 协作系统</span>
+      <nav class="nav">
+        <RouterLink to="/">新建分析</RouterLink>
+        <RouterLink to="/history">历史记录</RouterLink>
+      </nav>
     </el-header>
     <el-main class="app-main">
       <RouterView />
@@ -47,6 +51,23 @@ a {
 .app-header span {
   color: var(--el-text-color-secondary);
   font-size: 14px;
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-left: auto;
+  font-size: 14px;
+}
+
+.nav a {
+  color: #4b5563;
+}
+
+.nav a.router-link-active {
+  color: var(--el-color-primary);
+  font-weight: 600;
 }
 
 .app-main {

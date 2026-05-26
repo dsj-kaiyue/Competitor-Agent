@@ -5,20 +5,37 @@ from app.schemas.task_plan import TaskPlan
 from app.tools.llm_client import LLMClient
 
 
-DEMO_INPUT = "请分析 Cursor、GitHub Copilot、Windsurf、Tabnine 在 AI 编程助手市场的竞品情况，重点关注产品定位、核心功能、Agent 能力、IDE 集成、价格策略、企业能力、安全合规和适用用户。"
+DEFAULT_DIMENSIONS = ["产品定位", "核心功能", "目标用户", "数据能力", "技术架构", "价格策略", "生态集成", "安全合规"]
+DEFAULT_DATA_SOURCES = ["official_website", "pricing_page", "docs", "blog", "news", "reviews"]
 
 
-def _default_task_plan() -> TaskPlan:
+def _infer_task_plan(user_input: str) -> TaskPlan:
+    cleaned = user_input.strip()
+    target_product = None
+    industry = None
+
+    match = re.search(r"分析\s*(.+?)\s*在\s*(.+?)\s*的?竞品", cleaned)
+    if match:
+        target_product = match.group(1).strip(" ，。,.")
+        industry = match.group(2).strip(" ，。,.")
+    else:
+        match = re.search(r"分析\s*(.+?)\s*的?竞品", cleaned)
+        if match:
+            target_product = match.group(1).strip(" ，。,.")
+
+    if not target_product:
+        target_product = cleaned[:80] or "待分析产品"
+
     return TaskPlan(
-        topic="AI 编程助手市场竞品分析",
-        industry="AI 编程助手 / AI IDE",
-        target_product=None,
-        competitors=["Cursor", "GitHub Copilot", "Windsurf", "Tabnine"],
-        analysis_dimensions=["产品定位", "核心功能", "Agent 能力", "IDE 集成", "价格策略", "企业能力", "安全合规", "适用用户"],
+        topic=f"{target_product}竞品分析",
+        industry=industry,
+        target_product=target_product,
+        competitors=[],
+        analysis_dimensions=DEFAULT_DIMENSIONS,
         report_depth="standard",
         output_language="zh-CN",
-        auto_discover_competitors=False,
-        data_sources=["official_website", "pricing_page", "docs", "blog", "news", "reviews"],
+        auto_discover_competitors=True,
+        data_sources=DEFAULT_DATA_SOURCES,
     )
 
 
@@ -52,16 +69,25 @@ def parse_task_plan(user_input: str) -> TaskPlan:
   "analysis_dimensions": ["string"],
   "report_depth": "simple|standard|deep",
   "output_language": "zh-CN",
-  "auto_discover_competitors": false,
+  "auto_discover_competitors": true,
   "data_sources": ["official_website","pricing_page","docs","blog","news","reviews"]
 }}
+
+规则：
+- 如果用户只给了目标产品和行业，没有明确列出竞品，competitors 输出空数组，并把 auto_discover_competitors 设为 true。
+- 不要使用示例产品或默认竞品填充结果。
+- topic、industry、target_product 必须忠实来自用户输入。
 """
     try:
         content = LLMClient().complete(prompt, system="你只输出合法 JSON。")
         data = _json_from_text(content)
         plan = TaskPlan(**data)
-        if not plan.competitors or not plan.analysis_dimensions:
-            return _default_task_plan()
+        if not plan.analysis_dimensions:
+            plan.analysis_dimensions = DEFAULT_DIMENSIONS
+        if not plan.data_sources:
+            plan.data_sources = DEFAULT_DATA_SOURCES
+        if not plan.competitors:
+            plan.auto_discover_competitors = True
         return plan
     except Exception:
-        return _default_task_plan()
+        return _infer_task_plan(user_input)

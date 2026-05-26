@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str = "gpt-4.1-mini"
+    embedding_base_url: str | None = None
+    embedding_api_key: str | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
 

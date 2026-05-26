@@ -78,9 +78,14 @@ async function handleCreate() {
         <p>从一句话输入生成 TaskPlan，并执行可观测的多 Agent DAG。</p>
         <p class="api-base">API：{{ API_BASE_URL }}</p>
       </div>
-      <el-button type="primary" :loading="parsing" :disabled="creating" @click="handleParse">
-        解析需求
-      </el-button>
+      <div class="actions">
+        <RouterLink to="/history">
+          <el-button>历史记录</el-button>
+        </RouterLink>
+        <el-button type="primary" :loading="parsing" :disabled="creating" @click="handleParse">
+          解析需求
+        </el-button>
+      </div>
     </section>
 
     <el-input v-model="userInput" type="textarea" :rows="5" resize="none" />
@@ -106,11 +111,16 @@ async function handleCreate() {
 }
 
 .toolbar,
-.section-header {
+.section-header,
+.actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 16px;
+}
+
+.toolbar,
+.section-header {
+  justify-content: space-between;
 }
 
 h1,

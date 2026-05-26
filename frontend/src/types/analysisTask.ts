@@ -1,4 +1,5 @@
 import type { TaskPlan } from './taskPlan'
+import type { AgentNode } from './agentNode'
 
 export interface AnalysisTask {
   id: number
@@ -13,4 +14,8 @@ export interface AnalysisTask {
   error_message?: string | null
   created_at: string
   updated_at: string
+}
+
+export interface AnalysisTaskHistoryItem extends AnalysisTask {
+  nodes: AgentNode[]
 }

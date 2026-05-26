@@ -153,14 +153,50 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
 
     def collector(node: AgentNode) -> None:
         plan = get_task_plan(task)
+        if plan.auto_discover_competitors and not plan.competitors:
+            discovery_query = f"{plan.target_product or plan.topic} competitors alternatives {plan.industry or ''}".strip()
+            _console("competitor discovery started", {"task_id": task_id, "query": discovery_query})
+            discovery_results = web.search(discovery_query, max_results=8)
+            discovery_context = "\n".join(
+                f"- title={item.get('title')}; url={item.get('url')}; description={item.get('description') or item.get('markdown') or ''}"
+                for item in discovery_results
+            )
+            prompt = f"""
+请从搜索结果中识别与目标产品最相关的直接竞品或替代产品。
+目标产品：{plan.target_product or plan.topic}
+行业：{plan.industry}
+搜索结果：
+{discovery_context}
+
+只输出 JSON 数组，最多 6 个产品名。不要包含目标产品本身，不要输出解释。
+"""
+            try:
+                discovered = _json_from_text(llm.complete(prompt, system="你只输出合法 JSON。"))
+                if isinstance(discovered, dict):
+                    discovered = discovered.get("competitors", [])
+                plan.competitors = [
+                    str(name).strip()
+                    for name in discovered
+                    if str(name).strip() and str(name).strip().lower() != str(plan.target_product or "").strip().lower()
+                ][:6]
+            except Exception as exc:
+                _console("competitor discovery failed", {"task_id": task_id, "error": str(exc)})
+                plan.competitors = []
+            if not plan.competitors:
+                raise RuntimeError("Auto competitor discovery did not produce competitors")
+            task.task_plan_json = plan.model_dump()
+            state["competitors"] = plan.competitors
+            add_log(db, task_id, node.id, "Auto discovered competitors", {"competitors": plan.competitors})
+            _console("competitor discovery completed", {"task_id": task_id, "competitors": plan.competitors})
+
         saved_ids: list[int] = []
         seen_urls: set[str] = set()
         for competitor in plan.competitors:
             _console("collector competitor started", {"task_id": task_id, "competitor": competitor})
             queries = [
-                f"{competitor} AI coding assistant official product features",
+                f"{competitor} {plan.industry or plan.topic} official product features",
                 f"{competitor} pricing plans official",
-                f"{competitor} enterprise security compliance privacy official",
+                f"{competitor} docs enterprise security compliance privacy official",
             ]
             competitor_saved = 0
             for query in queries:

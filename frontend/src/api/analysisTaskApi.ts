@@ -1,6 +1,6 @@
 import { http } from './http'
 import type { AgentLog, AgentNode, DagEdge } from '@/types/agentNode'
-import type { AnalysisTask } from '@/types/analysisTask'
+import type { AnalysisTask, AnalysisTaskHistoryItem } from '@/types/analysisTask'
 import type { ClaimItem } from '@/types/claim'
 import type { EvidenceItem } from '@/types/evidence'
 import type { QAResult } from '@/types/qa'
@@ -13,6 +13,13 @@ export async function createAnalysisTask(user_input: string, task_plan: TaskPlan
     task_plan,
   })
   return data
+}
+
+export async function getAnalysisTasks(params?: { limit?: number; offset?: number }) {
+  const { data } = await http.get<{ items: AnalysisTaskHistoryItem[] }>('/analysis-tasks', {
+    params,
+  })
+  return data.items
 }
 
 export async function getAnalysisTask(taskId: number) {

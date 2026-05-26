@@ -1,25 +1,34 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import ClaimList from '@/components/ClaimList.vue'
 import QaResultPanel from '@/components/QaResultPanel.vue'
 import ReportMarkdown from '@/components/ReportMarkdown.vue'
-import { getTaskClaims, getTaskQa, getTaskReport } from '@/api/analysisTaskApi'
+import { getTaskClaims, getTaskQa, getTaskReportDetail } from '@/api/analysisTaskApi'
 import type { ClaimItem } from '@/types/claim'
 import type { QAResult } from '@/types/qa'
-import type { ReportItem } from '@/types/report'
+import type { ReportEvidenceItem, ReportItem } from '@/types/report'
 
 const taskId = Number(useRoute().params.id)
 const report = ref<ReportItem | null>(null)
 const qa = ref<QAResult | null>(null)
 const claims = ref<ClaimItem[]>([])
+const evidence = ref<ReportEvidenceItem[]>([])
+
+const claimById = computed(() => new Map(claims.value.map((claim) => [claim.id, claim])))
+const evidenceById = computed(() => new Map(evidence.value.map((item) => [item.id, item])))
+const sections = computed(() => report.value?.report_json?.sections || [])
 
 onMounted(async () => {
-  ;[report.value, qa.value, claims.value] = await Promise.all([
-    getTaskReport(taskId),
+  const [detail, qaResult, claimItems] = await Promise.all([
+    getTaskReportDetail(taskId),
     getTaskQa(taskId),
     getTaskClaims(taskId),
   ])
+  report.value = detail.report
+  qa.value = detail.qa_result || qaResult
+  claims.value = detail.claims?.length ? detail.claims : claimItems
+  evidence.value = detail.evidence || []
 })
 </script>
 
@@ -36,6 +45,49 @@ onMounted(async () => {
     </section>
 
     <el-empty v-if="!report" description="暂无报告" />
+    <section v-else-if="sections.length" class="report-json">
+      <article v-for="section in sections" :key="section.section_id" class="report-section">
+        <h2>{{ section.title }}</h2>
+        <div v-for="paragraph in section.paragraphs" :key="paragraph.paragraph_id" class="paragraph-block">
+          <p>{{ paragraph.text }}</p>
+          <el-collapse class="provenance">
+            <el-collapse-item
+              :title="`查看依据：${paragraph.claim_ids?.length || 0} 条 Claim，${paragraph.evidence_ids?.length || 0} 条 Evidence`"
+              :name="paragraph.paragraph_id"
+            >
+              <div class="provenance-grid">
+                <div>
+                  <h3>相关 Claim</h3>
+                  <ul>
+                    <li v-for="claimId in paragraph.claim_ids" :key="claimId">
+                      <strong>#{{ claimId }}</strong>
+                      <span>{{ claimById.get(claimId)?.claim_text || '未找到 Claim' }}</span>
+                      <el-tag size="small" effect="plain">{{ claimById.get(claimId)?.confidence ?? '-' }}</el-tag>
+                    </li>
+                  </ul>
+                </div>
+                <div>
+                  <h3>相关 Evidence</h3>
+                  <ul>
+                    <li v-for="evidenceId in paragraph.evidence_ids" :key="evidenceId">
+                      <a :href="evidenceById.get(evidenceId)?.source_url" target="_blank" rel="noreferrer">
+                        {{
+                          evidenceById.get(evidenceId)?.source_title ||
+                          evidenceById.get(evidenceId)?.source_url ||
+                          `Evidence #${evidenceId}`
+                        }}
+                      </a>
+                      <el-tag size="small">{{ evidenceById.get(evidenceId)?.source_type || '-' }}</el-tag>
+                      <p>{{ evidenceById.get(evidenceId)?.chunk_text }}</p>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </el-collapse-item>
+          </el-collapse>
+        </div>
+      </article>
+    </section>
     <ReportMarkdown v-else :markdown="report.content_markdown" />
 
     <section class="section">
@@ -55,6 +107,54 @@ onMounted(async () => {
 .section {
   display: grid;
   gap: 18px;
+}
+
+.report-json,
+.report-section,
+.paragraph-block {
+  display: grid;
+  gap: 14px;
+}
+
+.report-section {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+
+.paragraph-block > p {
+  margin: 0;
+  line-height: 1.8;
+}
+
+.provenance {
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.provenance-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.provenance-grid ul {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.provenance-grid li {
+  line-height: 1.6;
+}
+
+.provenance-grid li span,
+.provenance-grid li a {
+  margin: 0 8px;
+}
+
+.provenance-grid li p {
+  margin: 6px 0 0;
+  color: var(--el-text-color-secondary);
 }
 
 .toolbar {
@@ -80,5 +180,11 @@ h2 {
 p {
   margin-top: 6px;
   color: var(--el-text-color-secondary);
+}
+
+@media (max-width: 760px) {
+  .provenance-grid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

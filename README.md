@@ -1,71 +1,106 @@
 # Competitive Agent
 
-AI 驱动的通用竞品分析 Agent 协作系统。项目把“一句话竞品分析需求”解析成结构化任务计划，再通过多个 Agent 按 DAG 流程完成资料采集、证据抽取、结构化分析、报告生成和质量检查。任务状态、节点进度、Agent 日志、网页来源、证据、结论、报告和 QA 结果都会落到 MySQL，证据向量会写入 Milvus，前端通过 Vue 实时展示完整执行过程。
+AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话竞品分析需求解析成结构化任务计划，然后通过多 Agent 协作完成资料采集、证据抽取、向量检索、结构化分析、报告生成、QA 复核和报告溯源。
 
-当前版本已经接入真实外部服务：
+这份 README 记录当前项目的真实状态，重点覆盖今晚完成的核心升级，适合拿去和 ChatGPT 继续讨论下一步行动方案。
 
-- Firecrawl：搜索和抓取公开网页。
-- LLM：解析需求、生成 Claim、撰写报告、执行 QA 复核。
-- Embedding：把网页证据切片转成向量。
-- Milvus：保存 Evidence Chunk 向量。
-- Redis + Celery：异步执行长任务。
+## 当前版本状态
+
+当前版本已经跑通真实主链路：
+
+- Firecrawl：公开网页搜索和抓取。
+- DeepSeek 兼容 OpenAI API：需求解析、Claim 生成、报告撰写、QA 复核。
+- 阿里 DashScope `text-embedding-v4`：Evidence Chunk 向量化。
+- Milvus：Evidence Chunk 向量存储与 RAG 检索。
+- MySQL：任务、节点、日志、网页、证据、结论、报告、QA 结果的主存储。
+- Redis + Celery：长任务异步执行。
+- Vue 3 + VueFlow：前端展示任务 DAG、并行 worker、日志、证据链、报告和历史任务。
+
+今晚新增或升级：
+
+- 资料采集 Agent 支持并行 Firecrawl search/scrape worker。
+- 证据抽取 Agent 支持并行 embedding + Milvus upsert worker。
+- DAG 页面可视化展示并行采集 worker 和并行证据 worker。
+- Analyst Agent 改为 Milvus RAG 检索，不再只按竞品从 MySQL 全量读取 evidence。
+- ReportWriter 输出结构化 `report_json.sections`，报告段落可展开 Claim 和 Evidence。
+- QA 结果扩展为带 `next_action / target_nodes / revision_round` 的结构化 payload。
+- QA 不通过时最多返工 1 轮，可回流到 collector、analyst 或 report_writer。
+- DAG 页面支持 QA 回流虚线边。
+- 首页新增历史分析记录入口，历史页可查看以往任务、节点状态、报告和证据链。
+- Planner 修复了 demo fallback 问题，不再把任意需求错误解析成 AI 编程工具竞品。
 
 ## 整体架构
 
 ```text
 用户浏览器
-   |
-   | Vue 3 / Axios
-   v
+  |
+  | Vue 3 / Axios / VueFlow
+  v
 FastAPI API
-   |
-   | 1. 解析需求 / 创建任务
-   | 2. 查询任务、DAG、日志、证据、报告
-   v
-MySQL <---------------------------+
-   |                              |
-   | 保存任务、节点、日志、证据、结论 |
-   |                              |
-Redis Queue                       |
-   |                              |
-   v                              |
-Celery Worker                     |
-   |                              |
-   | 执行多 Agent DAG              |
-   v                              |
-Firecrawl / LLM / Embedding / Milvus
+  |
+  | 创建任务、查询任务、DAG、日志、证据、报告
+  v
+MySQL  <---------------------------------------------+
+  |                                                   |
+  | 保存所有可审计业务数据                              |
+  |                                                   |
+Redis Broker / Worker Heartbeat                      |
+  |                                                   |
+  v                                                   |
+Celery Worker                                        |
+  |                                                   |
+  | 执行多 Agent DAG                                  |
+  v                                                   |
+Firecrawl -> SourceDocument -> EvidenceChunk -> Milvus
+                         |             ^
+                         |             |
+                         +--> Analyst RAG
+                                  |
+                                  v
+                          Claim -> Report -> QA
 ```
 
-核心思想是把长时间运行的分析流程从 HTTP 请求中拆出去。前端创建任务后立即拿到 `task_id`，随后轮询后端接口展示 DAG 节点状态和 Agent 日志；Celery Worker 在后台执行真实采集、分析和写库。
+核心设计原则：
+
+- HTTP 请求只创建任务和查询状态，不阻塞等待完整分析。
+- Celery Worker 执行真实长任务。
+- MySQL 是最终业务数据来源。
+- Redis 只做队列和运行态心跳。
+- Milvus 只做向量检索，Evidence 原文仍以 MySQL 为准。
+- 前端通过轮询任务、节点和日志接口展示动态执行过程。
 
 ## 技术框架
 
-### 前端
-
-- Vue 3 + TypeScript：页面和状态组织。
-- Vite：开发服务器和构建工具。
-- Element Plus：表单、按钮、折叠面板、时间线、标签等 UI 组件。
-- VueFlow：展示 Agent DAG。
-- Axios：调用后端 API。
-- markdown-it：渲染 Markdown 报告。
-
 ### 后端
 
-- FastAPI：REST API 服务。
-- Pydantic / pydantic-settings：请求响应 Schema 和环境变量配置。
-- SQLAlchemy：ORM 模型和数据库访问。
-- PyMySQL：连接 MySQL。
+- FastAPI：REST API。
+- Pydantic / pydantic-settings：Schema 和环境变量配置。
+- SQLAlchemy：ORM。
+- PyMySQL：MySQL 驱动。
 - Alembic：数据库迁移。
-- Celery：后台异步任务执行。
-- Redis：Celery Broker、Worker 心跳。
-- pymilvus：写入和查询 Milvus 向量库。
-- langchain-openai / openai：调用 OpenAI 兼容 LLM 和 Embedding API。
+- Celery：异步任务执行。
+- Redis：Celery Broker、Worker 心跳和队列恢复。
+- pymilvus：Milvus 写入和检索。
+- OpenAI 兼容 SDK：DeepSeek Chat 模型与 DashScope embedding 模型调用。
+- Firecrawl SDK：网页搜索与抓取。
 
-### 数据存储
+### 前端
 
-- MySQL：系统主数据库，保存可审计业务数据。
-- Milvus：向量数据库，保存 Evidence Chunk 的 embedding。
-- Redis：消息队列和 Worker 在线心跳，不保存业务最终结果。
+- Vue 3 + TypeScript。
+- Vite。
+- Element Plus。
+- VueFlow。
+- Axios。
+- markdown-it。
+
+### 基础设施
+
+- MySQL：主业务库。
+- Redis：消息队列。
+- Milvus：向量库。
+- Firecrawl：公开网页采集。
+- DeepSeek：LLM。
+- DashScope：Embedding。
 
 ## 项目结构
 
@@ -73,72 +108,111 @@ Firecrawl / LLM / Embedding / Milvus
 .
 ├── backend/
 │   ├── app/
-│   │   ├── api/          # FastAPI 路由
-│   │   ├── agents/       # Planner Agent 等 Agent 入口
-│   │   ├── core/         # 配置、数据库、Celery、日志、Redis 运行态
-│   │   ├── graph/        # 多 Agent DAG 工作流
-│   │   ├── models/       # SQLAlchemy 数据模型
-│   │   ├── schemas/      # Pydantic API Schema
-│   │   ├── services/     # 任务、日志、证据、报告等业务服务
-│   │   └── tools/        # Firecrawl / Milvus / LLM 工具层
-│   ├── alembic/          # Alembic 迁移
+│   │   ├── agents/                 # Planner Agent
+│   │   ├── api/v1/                 # FastAPI API
+│   │   ├── core/                   # config / database / celery / redis runtime / logging
+│   │   ├── graph/                  # 多 Agent workflow
+│   │   ├── models/                 # SQLAlchemy 模型
+│   │   ├── schemas/                # Pydantic Schema
+│   │   ├── services/               # task / log / evidence / RAG retriever / report / QA 服务
+│   │   └── tools/                  # Firecrawl / LLM / Milvus 工具封装
+│   ├── alembic/
 │   ├── requirements.txt
-│   └── .env              # 本地后端配置，不提交
+│   └── .env                        # 本地配置，不提交
 ├── frontend/
 │   ├── src/
-│   │   ├── api/          # Axios API 封装
-│   │   ├── components/   # DAG、证据、报告、QA 等组件
+│   │   ├── api/                    # API 封装
+│   │   ├── components/             # DAG、QA、Claim、Evidence、Markdown 组件
 │   │   ├── router/
-│   │   ├── stores/
 │   │   ├── types/
-│   │   └── views/
+│   │   └── views/                  # 创建页、详情页、历史页、报告页、证据页
 │   └── package.json
-└── competitive_agent_system_README.md
+└── document/
+    └── tonight_core_improvements_for_codex.md
 ```
 
-## Agent 设计
+## Agent 与 DAG 设计
 
-系统当前固定创建 9 个 DAG 节点。节点定义在 `backend/app/services/task_service.py`，执行逻辑在 `backend/app/graph/workflow.py`。
+系统会为每个分析任务创建 9 个持久化 Agent 节点，定义在 `backend/app/services/task_service.py`，执行逻辑在 `backend/app/graph/workflow.py`。
 
-| node_key | Agent | 作用 | 主要输入 | 主要输出 |
-| --- | --- | --- | --- | --- |
-| `planner` | 任务规划 Agent | 把用户输入解析为结构化 TaskPlan | `user_input` | 竞品列表、行业、分析维度、报告深度 |
-| `collector` | 资料采集 Agent | 按竞品生成搜索 query，调用 Firecrawl Search / Scrape | TaskPlan | `source_document` |
-| `evidence_extractor` | 证据抽取 Agent | 清洗网页文本、切片、生成 embedding、写入 MySQL 和 Milvus | `source_document` | `evidence_chunk`、Milvus 向量 |
-| `feature_analysis` | 功能分析 Agent | 基于证据分析产品定位、功能、IDE/Agent 能力 | `evidence_chunk` | feature 类型 `claim` |
-| `pricing_analysis` | 价格分析 Agent | 分析套餐、价格策略、个人和团队商业化 | `evidence_chunk` | pricing 类型 `claim` |
-| `market_analysis` | 市场分析 Agent | 分析用户群体、市场定位、企业能力 | `evidence_chunk` | market 类型 `claim` |
-| `security_analysis` | 安全合规分析 Agent | 分析隐私、安全、合规、企业治理 | `evidence_chunk` | security 类型 `claim` |
-| `report_writer` | 报告撰写 Agent | 基于 Claim 写 Markdown 竞品分析报告 | `claim`、`claim_evidence` | `report` |
-| `qa` | 质量检查 Agent | 规则检查 + LLM 复核报告质量和证据支撑 | `report`、`claim` | `qa_result` |
+| node_key | Agent | 职责 | 主要输出 |
+| --- | --- | --- | --- |
+| `planner` | 任务规划 Agent | 将用户自然语言解析为 TaskPlan；必要时自动发现竞品 | `task_plan_json` |
+| `collector` | 资料采集 Agent | 生成搜索 query，调用 Firecrawl search/scrape | `source_document` |
+| `evidence_extractor` | 证据抽取 Agent | 清洗网页、切 chunk、embedding、写 Milvus | `evidence_chunk` |
+| `feature_analysis` | 功能分析 Agent | 基于 RAG evidence 生成产品/功能 Claim | `claim` |
+| `pricing_analysis` | 价格分析 Agent | 基于 RAG evidence 生成价格 Claim | `claim` |
+| `market_analysis` | 市场分析 Agent | 基于 RAG evidence 生成市场 Claim | `claim` |
+| `security_analysis` | 安全合规分析 Agent | 基于 RAG evidence 生成安全合规 Claim | `claim` |
+| `report_writer` | 报告撰写 Agent | 基于 Claim 生成结构化报告 JSON 和 Markdown | `report` |
+| `qa` | QA Agent | 规则检查 + LLM 复核，必要时触发一次返工 | `qa_result` |
 
-### DAG 顺序
+### 逻辑 DAG
 
 ```text
 planner
-  -> collector
-  -> evidence_extractor
-  -> feature_analysis
-  -> pricing_analysis
-  -> market_analysis
-  -> security_analysis
-  -> report_writer
-  -> qa
+  |
+collector
+  |
+evidence_extractor
+  |---------------- feature_analysis
+  |---------------- pricing_analysis
+  |---------------- market_analysis
+  |---------------- security_analysis
+                           |
+                    report_writer
+                           |
+                          qa
 ```
 
-每个节点执行时都会更新 `agent_node.status`，并写入 `agent_run_log`。前端任务详情页通过轮询 `/analysis-tasks/{task_id}`、`/nodes`、`/logs` 实时展示流程。
+前端会把四个 Analyst 显示为并行分支。当前后端中四个 Analyst 仍按顺序执行，但每个 Analyst 已经使用 Milvus RAG 检索证据。
 
-## 数据流转
+### 运行时并行 worker 可视化
 
-### 1. 解析需求
+今晚新增了两类虚拟 worker：
+
+```text
+collector
+  |-- collector_worker_1
+  |-- collector_worker_2
+  |-- collector_worker_3
+  |-- collector_worker_4
+
+evidence_extractor
+  |-- evidence_worker_1
+  |-- evidence_worker_2
+  |-- evidence_worker_3
+  |-- evidence_worker_4
+```
+
+这些 worker 是运行时可视化节点：
+
+- 不写入 `agent_node` 表。
+- 后端 `/analysis-tasks/{task_id}/nodes` 动态追加。
+- 数量来自 `.env` 配置。
+- 状态跟随父 Agent：父节点 `running` 时 worker 显示 `running`，父节点 `success` 时 worker 显示 `success`。
+- 主要用于让用户看到资料采集和证据抽取确实是并行执行。
+
+配置：
+
+```env
+COLLECTOR_MAX_WORKERS=4
+EVIDENCE_EXTRACTOR_MAX_WORKERS=4
+```
+
+如果外部服务限流，可以调小；如果网络和 API 稳定，可以逐步调大。
+
+## 当前数据流
+
+### 1. 需求解析
 
 前端调用：
 
-```text
+```http
 POST /api/v1/task-plans/parse
 ```
 
-后端使用 Planner Agent 调用 LLM，把自然语言解析成 TaskPlan。TaskPlan 包含：
+Planner Agent 输出 TaskPlan：
 
 - `topic`
 - `industry`
@@ -148,12 +222,19 @@ POST /api/v1/task-plans/parse
 - `report_depth`
 - `output_language`
 - `auto_discover_competitors`
+- `data_sources`
 
-### 2. 创建分析任务
+重要修复：
+
+- 以前 LLM 解析失败会 fallback 到 AI 编程助手 demo 数据。
+- 现在 fallback 会根据用户输入推断目标产品和行业，不再硬编码 Cursor / Copilot / Windsurf / Tabnine。
+- 如果用户只给目标产品和行业，不给竞品，则 `auto_discover_competitors=true`，collector 会自动搜索竞品。
+
+### 2. 创建任务
 
 前端调用：
 
-```text
+```http
 POST /api/v1/analysis-tasks
 ```
 
@@ -162,37 +243,314 @@ POST /api/v1/analysis-tasks
 - 1 条 `analysis_task`
 - 9 条 `agent_node`
 
-如果 Worker 心跳存在，任务会进入 Redis 队列 `competitor_agent_analysis`；如果开发环境没有 Worker 或 Redis 暂时不可用，会按配置降级到本地后台线程执行。
+然后：
 
-### 3. Worker 执行 DAG
+- 如果 Celery Worker 心跳存在，任务进入 Redis 队列 `competitor_agent_analysis`。
+- 如果 Worker 不可用且 fallback 配置开启，后端会降级到本地后台线程。
 
-Celery Worker 收到任务后调用：
+### 3. 资料采集
+
+Collector 对每个竞品生成 query：
 
 ```text
-run_competitive_analysis(db, task_id)
+{competitor} {industry/topic} official product features
+{competitor} pricing plans official
+{competitor} docs enterprise security compliance privacy official
 ```
 
-执行过程：
+若 QA 返工要求补采，还会追加 QA 生成的 follow-up query。
 
-1. `planner` 重新生成或校准 TaskPlan。
-2. `collector` 对每个竞品生成搜索 query，Firecrawl 搜索并抓取网页。
-3. 抓取结果写入 `source_document`。
-4. `evidence_extractor` 清洗网页正文，按约 1400 字符切片。
-5. 每个切片调用 embedding。
-6. 每个切片写入 `evidence_chunk`，向量写入 Milvus collection `evidence_chunks`。
-7. 各分析 Agent 用 evidence context 调 LLM，生成结构化 Claim。
-8. Claim 与 Evidence 通过 `claim_evidence` 建立引用关系。
-9. `report_writer` 基于 Claim 生成 Markdown 报告。
-10. `qa` 做证据完整性、置信度、维度覆盖检查，并调用 LLM 复核。
+今晚已改为并行：
 
-### 4. 前端展示
+1. 每个竞品内部并发执行多个 Firecrawl search。
+2. URL 去重。
+3. 每个竞品最多抓取 5 个 URL。
+4. 并发 scrape URL。
+5. 主线程统一写入 `source_document`。
 
-前端主要页面：
+这样避免跨线程共享 SQLAlchemy Session。
 
-- 创建页：输入需求、解析 TaskPlan、创建任务。
-- 任务详情页：展示任务状态、DAG、节点卡片、按 Agent 折叠的日志。
-- 证据链页：查看 `evidence_chunk` 和来源 URL。
-- 报告页：查看 Markdown 报告、QA 结果、Claim。
+### 4. 证据抽取与向量化
+
+Evidence Extractor 执行：
+
+1. 读取 `source_document`。
+2. 清洗 Markdown / HTML 文本。
+3. 按约 1400 字符切片，overlap 约 180。
+4. 先创建 `evidence_chunk` 行。
+5. 并发调用 embedding。
+6. 并发写入 Milvus。
+7. 主线程更新 `evidence_chunk.milvus_vector_id`。
+
+Milvus collection：
+
+```text
+evidence_chunks
+```
+
+Milvus 字段：
+
+```text
+id
+task_id
+chunk_id
+competitor_name
+source_type
+source_url
+embedding
+```
+
+线程中只调用外部 IO，不使用 DB Session。
+
+### 5. Milvus RAG 检索
+
+新增服务：
+
+```text
+backend/app/services/evidence_retriever.py
+```
+
+接口：
+
+```python
+EvidenceRetriever.search(
+    task_id,
+    query,
+    competitor_name=None,
+    source_type=None,
+    top_k=8,
+    node_id=None,
+)
+```
+
+执行逻辑：
+
+1. 用 embedding 模型生成 query vector。
+2. 用 Milvus filter 限定 `task_id`。
+3. 如果指定 `competitor_name`，继续过滤竞品。
+4. 如果指定 `source_type`，继续过滤来源类型。
+5. Milvus 返回 `chunk_id`。
+6. 回 MySQL 查询 `evidence_chunk` 原文。
+7. 按 Milvus score 顺序返回。
+8. Milvus 异常时 fallback 到 MySQL。
+9. 检索过程写入 `agent_run_log`。
+
+日志 payload 示例：
+
+```json
+{
+  "retrieval_mode": "milvus_rag",
+  "query": "Cursor pricing plans subscription team enterprise billing official",
+  "competitor_name": "Cursor",
+  "top_k": 8,
+  "retrieved_chunk_ids": [1, 2, 3],
+  "fallback_used": false
+}
+```
+
+fallback 示例：
+
+```json
+{
+  "retrieval_mode": "mysql_fallback",
+  "reason": "Milvus search failed: ...",
+  "retrieved_chunk_ids": [1, 2, 3]
+}
+```
+
+### 6. Claim 生成
+
+四个 Analyst 分别构造不同 query：
+
+| Agent | query 方向 | source_type 偏好 |
+| --- | --- | --- |
+| `feature_analysis` | product positioning, core features, topic, dimension | 无强制 |
+| `pricing_analysis` | pricing, plans, subscription, team, enterprise, official | `pricing_page` |
+| `market_analysis` | target users, market positioning, enterprise teams, strategy | 无强制 |
+| `security_analysis` | security, privacy, compliance, data protection, training data policy | 无强制 |
+
+LLM 输出 Claim JSON：
+
+```json
+[
+  {
+    "claim_text": "中文结论",
+    "evidence_ids": [101, 102],
+    "confidence": 0.86,
+    "risk_level": "low"
+  }
+]
+```
+
+如果 LLM 没返回 `evidence_ids`，系统默认绑定本次 RAG 检索的 top evidence。
+
+Claim 只允许绑定本次传给 LLM 的 evidence，避免把全量 evidence 都挂上去。
+
+### 7. 报告生成与段落溯源
+
+ReportWriter 不再只让 LLM 输出 Markdown，而是要求 LLM 输出结构化 JSON：
+
+```json
+{
+  "title": "竞品分析报告",
+  "sections": [
+    {
+      "section_id": "executive_summary",
+      "title": "执行摘要",
+      "paragraphs": [
+        {
+          "paragraph_id": "executive_summary_p1",
+          "text": "关键结论文本",
+          "claim_ids": [101, 102],
+          "evidence_ids": [201, 202]
+        }
+      ]
+    }
+  ],
+  "mode": "firecrawl_llm_milvus_rag"
+}
+```
+
+注意：
+
+- LLM 只负责输出 `claim_ids`。
+- 后端根据 `claim_evidence` 自动补齐 `evidence_ids`。
+- Markdown 由 `report_json` 渲染生成。
+- 如果 LLM 输出 JSON 失败，后端会 fallback 生成基础结构化报告。
+
+前端报告页支持：
+
+- 按 section / paragraph 展示报告。
+- 每个段落显示“查看依据：N 条 Claim，M 条 Evidence”。
+- 点击展开后显示相关 Claim、置信度、Evidence 来源 URL、source_type 和原文片段。
+
+### 8. QA 反馈闭环
+
+QA Agent 至少检查：
+
+- 每个核心 Claim 是否绑定 Evidence。
+- `pricing` Claim 是否优先有 `official_website` / `pricing_page` 来源。
+- `security` Claim 是否优先有 `official_website` / `docs` / `security` / `enterprise` 来源。
+- 报告是否覆盖用户选择的分析维度。
+- Claim `confidence < 0.6` 是否标记 weak evidence。
+- 报告是否为空、过短或缺少结构。
+
+`qa_result.issues_json` 现在保存结构化 payload：
+
+```json
+{
+  "passed": false,
+  "score": 0.72,
+  "issues": [
+    {
+      "type": "weak_evidence",
+      "severity": "medium",
+      "message": "价格 Claim 缺少官方价格页证据",
+      "related_claim_id": 12,
+      "related_competitor": "Example",
+      "related_dimension": "pricing",
+      "suggested_action": "recollect",
+      "target_node": null,
+      "search_query": "Example pricing plans official"
+    }
+  ],
+  "next_action": "recollect",
+  "target_nodes": ["collector"],
+  "revision_reason": "价格 Claim 缺少官方价格页证据",
+  "followup_queries": ["Example pricing plans official"],
+  "revision_round": 0
+}
+```
+
+返工规则：
+
+- 最多返工 1 轮。
+- `recollect`：回流到 collector，再 evidence_extractor，再目标 analyst，再 report_writer，再 qa。
+- `reanalyze`：回流到目标 analyst，再 report_writer，再 qa。
+- `rewrite`：回流到 report_writer，再 qa。
+- 返工会追加日志，不删除第一次执行日志。
+- 前端 DAG 会展示 `qa -> target_node` 的橙色虚线回流边。
+
+## 前端页面
+
+### 创建页
+
+文件：
+
+```text
+frontend/src/views/TaskCreateView.vue
+```
+
+能力：
+
+- 输入自然语言需求。
+- 点击解析需求。
+- 展示并可编辑 TaskPlan。
+- 创建分析任务。
+- 进入任务详情。
+- 提供历史记录入口。
+
+### 任务详情页
+
+文件：
+
+```text
+frontend/src/views/TaskDetailView.vue
+frontend/src/components/DagFlow.vue
+```
+
+能力：
+
+- 展示任务状态。
+- 展示 DAG。
+- 展示并行 collector worker 和 evidence worker。
+- 展示四个 Analyst 分支。
+- 展示 QA 回流虚线边。
+- 展示按 Agent 分组的日志。
+- 日志按时间倒序显示，最新动态在上方。
+- 同一 Agent 的日志可折叠。
+
+### 历史记录页
+
+文件：
+
+```text
+frontend/src/views/HistoryView.vue
+```
+
+能力：
+
+- 查看历史分析任务。
+- 查看任务状态、节点状态统计。
+- 跳转任务详情、报告、证据链。
+
+### 证据链页
+
+文件：
+
+```text
+frontend/src/views/EvidenceView.vue
+```
+
+能力：
+
+- 查看 Evidence Chunk。
+- 查看来源 URL、标题、source_type、竞品、可信度。
+
+### 报告页
+
+文件：
+
+```text
+frontend/src/views/ReportView.vue
+```
+
+能力：
+
+- 展示结构化报告。
+- 按段落展开 Claim 和 Evidence。
+- 展示 QA 结果。
+- 展示结构化 Claim 列表。
 
 ## 数据库设计
 
@@ -204,31 +562,35 @@ run_competitive_analysis(db, task_id)
 | --- | --- |
 | `id` | 任务 ID |
 | `user_input` | 用户原始需求 |
-| `topic` | 分析主题 |
+| `topic` | 主题 |
 | `industry` | 行业 |
 | `target_product` | 目标产品 |
-| `status` | 任务状态，如 `queued`、`collecting`、`extracting`、`analyzing`、`success`、`failed` |
+| `status` | 任务状态 |
 | `report_depth` | 报告深度 |
 | `output_language` | 输出语言 |
-| `task_plan_json` | 结构化 TaskPlan |
-| `error_message` | 失败原因 |
+| `task_plan_json` | TaskPlan JSON |
+| `error_message` | 错误信息 |
+| `created_at / updated_at` | 时间戳 |
 
 ### `agent_node`
 
-每个任务的 Agent DAG 节点。
+持久化 Agent 节点。
 
 | 字段 | 含义 |
 | --- | --- |
-| `task_id` | 所属任务 |
-| `node_key` | 节点标识 |
-| `node_name` | 展示名称 |
+| `task_id` | 任务 ID |
+| `node_key` | 节点 key |
+| `node_name` | 节点名 |
 | `node_type` | 节点类型 |
-| `status` | `pending`、`running`、`success`、`failed` |
+| `status` | `pending / running / success / failed` |
 | `input_summary` | 输入摘要 |
 | `output_summary` | 输出摘要 |
-| `started_at` / `ended_at` | 开始和结束时间 |
-| `duration_ms` | 执行耗时 |
-| `error_message` | 节点错误 |
+| `started_at / ended_at` | 开始和结束时间 |
+| `duration_ms` | 耗时 |
+| `retry_count` | 返工次数 |
+| `error_message` | 错误 |
+
+并行 worker 不写入该表，是 `/nodes` 接口动态生成的虚拟节点。
 
 ### `agent_run_log`
 
@@ -236,71 +598,61 @@ Agent 运行日志。
 
 | 字段 | 含义 |
 | --- | --- |
-| `task_id` | 所属任务 |
-| `node_id` | 所属节点，可为空 |
-| `log_type` | `info`、`warning`、`error` |
-| `message` | 日志消息 |
-| `payload_json` | 结构化上下文 |
-| `created_at` | 记录时间 |
+| `task_id` | 任务 ID |
+| `node_id` | Agent 节点 ID |
+| `log_type` | `info / warning / error` |
+| `message` | 日志文本 |
+| `payload_json` | 结构化 payload |
+| `created_at` | 时间 |
 
 ### `source_document`
 
-Firecrawl 抓取到的网页文档。
+Firecrawl 抓取网页。
 
 | 字段 | 含义 |
 | --- | --- |
-| `task_id` | 所属任务 |
-| `competitor_name` | 竞品名 |
-| `source_url` | 来源 URL |
-| `source_title` | 网页标题 |
-| `source_type` | 来源类型，如 `official_website`、`pricing_page`、`docs` |
-| `content_markdown` | 原始 Markdown |
-| `content_text` | 清洗后的文本 |
-| `metadata_json` | 搜索 query、搜索结果、抓取元数据 |
+| `task_id` | 任务 ID |
+| `competitor_name` | 竞品 |
+| `source_url` | URL |
+| `source_title` | 标题 |
+| `source_type` | 来源类型 |
+| `content_markdown` | Markdown |
+| `content_text` | 清洗文本 |
+| `metadata_json` | 搜索和抓取元数据 |
 
 ### `evidence_chunk`
 
-网页文档切片后的证据块。
+证据切片。
 
 | 字段 | 含义 |
 | --- | --- |
-| `task_id` | 所属任务 |
+| `task_id` | 任务 ID |
 | `source_document_id` | 来源文档 |
-| `competitor_name` | 竞品名 |
-| `source_url` / `source_title` | 来源信息 |
+| `competitor_name` | 竞品 |
+| `source_url / source_title` | 来源信息 |
 | `source_type` | 来源类型 |
-| `chunk_index` | 文档内切片序号 |
+| `chunk_index` | 切片序号 |
 | `chunk_text` | 证据文本 |
-| `reliability_score` | 证据可信度评分 |
-| `milvus_vector_id` | Milvus 向量 ID，正常为 `task_id-chunk_id` |
-
-Milvus collection `evidence_chunks` 字段包括：
-
-- `id`
-- `task_id`
-- `chunk_id`
-- `competitor_name`
-- `source_type`
-- `source_url`
-- `embedding`
+| `reliability_score` | 可信度 |
+| `milvus_vector_id` | Milvus 向量 ID |
 
 ### `claim`
 
-分析 Agent 生成的结构化结论。
+结构化结论。
 
 | 字段 | 含义 |
 | --- | --- |
-| `task_id` | 所属任务 |
-| `agent_node_id` | 生成该 Claim 的 Agent 节点 |
-| `competitor_name` | 竞品名 |
-| `claim_type` | `feature`、`pricing`、`market`、`security` |
-| `claim_text` | 结论文本 |
+| `task_id` | 任务 ID |
+| `agent_node_id` | 生成 Agent |
+| `competitor_name` | 竞品 |
+| `claim_type` | `feature / pricing / market / security` |
+| `claim_text` | 结论 |
 | `confidence` | 置信度 |
 | `risk_level` | 风险等级 |
 
 ### `claim_evidence`
 
-Claim 与 Evidence 的多对多关联表。
+Claim 与 Evidence 多对多关联表。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -309,127 +661,148 @@ Claim 与 Evidence 的多对多关联表。
 
 ### `report`
 
-最终报告。
+报告。
 
 | 字段 | 含义 |
 | --- | --- |
-| `task_id` | 所属任务 |
-| `title` | 报告标题 |
-| `content_markdown` | Markdown 内容 |
-| `content_html` | HTML 内容 |
-| `report_json` | 报告元数据，如 Claim ID 列表 |
+| `task_id` | 任务 ID |
+| `title` | 标题 |
+| `content_markdown` | Markdown |
+| `content_html` | HTML |
+| `report_json` | 结构化报告，包含 sections / paragraphs / claim_ids / evidence_ids |
 
 ### `qa_result`
 
-报告质量检查结果。
+QA 结果。
 
 | 字段 | 含义 |
 | --- | --- |
-| `task_id` | 所属任务 |
+| `task_id` | 任务 ID |
 | `report_id` | 报告 ID |
 | `passed` | 是否通过 |
-| `score` | QA 得分 |
-| `issues_json` | 问题列表 |
+| `score` | 得分 |
+| `issues_json` | QA payload，包含 issues / next_action / target_nodes / revision_round |
 
 ## API 概览
 
-| 方法 | 路径 | 作用 |
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
-| `POST` | `/api/v1/task-plans/parse` | 解析自然语言需求为 TaskPlan |
-| `GET` | `/api/v1/analysis-tasks` | 查询历史分析任务和各 Agent 节点状态 |
-| `POST` | `/api/v1/analysis-tasks` | 创建分析任务 |
-| `GET` | `/api/v1/analysis-tasks/{task_id}` | 查询任务详情 |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/nodes` | 查询 DAG 节点和边 |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/logs` | 查询 Agent 日志 |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/evidence` | 查询证据链 |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/claims` | 查询结构化 Claim |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/report` | 查询报告 |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/qa` | 查询 QA 结果 |
+| `POST` | `/api/v1/task-plans/parse` | 解析自然语言需求 |
+| `GET` | `/api/v1/analysis-tasks` | 历史任务 |
+| `POST` | `/api/v1/analysis-tasks` | 创建任务 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}` | 任务详情 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/nodes` | DAG 节点和边，包含虚拟并行 worker |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/logs` | Agent 日志 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/evidence` | Evidence Chunk |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/claims` | Claim |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/report` | 报告、Claim、Evidence、QA payload |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/qa` | QA 结果 |
 
-## 配置流程
+## 配置
 
-### 1. 创建 Conda 环境
+后端配置在：
 
-```powershell
-conda create -n competitor-agent python=3.11
-conda activate competitor-agent
+```text
+backend/.env
 ```
 
-### 2. 安装后端依赖
-
-```powershell
-cd backend
-pip install -r requirements.txt
-```
-
-### 3. 安装前端依赖
-
-```powershell
-cd frontend
-npm install
-```
-
-### 4. 创建 MySQL 数据库
-
-```sql
-CREATE DATABASE competitor_agent CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-```
-
-### 5. 配置后端 `.env`
-
-在 `backend/.env` 中配置：
+示例，不要把真实密钥提交到仓库：
 
 ```env
-DATABASE_URL=mysql+pymysql://root:password@127.0.0.1:3306/competitor_agent?charset=utf8mb4
+APP_ENV=dev
+APP_NAME=competitive-agent-system
 
-CELERY_BROKER_URL=redis://:password@43.143.122.92:6379/0
-CELERY_RESULT_BACKEND=redis://:password@43.143.122.92:6379/1
+DATABASE_URL=mysql+pymysql://user:password@127.0.0.1:3306/competitor_agent?charset=utf8mb4
 
-FIRECRAWL_API_KEY=你的 Firecrawl Key
+CELERY_BROKER_URL=redis://:password@host:6379/0
+CELERY_RESULT_BACKEND=redis://:password@host:6379/1
+
+FIRECRAWL_API_KEY=your_firecrawl_key
 
 LLM_BASE_URL=https://api.deepseek.com/v1
-LLM_API_KEY=你的 DeepSeek Key
+LLM_API_KEY=your_deepseek_key
 LLM_MODEL=deepseek-v4-pro
+
 EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-EMBEDDING_API_KEY=你的 DashScope Key
+EMBEDDING_API_KEY=your_dashscope_key
 EMBEDDING_MODEL=text-embedding-v4
 EMBEDDING_DIM=1536
 
-MILVUS_URI=http://43.143.122.92:19530
-MILVUS_TOKEN=你的 Milvus Token
+MILVUS_URI=http://host:19530
+MILVUS_TOKEN=your_milvus_token
 MILVUS_COLLECTION=evidence_chunks
 
 RUN_TASKS_INLINE=false
 FALLBACK_TO_LOCAL_THREAD_ON_CELERY_ERROR=true
 FALLBACK_TO_LOCAL_THREAD_WHEN_WORKER_UNAVAILABLE=true
+
+CELERY_WORKER_HEARTBEAT_TTL_SECONDS=45
+CELERY_WORKER_HEARTBEAT_INTERVAL_SECONDS=10
+CELERY_VISIBILITY_TIMEOUT_SECONDS=120
+CELERY_QUEUED_RECOVERY_MAX_AGE_SECONDS=1800
+
+COLLECTOR_MAX_WORKERS=4
+EVIDENCE_EXTRACTOR_MAX_WORKERS=4
 ```
 
-### 6. 配置前端 `.env.development`
+并发配置建议：
 
-在 `frontend/.env.development` 中配置：
+- `COLLECTOR_MAX_WORKERS=2~4`：Firecrawl 慢或限流时调小。
+- `EVIDENCE_EXTRACTOR_MAX_WORKERS=4~8`：embedding 服务稳定时可调大。
+- 并发越高，越可能触发 Firecrawl / embedding / Milvus 限流。
+
+前端配置：
+
+```text
+frontend/.env.development
+```
+
+示例：
 
 ```env
 VITE_API_BASE_URL=http://127.0.0.1:8000/api/v1
 ```
 
-### 7. 初始化数据库
+## 启动
+
+### 1. 后端依赖
 
 ```powershell
-cd backend
+conda create -n competitor-agent python=3.11
+conda activate competitor-agent
+cd D:\Code\Python\Competitor-Agent\backend
+pip install -r requirements.txt
+```
+
+### 2. 前端依赖
+
+```powershell
+cd D:\Code\Python\Competitor-Agent\frontend
+npm install
+```
+
+### 3. MySQL 初始化
+
+```sql
+CREATE DATABASE competitor_agent CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+初始化表：
+
+```powershell
+cd D:\Code\Python\Competitor-Agent\backend
 conda activate competitor-agent
 python -m app.db_init
 ```
 
-也可以使用 Alembic：
+或：
 
 ```powershell
 alembic upgrade head
 ```
 
-## 启动项目
-
-### 启动后端 API
+### 4. 启动 FastAPI
 
 ```powershell
 cd D:\Code\Python\Competitor-Agent\backend
@@ -437,16 +810,16 @@ conda activate competitor-agent
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-访问：
+检查：
 
 ```text
 http://127.0.0.1:8000/health
 http://127.0.0.1:8000/docs
 ```
 
-### 启动 Celery Worker
+### 5. 启动 Celery Worker
 
-另开终端：
+Windows 本地建议：
 
 ```powershell
 cd D:\Code\Python\Competitor-Agent\backend
@@ -454,11 +827,14 @@ conda activate competitor-agent
 python -m celery -A app.worker:celery_app worker --loglevel=info --pool=solo -Q competitor_agent_analysis --without-gossip --without-mingle --without-heartbeat
 ```
 
-Windows 本地建议使用 `python -m celery` 和 `--pool=solo`。不要用 `conda run celery ...` 包装长进程，否则日志和进程行为不够直观。
+说明：
 
-### 启动前端
+- `--pool=solo` 适合 Windows。
+- 不建议用 `conda run celery ...` 包装长进程。
+- 如果正在跑任务，不要重启 Celery Worker，否则可能中断当前任务。
+- 只重启 FastAPI 通常不会中断 Celery Worker 中正在执行的任务。
 
-另开终端：
+### 6. 启动前端
 
 ```powershell
 cd D:\Code\Python\Competitor-Agent\frontend
@@ -471,123 +847,143 @@ npm run dev
 http://127.0.0.1:5173/
 ```
 
-## 使用流程
+## Redis / Celery 运行说明
 
-1. 打开前端首页。
-2. 输入竞品分析需求。
-3. 点击“解析需求”，由 Planner Agent 生成 TaskPlan。
-4. 检查竞品、行业、分析维度、输出语言等配置。
-5. 点击“开始分析”。
-6. 进入任务详情页，查看 DAG 节点、进度、Agent 动态日志。
-7. 进入证据链页，查看 Evidence Chunk 和来源 URL。
-8. 进入报告页，查看 Markdown 报告、Claim 和 QA 结果。
-
-## Redis 与 Celery 运行说明
-
-当前项目使用专用队列：
+队列名：
 
 ```text
 competitor_agent_analysis
 ```
 
-Worker 心跳 key：
+Worker 心跳：
 
 ```text
 competitor_agent:worker:heartbeat
 ```
 
-Celery 还会创建 Kombu 内部绑定 key：
+Celery / Kombu 内部 key 可能包括：
 
 ```text
 _kombu.binding.competitor_agent_analysis
+competitor_agent_analysis
 ```
 
-当前代码关闭了 Kombu Redis `ack_emulation`，用于规避远程 Redis 长时间空闲后断开连接导致消息卡在 `unacked` 的问题。远程 Redis 服务端建议设置：
+远程 Redis 建议：
 
 ```bash
-redis-cli -h 43.143.122.92 -p 6379 -a '你的 Redis 密码' CONFIG SET timeout 0
-redis-cli -h 43.143.122.92 -p 6379 -a '你的 Redis 密码' CONFIG SET tcp-keepalive 60
-redis-cli -h 43.143.122.92 -p 6379 -a '你的 Redis 密码' CONFIG REWRITE
+redis-cli -h your-host -p 6379 -a 'password' CONFIG SET timeout 0
+redis-cli -h your-host -p 6379 -a 'password' CONFIG SET tcp-keepalive 60
+redis-cli -h your-host -p 6379 -a 'password' CONFIG REWRITE
 ```
 
 含义：
 
-- `timeout 0`：Redis 不主动断开空闲客户端。
-- `tcp-keepalive 60`：帮助 Redis 更快发现异常断开的客户端。
-- `CONFIG REWRITE`：把配置写回 redis.conf。
+- `timeout 0`：服务端不主动断开空闲客户端。
+- `tcp-keepalive 60`：更快识别异常断开的连接。
+- 本地停止 Celery Worker 时，连接会正常释放，不会永久占满。
 
-如果 Redis 在 Docker 中运行，进入容器后执行同样命令。如果云厂商安全组、负载均衡或代理层有 TCP idle timeout，也要调大到超过单个分析任务的最长运行时间。
+## Milvus 查看
 
-## Milvus 数据查看
+Evidence 向量是在 `evidence_extractor` 阶段写入 Milvus 的，不是在 Firecrawl 搜索阶段写入。
 
-证据向量在 `evidence_extractor` 节点写入 Milvus，不是在 Firecrawl 搜索到网页时写入。
-
-默认 collection：
-
-```text
-evidence_chunks
-```
-
-写入字段：
-
-```text
-id, task_id, chunk_id, competitor_name, source_type, source_url, embedding
-```
-
-可以用 Python 验证：
+验证 collection：
 
 ```powershell
-cd backend
+cd D:\Code\Python\Competitor-Agent\backend
 conda activate competitor-agent
 python -c "from app.core.config import settings; from pymilvus import MilvusClient; c=MilvusClient(uri=settings.milvus_uri, token=settings.milvus_token); print(c.list_collections()); print(c.get_collection_stats(settings.milvus_collection))"
 ```
 
-如果要可视化查看 collection 数据，建议启动 Attu，并连接：
+如果 Milvus 内置页面看不到数据，不一定表示没写入。建议用 Attu 或 pymilvus 查询 collection 和 row count。
+
+## 典型使用流程
+
+1. 打开前端首页。
+2. 输入需求，例如：
 
 ```text
-Milvus Address: 43.143.122.92:19530
-Database: default
-Collection: evidence_chunks
+请分析 Firecrawl 在 AI 数据采集领域的竞品情况，重点关注产品定位、核心功能、数据采集能力、价格策略、开发者生态、安全合规和适用用户。
 ```
 
-Milvus 内置 WebUI 的 `data_component` 页面主要显示组件和运行状态，不是 collection 数据浏览页。
+3. 点击“解析需求”。
+4. 检查 TaskPlan。
+5. 点击“开始分析”。
+6. 进入任务详情页，观察：
+   - 主 DAG。
+   - 并行采集 worker。
+   - 并行证据 worker。
+   - 四个 Analyst 分支。
+   - QA 回流边。
+   - Agent 日志。
+7. 进入证据链页查看网页来源。
+8. 进入报告页展开段落依据，查看 Claim 和 Evidence。
+9. 进入历史记录页查看以前的任务。
 
-## 可选：不用 Celery 调试
+## 当前已验证
 
-如果只是临时调试，可以在 `backend/.env` 中设置：
+今晚代码层面已做过：
 
-```env
-RUN_TASKS_INLINE=true
+```powershell
+python -m compileall app
+npm run build
 ```
 
-这种模式会在后端请求内直接执行完整 DAG，不推荐日常使用，因为真实采集和 LLM 分析可能超过前端 HTTP 超时时间。
-
-## 常见问题
-
-### 前端提示 API timeout
-
-真实 Firecrawl、LLM、Milvus 流程会运行数分钟，不能用普通 HTTP 请求一直等待。应使用 Redis + Celery 异步执行，并在前端通过任务详情页轮询状态。
-
-### 任务一直停在 queued
-
-优先检查：
-
-1. Celery Worker 是否启动。
-2. Worker 是否监听 `competitor_agent_analysis` 队列。
-3. Redis 是否可连接。
-4. `competitor_agent:worker:heartbeat` 是否存在。
-
-### Redis 出现 WinError 10054
-
-这是远程 Redis 或中间网络重置 TCP 连接。当前代码已关闭 Redis ack emulation，并建议服务端设置 `timeout 0` 和 `tcp-keepalive 60`。
-
-### Milvus WebUI 看不到数据
-
-先用 pymilvus 查询 collection stats。如果 Python 能查到 `evidence_chunks` 和 `row_count`，说明数据已写入。内置 WebUI 的组件页不等于 collection 数据页，建议使用 Attu 查看。
+前端构建会出现 Element Plus / Rolldown 的 pure annotation warning 和 chunk size warning，目前不影响运行。
 
 ## 当前能力边界
 
-- 当前 DAG 是顺序执行，不是并行调度。
-- Analyst Agent 当前按固定四个维度执行：功能、价格、市场、安全合规。
-- Evidence Chunk 检索写入 Milvus，但当前分析阶段主要从 MySQL 按竞品读取 evidence，没有做复杂向量召回编排。
-- 任务恢复逻辑适合本地开发和 MVP，生产环境建议进一步加入任务锁、幂等写入、死信队列和监控告警。
+当前系统已经是可运行 MVP+，但仍有一些边界：
+
+- 四个 Analyst 后端仍是顺序执行，前端展示为逻辑并行分支。
+- Collector 和 Evidence Extractor 已经做了并发 worker。
+- 并行 worker 是虚拟可视化节点，不是独立 Celery task。
+- QA 返工最多 1 轮，避免无限循环。
+- 任务恢复和幂等能力仍偏 MVP，生产环境还需要加强。
+- Firecrawl、DeepSeek、DashScope、Milvus 任一外部服务不稳定都会影响任务耗时。
+- ReportWriter 的结构化 JSON 依赖 LLM 输出质量，已有 fallback，但报告质量仍可进一步增强。
+- Milvus RAG 检索已接入，但 query 策略还比较固定，可继续优化。
+
+## 下一步可讨论方向
+
+建议后续优先级：
+
+1. 将四个 Analyst 改为真正并行执行，并保持 DB Session 隔离。
+2. 将 collector/evidence worker 从线程池升级为可观测的 Celery 子任务。
+3. 增加任务取消、暂停、重试能力。
+4. 增加每个 worker 的真实进度，而不是只跟随父节点状态。
+5. 增加 Firecrawl / LLM / Embedding / Milvus 的限流和重试策略。
+6. 增加死信队列和失败任务恢复。
+7. 优化 RAG query，根据用户选择的维度动态生成检索 query。
+8. 增加 Evidence 去重、来源权重、时间新鲜度评分。
+9. 增加更严格的 Claim schema 和报告评分 rubric。
+10. 增加导出能力：Markdown、PDF、Word、HTML。
+11. 增加多任务并发队列和任务优先级。
+12. 增加评测集，用固定需求自动评估报告质量和证据命中率。
+
+## 给 ChatGPT 的讨论摘要
+
+如果要和 ChatGPT 继续讨论，可以直接复制下面这段：
+
+```text
+我现在有一个 FastAPI + Vue + Redis/Celery + MySQL + Milvus + Firecrawl + LLM 的竞品分析 Agent 系统。
+
+当前主链路：
+1. Planner 解析用户需求为 TaskPlan，支持自动发现竞品。
+2. Collector 用 Firecrawl 搜索和抓取网页，已支持并行 search/scrape worker。
+3. Evidence Extractor 清洗网页、切 chunk、embedding、写 MySQL 和 Milvus，已支持并行 embedding/Milvus worker。
+4. 四个 Analyst：feature/pricing/market/security，使用 Milvus RAG 检索 evidence，再生成 Claim。
+5. ReportWriter 基于 Claim 生成结构化 report_json.sections 和 Markdown。
+6. 报告页可以展开每个段落对应的 Claim 和 Evidence。
+7. QA Agent 做规则检查和 LLM 复核，结果包含 issues、next_action、target_nodes、revision_round。
+8. QA 不通过时最多返工 1 轮，可回流 collector、analyst 或 report_writer。
+9. 前端 VueFlow 展示 DAG、并行 worker、四个 Analyst 分支和 QA 回流边。
+10. MySQL 保存业务数据，Milvus 保存向量，Redis 只做 Celery Broker 和 Worker 心跳。
+
+当前问题和下一步：
+- 四个 Analyst 现在后端仍是顺序执行，想改成真正并行。
+- collector/evidence worker 现在是线程池和虚拟可视化节点，不是独立 Celery 子任务。
+- 需要设计更可靠的任务取消、重试、恢复、限流和监控机制。
+- 需要进一步优化 RAG query、Evidence 去重、来源权重、报告质量评分和导出能力。
+
+请基于这个系统现状，帮我规划下一阶段最值得做的技术改进路线。
+```

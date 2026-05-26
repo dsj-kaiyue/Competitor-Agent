@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.agents.planner_agent import parse_task_plan
 from app.models.agent_node import AgentNode
 from app.models.analysis_task import AnalysisTask
+from app.models.qa_result import QAResult
 from app.schemas.analysis_task import AnalysisTaskCreateRequest
 from app.schemas.task_plan import TaskPlan
 
@@ -24,14 +25,17 @@ NODE_DEFINITIONS = [
 ]
 
 DAG_EDGES = [
-    {"source": "planner", "target": "collector"},
-    {"source": "collector", "target": "evidence_extractor"},
-    {"source": "evidence_extractor", "target": "feature_analysis"},
-    {"source": "feature_analysis", "target": "pricing_analysis"},
-    {"source": "pricing_analysis", "target": "market_analysis"},
-    {"source": "market_analysis", "target": "security_analysis"},
-    {"source": "security_analysis", "target": "report_writer"},
-    {"source": "report_writer", "target": "qa"},
+    {"source": "planner", "target": "collector", "type": "normal"},
+    {"source": "collector", "target": "evidence_extractor", "type": "normal"},
+    {"source": "evidence_extractor", "target": "feature_analysis", "type": "normal"},
+    {"source": "evidence_extractor", "target": "pricing_analysis", "type": "normal"},
+    {"source": "evidence_extractor", "target": "market_analysis", "type": "normal"},
+    {"source": "evidence_extractor", "target": "security_analysis", "type": "normal"},
+    {"source": "feature_analysis", "target": "report_writer", "type": "normal"},
+    {"source": "pricing_analysis", "target": "report_writer", "type": "normal"},
+    {"source": "market_analysis", "target": "report_writer", "type": "normal"},
+    {"source": "security_analysis", "target": "report_writer", "type": "normal"},
+    {"source": "report_writer", "target": "qa", "type": "normal"},
 ]
 
 
@@ -90,3 +94,20 @@ def get_task_plan(task: AnalysisTask) -> TaskPlan:
 
 def list_nodes(db: Session, task_id: int) -> list[AgentNode]:
     return list(db.scalars(select(AgentNode).where(AgentNode.task_id == task_id).order_by(AgentNode.id)))
+
+
+def list_edges(db: Session, task_id: int) -> list[dict]:
+    edges = [dict(edge) for edge in DAG_EDGES]
+    qa_results = list(db.scalars(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id.desc())))
+    for qa_result in qa_results:
+        payload = qa_result.issues_json
+        if not isinstance(payload, dict):
+            continue
+        next_action = payload.get("next_action")
+        target_nodes = payload.get("target_nodes") or []
+        if next_action in {"recollect", "reanalyze", "rewrite"}:
+            targets = target_nodes or (["collector"] if next_action == "recollect" else ["report_writer"])
+            for target in targets:
+                edges.append({"source": "qa", "target": target, "type": "revision", "label": "QA Revision"})
+            break
+    return edges

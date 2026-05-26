@@ -19,13 +19,13 @@ from app.schemas.analysis_task import (
 from app.schemas.claim import ClaimItem, ClaimListResponse
 from app.schemas.evidence import EvidenceListResponse
 from app.schemas.qa import QAResultItem, QAResultResponse
-from app.schemas.report import ReportItem, ReportResponse
+from app.schemas.report import ReportClaimItem, ReportEvidenceItem, ReportItem, ReportResponse
 from app.services.claim_service import list_claims_with_evidence
 from app.services.evidence_service import list_evidence
 from app.services.log_service import list_logs
 from app.services.qa_service import get_qa_result
 from app.services.report_service import get_report
-from app.services.task_service import DAG_EDGES, create_task, get_task, get_task_plan, list_nodes, list_tasks, update_task_status
+from app.services.task_service import create_task, get_task, get_task_plan, list_edges, list_nodes, list_tasks, update_task_status
 from app.worker import run_analysis_task
 
 router = APIRouter()
@@ -65,6 +65,76 @@ def _run_analysis_in_local_thread(task_id: int) -> None:
             db.close()
 
     Thread(target=runner, daemon=True, name=f"analysis-task-{task_id}").start()
+
+
+def _normalize_qa_payload(qa_result) -> dict:
+    payload = qa_result.issues_json or []
+    if isinstance(payload, dict):
+        return {
+            "issues": payload.get("issues") or [],
+            "next_action": payload.get("next_action") or "end",
+            "target_nodes": payload.get("target_nodes") or [],
+            "revision_reason": payload.get("revision_reason"),
+            "revision_round": payload.get("revision_round") or 0,
+        }
+    return {
+        "issues": payload if isinstance(payload, list) else [],
+        "next_action": "end",
+        "target_nodes": [],
+        "revision_reason": None,
+        "revision_round": 0,
+    }
+
+
+def _virtual_worker_status(parent_status: str) -> str:
+    if parent_status in {"running", "success", "failed"}:
+        return parent_status
+    return "pending"
+
+
+def _with_parallel_worker_nodes(task_id: int, nodes: list, edges: list[dict]) -> tuple[list, list[dict]]:
+    node_by_key = {node.node_key: node for node in nodes}
+    next_nodes = list(nodes)
+    next_edges = [dict(edge) for edge in edges if edge.get("source") not in {"collector", "evidence_extractor"} or edge.get("type") == "revision"]
+
+    def add_workers(parent_key: str, worker_prefix: str, worker_name: str, worker_count: int, downstream_targets: list[str]) -> None:
+        parent = node_by_key.get(parent_key)
+        if parent is None:
+            return
+        parent_status = _virtual_worker_status(parent.status)
+        base_id = 10_000_000 if worker_prefix == "collector_worker" else 20_000_000
+        for index in range(1, max(1, worker_count) + 1):
+            worker_key = f"{worker_prefix}_{index}"
+            next_nodes.append(
+                {
+                    "id": -(base_id + task_id * 100 + index),
+                    "task_id": task_id,
+                    "node_key": worker_key,
+                    "node_name": f"{worker_name} {index}",
+                    "node_type": "virtual_worker",
+                    "status": parent_status,
+                    "input_summary": f"parallel worker of {parent_key}",
+                    "output_summary": None,
+                    "started_at": parent.started_at,
+                    "ended_at": parent.ended_at,
+                    "duration_ms": parent.duration_ms,
+                    "retry_count": parent.retry_count,
+                    "error_message": parent.error_message,
+                }
+            )
+            next_edges.append({"source": parent_key, "target": worker_key, "type": "parallel", "label": "parallel"})
+            for target in downstream_targets:
+                next_edges.append({"source": worker_key, "target": target, "type": "parallel"})
+
+    add_workers("collector", "collector_worker", "采集 Worker", settings.collector_max_workers, ["evidence_extractor"])
+    add_workers(
+        "evidence_extractor",
+        "evidence_worker",
+        "证据 Worker",
+        settings.evidence_extractor_max_workers,
+        ["feature_analysis", "pricing_analysis", "market_analysis", "security_analysis"],
+    )
+    return next_nodes, next_edges
 
 
 @router.post("", response_model=AnalysisTaskCreateResponse)
@@ -137,7 +207,8 @@ def get_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTa
 def get_task_nodes(task_id: int, db: Session = Depends(get_db)) -> AgentNodeListResponse:
     if get_task(db, task_id) is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    return AgentNodeListResponse(nodes=list_nodes(db, task_id), edges=DAG_EDGES)
+    nodes, edges = _with_parallel_worker_nodes(task_id, list_nodes(db, task_id), list_edges(db, task_id))
+    return AgentNodeListResponse(nodes=nodes, edges=edges)
 
 
 @router.get("/{task_id}/logs", response_model=AgentLogListResponse)
@@ -191,6 +262,37 @@ def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportRespon
     report = get_report(db, task_id)
     if report is None:
         return ReportResponse(report=None)
+    claim_items = []
+    evidence_ids: set[int] = set()
+    for claim, claim_evidence_ids in list_claims_with_evidence(db, task_id):
+        evidence_ids.update(claim_evidence_ids)
+        claim_items.append(
+            ReportClaimItem(
+                id=claim.id,
+                task_id=claim.task_id,
+                claim_text=claim.claim_text,
+                competitor_name=claim.competitor_name,
+                claim_type=claim.claim_type,
+                confidence=claim.confidence,
+                risk_level=claim.risk_level,
+                evidence_ids=claim_evidence_ids,
+                created_at=claim.created_at,
+            )
+        )
+    evidence_items = [
+        ReportEvidenceItem(
+            id=item.id,
+            source_url=item.source_url,
+            source_title=item.source_title,
+            source_type=item.source_type,
+            chunk_text=item.chunk_text,
+            competitor_name=item.competitor_name,
+            reliability_score=item.reliability_score,
+        )
+        for item in list_evidence(db, task_id)
+        if item.id in evidence_ids
+    ]
+    qa_result = get_qa_result(db, task_id)
     return ReportResponse(
         report=ReportItem(
             id=report.id,
@@ -198,9 +300,13 @@ def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportRespon
             title=report.title,
             content_markdown=report.content_markdown,
             content_html=report.content_html,
+            report_json=report.report_json,
             created_at=report.created_at,
             updated_at=report.updated_at,
-        )
+        ),
+        claims=claim_items,
+        evidence=evidence_items,
+        qa_result=_normalize_qa_payload(qa_result) if qa_result else None,
     )
 
 
@@ -209,6 +315,7 @@ def get_task_qa(task_id: int, db: Session = Depends(get_db)) -> QAResultResponse
     qa_result = get_qa_result(db, task_id)
     if qa_result is None:
         return QAResultResponse(qa_result=None)
+    payload = _normalize_qa_payload(qa_result)
     return QAResultResponse(
         qa_result=QAResultItem(
             id=qa_result.id,
@@ -216,7 +323,11 @@ def get_task_qa(task_id: int, db: Session = Depends(get_db)) -> QAResultResponse
             report_id=qa_result.report_id,
             passed=qa_result.passed,
             score=qa_result.score,
-            issues=qa_result.issues_json or [],
+            issues=payload["issues"],
+            next_action=payload["next_action"],
+            target_nodes=payload["target_nodes"],
+            revision_reason=payload["revision_reason"],
+            revision_round=payload["revision_round"],
             created_at=qa_result.created_at,
         )
     )

@@ -3,7 +3,11 @@ export interface QAIssue {
   severity: string
   message: string
   related_claim_id?: number | null
+  related_competitor?: string | null
+  related_dimension?: string | null
   suggested_action?: string
+  target_node?: string | null
+  search_query?: string | null
 }
 
 export interface QAResult {
@@ -13,5 +17,9 @@ export interface QAResult {
   passed: boolean
   score?: string | number | null
   issues: QAIssue[]
+  next_action?: string
+  target_nodes?: string[]
+  revision_reason?: string | null
+  revision_round?: number
   created_at: string
 }

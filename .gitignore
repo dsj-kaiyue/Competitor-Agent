@@ -93,3 +93,6 @@ temp/
 *.tmp
 *.bak
 *.orig
+
+
+document/

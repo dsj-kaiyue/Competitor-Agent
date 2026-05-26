@@ -12,5 +12,13 @@ class CompetitiveAnalysisState(TypedDict, total=False):
     claim_ids: list[int]
     report_id: int
     qa_result_id: int
+    revision_round: int
+    max_revision_rounds: int
+    qa_passed: bool | None
+    qa_next_action: str | None
+    qa_target_nodes: list[str]
+    qa_issues: list[dict[str, Any]]
+    qa_followup_queries: list[str]
+    reanalyze_dimensions: list[str]
     current_node: str
     errors: list[str]

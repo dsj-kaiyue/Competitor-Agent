@@ -17,6 +17,8 @@ export interface AgentNode {
 export interface DagEdge {
   source: string
   target: string
+  type?: string
+  label?: string | null
 }
 
 export interface AgentLog {

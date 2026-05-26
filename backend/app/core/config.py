@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     embedding_api_key: str | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
+    collector_max_workers: int = 4
+    evidence_extractor_max_workers: int = 4
 
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
     run_tasks_inline: bool = False

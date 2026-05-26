@@ -79,3 +79,31 @@ class MilvusTool:
             )
             return f"mock-{vector_id}"
         return vector_id
+
+    def search_evidence_embeddings(
+        self,
+        query_embedding: list[float],
+        filter_expr: str,
+        top_k: int,
+    ) -> list[dict]:
+        client = self._client()
+        raw_results = client.search(
+            collection_name=self.collection_name,
+            data=[query_embedding],
+            anns_field="embedding",
+            filter=filter_expr,
+            limit=top_k,
+            output_fields=["chunk_id", "task_id", "competitor_name", "source_type", "source_url"],
+        )
+        hits = raw_results[0] if raw_results else []
+        normalized: list[dict] = []
+        for hit in hits:
+            entity = hit.get("entity", {}) if isinstance(hit, dict) else getattr(hit, "entity", {})
+            chunk_id = entity.get("chunk_id") if isinstance(entity, dict) else None
+            normalized.append(
+                {
+                    "chunk_id": int(chunk_id),
+                    "score": hit.get("distance") if isinstance(hit, dict) else getattr(hit, "distance", None),
+                }
+            )
+        return normalized

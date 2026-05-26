@@ -24,6 +24,8 @@ class AgentNodeResponse(BaseModel):
 class DagEdge(BaseModel):
     source: str
     target: str
+    type: str = "normal"
+    label: str | None = None
 
 
 class AgentNodeListResponse(BaseModel):

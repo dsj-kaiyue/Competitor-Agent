@@ -4,7 +4,7 @@ import type { AnalysisTask, AnalysisTaskHistoryItem } from '@/types/analysisTask
 import type { ClaimItem } from '@/types/claim'
 import type { EvidenceItem } from '@/types/evidence'
 import type { QAResult } from '@/types/qa'
-import type { ReportItem } from '@/types/report'
+import type { ReportItem, ReportResponse } from '@/types/report'
 import type { TaskPlan } from '@/types/taskPlan'
 
 export async function createAnalysisTask(user_input: string, task_plan: TaskPlan) {
@@ -54,6 +54,11 @@ export async function getTaskClaims(taskId: number) {
 export async function getTaskReport(taskId: number) {
   const { data } = await http.get<{ report: ReportItem | null }>(`/analysis-tasks/${taskId}/report`)
   return data.report
+}
+
+export async function getTaskReportDetail(taskId: number) {
+  const { data } = await http.get<ReportResponse>(`/analysis-tasks/${taskId}/report`)
+  return data
 }
 
 export async function getTaskQa(taskId: number) {

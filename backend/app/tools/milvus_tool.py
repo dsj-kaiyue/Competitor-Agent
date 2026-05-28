@@ -43,42 +43,58 @@ class MilvusTool:
         source_url: str,
         embedding: list[float],
     ) -> str:
-        vector_id = f"{task_id}-{chunk_id}"
+        return self.upsert_evidence_embeddings_batch(
+            [
+                {
+                    "chunk_id": chunk_id,
+                    "task_id": task_id,
+                    "competitor_name": competitor_name,
+                    "source_type": source_type,
+                    "source_url": source_url,
+                    "embedding": embedding,
+                }
+            ]
+        )[0]
+
+    def upsert_evidence_embeddings_batch(self, items: list[dict]) -> list[str]:
+        if not items:
+            return []
+        vector_ids = [f"{item['task_id']}-{item['chunk_id']}" for item in items]
         try:
-            self.ensure_collection(len(embedding))
+            first_embedding = items[0].get("embedding") or []
+            self.ensure_collection(len(first_embedding))
             client = self._client()
             client.insert(
                 collection_name=self.collection_name,
                 data=[
                     {
-                        "id": chunk_id,
-                        "task_id": task_id,
-                        "chunk_id": chunk_id,
-                        "competitor_name": competitor_name or "",
-                        "source_type": source_type or "",
-                        "source_url": source_url,
-                        "embedding": embedding,
+                        "id": item["chunk_id"],
+                        "task_id": item["task_id"],
+                        "chunk_id": item["chunk_id"],
+                        "competitor_name": item.get("competitor_name") or "",
+                        "source_type": item.get("source_type") or "",
+                        "source_url": item.get("source_url") or "",
+                        "embedding": item["embedding"],
                     }
+                    for item in items
                 ],
             )
             client.flush(self.collection_name)
             logger.info(
-                "milvus insert completed | collection=%s task_id=%s chunk_id=%s vector_id=%s",
+                "milvus batch insert completed | collection=%s count=%s first_vector_id=%s",
                 self.collection_name,
-                task_id,
-                chunk_id,
-                vector_id,
+                len(items),
+                vector_ids[0],
             )
         except Exception as exc:
             logger.exception(
-                "milvus insert failed, fallback to mock vector id | collection=%s task_id=%s chunk_id=%s error=%s",
+                "milvus batch insert failed, fallback to mock vector ids | collection=%s count=%s error=%s",
                 self.collection_name,
-                task_id,
-                chunk_id,
+                len(items),
                 exc,
             )
-            return f"mock-{vector_id}"
-        return vector_id
+            return [f"mock-{vector_id}" for vector_id in vector_ids]
+        return vector_ids
 
     def search_evidence_embeddings(
         self,

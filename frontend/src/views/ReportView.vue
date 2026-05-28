@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import ClaimList from '@/components/ClaimList.vue'
 import QaResultPanel from '@/components/QaResultPanel.vue'
 import ReportMarkdown from '@/components/ReportMarkdown.vue'
-import { getTaskClaims, getTaskQa, getTaskReportDetail } from '@/api/analysisTaskApi'
+import { downloadTaskReport, getTaskClaims, getTaskQa, getTaskReportDetail } from '@/api/analysisTaskApi'
 import type { ClaimItem } from '@/types/claim'
 import type { QAResult } from '@/types/qa'
 import type { ReportEvidenceItem, ReportItem } from '@/types/report'
@@ -14,6 +15,7 @@ const report = ref<ReportItem | null>(null)
 const qa = ref<QAResult | null>(null)
 const claims = ref<ClaimItem[]>([])
 const evidence = ref<ReportEvidenceItem[]>([])
+const exporting = ref(false)
 
 const claimById = computed(() => new Map(claims.value.map((claim) => [claim.id, claim])))
 const evidenceById = computed(() => new Map(evidence.value.map((item) => [item.id, item])))
@@ -30,6 +32,22 @@ onMounted(async () => {
   claims.value = detail.claims?.length ? detail.claims : claimItems
   evidence.value = detail.evidence || []
 })
+
+async function handleExport(format: 'markdown' | 'pdf') {
+  if (!report.value || exporting.value) {
+    return
+  }
+  exporting.value = true
+  try {
+    await downloadTaskReport(taskId, format)
+    ElMessage.success(format === 'pdf' ? 'PDF 导出已开始' : 'Markdown 导出已开始')
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '导出失败'
+    ElMessage.error(message)
+  } finally {
+    exporting.value = false
+  }
+}
 </script>
 
 <template>
@@ -39,9 +57,22 @@ onMounted(async () => {
         <h1>{{ report?.title || '分析报告' }}</h1>
         <p>报告、QA 与 Claim-Evidence 关联</p>
       </div>
-      <RouterLink :to="`/tasks/${taskId}`">
-        <el-button>返回任务</el-button>
-      </RouterLink>
+      <div class="toolbar-actions">
+        <el-dropdown :disabled="!report || exporting" @command="handleExport">
+          <el-button type="primary" :loading="exporting">
+            导出报告
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="markdown">Markdown 文件</el-dropdown-item>
+              <el-dropdown-item command="pdf">PDF 文件</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <RouterLink :to="`/tasks/${taskId}`">
+          <el-button>返回任务</el-button>
+        </RouterLink>
+      </div>
     </section>
 
     <el-empty v-if="!report" description="暂无报告" />
@@ -161,6 +192,14 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 h1,
@@ -185,6 +224,15 @@ p {
 @media (max-width: 760px) {
   .provenance-grid {
     grid-template-columns: 1fr;
+  }
+
+  .toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .toolbar-actions {
+    width: 100%;
   }
 }
 </style>

@@ -1,6 +1,7 @@
 from threading import Thread
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -24,8 +25,20 @@ from app.services.claim_service import list_claims_with_evidence
 from app.services.evidence_service import list_evidence
 from app.services.log_service import list_logs
 from app.services.qa_service import get_qa_result
-from app.services.report_service import get_report
-from app.services.task_service import create_task, get_task, get_task_plan, list_edges, list_nodes, list_tasks, update_task_status
+from app.services.report_service import build_markdown_export, build_pdf_export, get_report, safe_report_filename
+from app.services.task_service import (
+    create_task,
+    get_task,
+    get_task_plan,
+    list_edges,
+    list_nodes,
+    list_tasks,
+    mark_task_resuming,
+    request_cancel_task,
+    request_pause_task,
+    reset_task_for_retry,
+    update_task_status,
+)
 from app.worker import run_analysis_task
 
 router = APIRouter()
@@ -50,7 +63,7 @@ def _to_task_response(task) -> AnalysisTaskResponse:
 
 def _run_analysis_in_local_thread(task_id: int) -> None:
     def runner() -> None:
-        from app.graph.workflow import run_competitive_analysis
+        from app.graph.workflow import TaskCanceled, TaskPaused, run_competitive_analysis
         from app.services.task_service import update_task_status
 
         db = SessionLocal()
@@ -58,6 +71,12 @@ def _run_analysis_in_local_thread(task_id: int) -> None:
             _console("local background task started", {"task_id": task_id})
             run_competitive_analysis(db, task_id)
             _console("local background task completed", {"task_id": task_id})
+        except TaskPaused as exc:
+            update_task_status(db, task_id, "paused", str(exc))
+            _console("local background task paused", {"task_id": task_id})
+        except TaskCanceled as exc:
+            update_task_status(db, task_id, "canceled", str(exc))
+            _console("local background task canceled", {"task_id": task_id})
         except Exception as exc:
             update_task_status(db, task_id, "failed", str(exc))
             _console("local background task failed", {"task_id": task_id, "error": str(exc)})
@@ -65,6 +84,32 @@ def _run_analysis_in_local_thread(task_id: int) -> None:
             db.close()
 
     Thread(target=runner, daemon=True, name=f"analysis-task-{task_id}").start()
+
+
+def _enqueue_or_run_task(db: Session, task_id: int) -> None:
+    if settings.run_tasks_inline:
+        from app.graph.workflow import run_competitive_analysis
+
+        run_competitive_analysis(db, task_id)
+        return
+
+    worker_heartbeat = get_worker_heartbeat()
+    if worker_heartbeat is None:
+        message = "Celery Worker heartbeat missing; worker is not ready to consume tasks"
+        _console("analysis task worker unavailable", {"task_id": task_id, "queue": CELERY_QUEUE_NAME})
+        if settings.fallback_to_local_thread_when_worker_unavailable:
+            update_task_status(db, task_id, "running")
+            _console("falling back to local background thread", {"task_id": task_id, "reason": message})
+            _run_analysis_in_local_thread(task_id)
+            return
+        update_task_status(db, task_id, "failed", message)
+        raise HTTPException(status_code=503, detail=message)
+
+    async_result = run_analysis_task.apply_async(args=[task_id], queue=CELERY_QUEUE_NAME, routing_key=CELERY_QUEUE_NAME)
+    _console(
+        "analysis task enqueued",
+        {"task_id": task_id, "celery_task_id": async_result.id, "queue": CELERY_QUEUE_NAME, "worker": worker_heartbeat},
+    )
 
 
 def _normalize_qa_payload(qa_result) -> dict:
@@ -87,7 +132,7 @@ def _normalize_qa_payload(qa_result) -> dict:
 
 
 def _virtual_worker_status(parent_status: str) -> str:
-    if parent_status in {"running", "success", "failed"}:
+    if parent_status in {"running", "success", "failed", "paused", "canceled"}:
         return parent_status
     return "pending"
 
@@ -142,40 +187,19 @@ def create_analysis_task(request: AnalysisTaskCreateRequest, db: Session = Depen
     _console("analysis task create requested", {"topic": request.task_plan.topic, "competitors": request.task_plan.competitors})
     task = create_task(db, request)
     _console("analysis task created", {"task_id": task.id, "run_tasks_inline": settings.run_tasks_inline})
-    if settings.run_tasks_inline:
-        from app.graph.workflow import run_competitive_analysis
-
-        run_competitive_analysis(db, task.id)
-    else:
-        try:
-            worker_heartbeat = get_worker_heartbeat()
-            if worker_heartbeat is None:
-                message = "Celery Worker heartbeat missing; worker is not ready to consume tasks"
-                _console("analysis task worker unavailable", {"task_id": task.id, "queue": CELERY_QUEUE_NAME})
-                if settings.fallback_to_local_thread_when_worker_unavailable:
-                    update_task_status(db, task.id, "running")
-                    _console("falling back to local background thread", {"task_id": task.id, "reason": message})
-                    _run_analysis_in_local_thread(task.id)
-                else:
-                    update_task_status(db, task.id, "failed", message)
-                    raise HTTPException(status_code=503, detail=message)
-            else:
-                async_result = run_analysis_task.apply_async(args=[task.id], queue=CELERY_QUEUE_NAME, routing_key=CELERY_QUEUE_NAME)
-                _console(
-                    "analysis task enqueued",
-                    {"task_id": task.id, "celery_task_id": async_result.id, "queue": CELERY_QUEUE_NAME, "worker": worker_heartbeat},
-                )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _console("analysis task enqueue failed", {"task_id": task.id, "error": str(exc)})
-            if settings.fallback_to_local_thread_on_celery_error:
-                update_task_status(db, task.id, "running")
-                _console("falling back to local background thread", {"task_id": task.id})
-                _run_analysis_in_local_thread(task.id)
-            else:
-                update_task_status(db, task.id, "failed", f"Celery enqueue failed: {exc}")
-                raise HTTPException(status_code=503, detail=f"Celery/Redis enqueue failed: {exc}") from exc
+    try:
+        _enqueue_or_run_task(db, task.id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _console("analysis task enqueue failed", {"task_id": task.id, "error": str(exc)})
+        if settings.fallback_to_local_thread_on_celery_error:
+            update_task_status(db, task.id, "running")
+            _console("falling back to local background thread", {"task_id": task.id})
+            _run_analysis_in_local_thread(task.id)
+        else:
+            update_task_status(db, task.id, "failed", f"Celery enqueue failed: {exc}")
+            raise HTTPException(status_code=503, detail=f"Celery/Redis enqueue failed: {exc}") from exc
     db.refresh(task)
     _console("analysis task create response", {"task_id": task.id, "status": task.status})
     return AnalysisTaskCreateResponse(task_id=task.id, status=task.status)
@@ -200,6 +224,53 @@ def get_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTa
     task = get_task(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    return _to_task_response(task)
+
+
+@router.post("/{task_id}/pause", response_model=AnalysisTaskResponse)
+def pause_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
+    task = request_pause_task(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _console("analysis task pause requested", {"task_id": task_id, "status": task.status})
+    return _to_task_response(task)
+
+
+@router.post("/{task_id}/resume", response_model=AnalysisTaskResponse)
+def resume_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
+    task = mark_task_resuming(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status != "queued":
+        raise HTTPException(status_code=409, detail=f"Task cannot be resumed from status {task.status}")
+    _enqueue_or_run_task(db, task_id)
+    db.refresh(task)
+    _console("analysis task resume requested", {"task_id": task_id, "status": task.status})
+    return _to_task_response(task)
+
+
+@router.post("/{task_id}/cancel", response_model=AnalysisTaskResponse)
+def cancel_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
+    task = request_cancel_task(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _console("analysis task cancel requested", {"task_id": task_id, "status": task.status})
+    return _to_task_response(task)
+
+
+@router.post("/{task_id}/retry", response_model=AnalysisTaskResponse)
+def retry_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
+    task = get_task(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status not in {"failed", "canceled", "paused", "success"}:
+        raise HTTPException(status_code=409, detail=f"Task cannot be retried from status {task.status}")
+    task = reset_task_for_retry(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _enqueue_or_run_task(db, task_id)
+    db.refresh(task)
+    _console("analysis task retry requested", {"task_id": task_id, "status": task.status})
     return _to_task_response(task)
 
 
@@ -307,6 +378,37 @@ def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportRespon
         claims=claim_items,
         evidence=evidence_items,
         qa_result=_normalize_qa_payload(qa_result) if qa_result else None,
+    )
+
+
+@router.get("/{task_id}/report/export")
+def export_task_report(
+    task_id: int,
+    format: str = Query(default="markdown", pattern="^(markdown|md|pdf)$"),
+    db: Session = Depends(get_db),
+) -> Response:
+    report = get_report(db, task_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    normalized_format = "markdown" if format in {"markdown", "md"} else "pdf"
+    if normalized_format == "markdown":
+        filename = safe_report_filename(report, "md")
+        body = build_markdown_export(report).encode("utf-8")
+        media_type = "text/markdown; charset=utf-8"
+    else:
+        filename = safe_report_filename(report, "pdf")
+        try:
+            body = build_pdf_export(report)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        media_type = "application/pdf"
+
+    quoted_filename = quote(filename)
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quoted_filename}"},
     )
 
 

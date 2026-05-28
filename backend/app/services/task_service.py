@@ -1,13 +1,17 @@
-from datetime import datetime
-
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Session
 
 from app.agents.planner_agent import parse_task_plan
+from app.core.timezone import now_bj
 from app.models.agent_node import AgentNode
 from app.models.analysis_task import AnalysisTask
+from app.models.claim import Claim
+from app.models.claim_evidence import ClaimEvidence
+from app.models.evidence_chunk import EvidenceChunk
 from app.models.qa_result import QAResult
+from app.models.report import Report
+from app.models.source_document import SourceDocument
 from app.schemas.analysis_task import AnalysisTaskCreateRequest
 from app.schemas.task_plan import TaskPlan
 
@@ -82,8 +86,92 @@ def update_task_status(db: Session, task_id: int, status: str, error_message: st
         return
     task.status = status
     task.error_message = error_message
-    task.updated_at = datetime.utcnow()
+    task.updated_at = now_bj()
     db.commit()
+
+
+def request_cancel_task(db: Session, task_id: int) -> AnalysisTask | None:
+    task = db.get(AnalysisTask, task_id)
+    if task is None:
+        return None
+    if task.status in {"success", "failed", "canceled"}:
+        task.status = "canceled"
+    elif task.status == "queued":
+        task.status = "canceled"
+    else:
+        task.status = "cancel_requested"
+    task.error_message = "任务取消请求已提交"
+    task.updated_at = now_bj()
+    for node in task.nodes:
+        if node.status in {"pending", "running", "paused"}:
+            node.status = "canceled" if task.status == "canceled" else node.status
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def request_pause_task(db: Session, task_id: int) -> AnalysisTask | None:
+    task = db.get(AnalysisTask, task_id)
+    if task is None:
+        return None
+    if task.status in {"success", "failed", "canceled"}:
+        return task
+    task.status = "paused" if task.status == "queued" else "pause_requested"
+    task.error_message = "任务暂停请求已提交"
+    task.updated_at = now_bj()
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def mark_task_resuming(db: Session, task_id: int) -> AnalysisTask | None:
+    task = db.get(AnalysisTask, task_id)
+    if task is None:
+        return None
+    if task.status not in {"paused", "pause_requested"}:
+        return task
+    task.status = "queued"
+    task.error_message = None
+    task.updated_at = now_bj()
+    for node in task.nodes:
+        if node.status == "paused":
+            node.status = "pending"
+            node.error_message = None
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def reset_task_for_retry(db: Session, task_id: int) -> AnalysisTask | None:
+    task = db.get(AnalysisTask, task_id)
+    if task is None:
+        return None
+
+    claim_ids = select(Claim.id).where(Claim.task_id == task_id)
+    evidence_ids = select(EvidenceChunk.id).where(EvidenceChunk.task_id == task_id)
+    db.execute(delete(ClaimEvidence).where(ClaimEvidence.claim_id.in_(claim_ids)).execution_options(synchronize_session=False))
+    db.execute(delete(ClaimEvidence).where(ClaimEvidence.evidence_chunk_id.in_(evidence_ids)).execution_options(synchronize_session=False))
+    db.execute(delete(QAResult).where(QAResult.task_id == task_id).execution_options(synchronize_session=False))
+    db.execute(delete(Report).where(Report.task_id == task_id).execution_options(synchronize_session=False))
+    db.execute(delete(Claim).where(Claim.task_id == task_id).execution_options(synchronize_session=False))
+    db.execute(delete(EvidenceChunk).where(EvidenceChunk.task_id == task_id).execution_options(synchronize_session=False))
+    db.execute(delete(SourceDocument).where(SourceDocument.task_id == task_id).execution_options(synchronize_session=False))
+
+    for node in task.nodes:
+        node.status = "pending"
+        node.input_summary = None
+        node.output_summary = None
+        node.started_at = None
+        node.ended_at = None
+        node.duration_ms = None
+        node.retry_count += 1
+        node.error_message = None
+    task.status = "queued"
+    task.error_message = None
+    task.updated_at = now_bj()
+    db.commit()
+    db.refresh(task)
+    return task
 
 
 def get_task_plan(task: AnalysisTask) -> TaskPlan:

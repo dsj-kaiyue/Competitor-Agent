@@ -5,6 +5,7 @@ from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.core.timezone import now_bj
 
 
 class Claim(Base):
@@ -18,4 +19,4 @@ class Claim(Base):
     claim_text: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(4, 2))
     risk_level: Mapped[str | None] = mapped_column(String(50))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_bj, nullable=False)

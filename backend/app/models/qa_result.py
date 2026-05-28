@@ -5,6 +5,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, Numeric
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.core.timezone import now_bj
 
 
 class QAResult(Base):
@@ -16,4 +17,4 @@ class QAResult(Base):
     passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     score: Mapped[Decimal | None] = mapped_column(Numeric(4, 2))
     issues_json: Mapped[list | None] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_bj, nullable=False)

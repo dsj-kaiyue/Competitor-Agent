@@ -34,6 +34,8 @@ class EvidenceRetriever:
             results = self.milvus.search_evidence_embeddings(query_embedding, filter_expr, top_k)
             chunk_ids = [item["chunk_id"] for item in results if item.get("chunk_id")]
             chunks = self._chunks_by_ids(chunk_ids)
+            if not chunks:
+                raise RuntimeError("Milvus returned no chunks")
             self.last_search_log = {
                 "retrieval_mode": "milvus_rag",
                 "query": query,

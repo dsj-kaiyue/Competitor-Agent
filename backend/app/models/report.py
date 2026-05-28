@@ -5,6 +5,7 @@ from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.core.timezone import now_bj
 
 
 class Report(Base):
@@ -16,5 +17,5 @@ class Report(Base):
     content_markdown: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
     content_html: Mapped[str | None] = mapped_column(MEDIUMTEXT)
     report_json: Mapped[dict | None] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_bj, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_bj, onupdate=now_bj, nullable=False)

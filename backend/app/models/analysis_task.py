@@ -4,6 +4,7 @@ from sqlalchemy import DateTime, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.core.timezone import now_bj
 
 
 class AnalysisTask(Base):
@@ -19,7 +20,7 @@ class AnalysisTask(Base):
     output_language: Mapped[str] = mapped_column(String(50), default="zh-CN")
     task_plan_json: Mapped[dict | None] = mapped_column(JSON)
     error_message: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_bj, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_bj, onupdate=now_bj, nullable=False)
 
     nodes = relationship("AgentNode", back_populates="task", cascade="all, delete-orphan")

@@ -13,6 +13,10 @@ const statusColor: Record<string, string> = {
   running: '#409eff',
   success: '#67c23a',
   failed: '#f56c6c',
+  paused: '#e6a23c',
+  pause_requested: '#e6a23c',
+  canceled: '#f56c6c',
+  cancel_requested: '#f56c6c',
   revision: '#e6a23c',
   needs_revision: '#e6a23c',
 }

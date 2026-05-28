@@ -27,6 +27,26 @@ export async function getAnalysisTask(taskId: number) {
   return data
 }
 
+export async function pauseAnalysisTask(taskId: number) {
+  const { data } = await http.post<AnalysisTask>(`/analysis-tasks/${taskId}/pause`)
+  return data
+}
+
+export async function resumeAnalysisTask(taskId: number) {
+  const { data } = await http.post<AnalysisTask>(`/analysis-tasks/${taskId}/resume`)
+  return data
+}
+
+export async function cancelAnalysisTask(taskId: number) {
+  const { data } = await http.post<AnalysisTask>(`/analysis-tasks/${taskId}/cancel`)
+  return data
+}
+
+export async function retryAnalysisTask(taskId: number) {
+  const { data } = await http.post<AnalysisTask>(`/analysis-tasks/${taskId}/retry`)
+  return data
+}
+
 export async function getTaskNodes(taskId: number) {
   const { data } = await http.get<{ nodes: AgentNode[]; edges: DagEdge[] }>(
     `/analysis-tasks/${taskId}/nodes`,
@@ -59,6 +79,34 @@ export async function getTaskReport(taskId: number) {
 export async function getTaskReportDetail(taskId: number) {
   const { data } = await http.get<ReportResponse>(`/analysis-tasks/${taskId}/report`)
   return data
+}
+
+function filenameFromDisposition(disposition?: string): string | null {
+  if (!disposition) {
+    return null
+  }
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1])
+  }
+  const asciiMatch = disposition.match(/filename="?([^";]+)"?/i)
+  return asciiMatch?.[1] || null
+}
+
+export async function downloadTaskReport(taskId: number, format: 'markdown' | 'pdf') {
+  const { data, headers } = await http.get<Blob>(`/analysis-tasks/${taskId}/report/export`, {
+    params: { format },
+    responseType: 'blob',
+  })
+  const filename = filenameFromDisposition(headers['content-disposition']) || `analysis-report.${format === 'pdf' ? 'pdf' : 'md'}`
+  const url = window.URL.createObjectURL(data)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.URL.revokeObjectURL(url)
 }
 
 export async function getTaskQa(taskId: number) {

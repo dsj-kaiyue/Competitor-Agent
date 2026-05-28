@@ -1,17 +1,18 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from decimal import Decimal
 import json
 import logging
 import re
+from time import perf_counter
 
 import markdown
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.agents.planner_agent import parse_task_plan
 from app.core.config import settings
+from app.core.database import SessionLocal
+from app.core.timezone import now_bj
 from app.graph.state import CompetitiveAnalysisState
 from app.models.agent_node import AgentNode
 from app.models.analysis_task import AnalysisTask
@@ -31,6 +32,25 @@ from app.tools.web_context_provider import WebContextProvider
 
 logger = logging.getLogger("competitive-agent")
 
+ANALYST_SPECS: dict[str, tuple[str, str]] = {
+    "feature_analysis": ("feature", "产品定位、核心功能、Agent 能力、IDE 集成"),
+    "pricing_analysis": ("pricing", "价格策略、套餐结构、个人与团队商业化"),
+    "market_analysis": ("market", "适用用户、市场定位、企业能力"),
+    "security_analysis": ("security", "安全合规、隐私、企业治理能力"),
+}
+
+
+class TaskControlException(Exception):
+    pass
+
+
+class TaskPaused(TaskControlException):
+    pass
+
+
+class TaskCanceled(TaskControlException):
+    pass
+
 
 def _console(message: str, payload: dict | None = None) -> None:
     suffix = f" | {json.dumps(payload, ensure_ascii=False)}" if payload else ""
@@ -44,10 +64,49 @@ def _node(db: Session, task_id: int, node_key: str) -> AgentNode:
     return node
 
 
-def _run_node(db: Session, task_id: int, node_key: str, task_status: str, fn: Callable[[AgentNode], None]) -> None:
+def _check_task_control(db: Session, task_id: int, node: AgentNode | None = None) -> None:
+    task = db.get(AnalysisTask, task_id)
+    if task is None:
+        raise RuntimeError(f"Task {task_id} not found")
+    db.refresh(task)
+    if task.status in {"cancel_requested", "canceled"}:
+        task.status = "canceled"
+        task.error_message = "任务已取消"
+        task.updated_at = now_bj()
+        if node is not None:
+            add_log(db, task_id, node.id, f"{node.node_name} canceled", log_type="warning")
+        db.commit()
+        _console("analysis workflow canceled", {"task_id": task_id, "node_key": node.node_key if node else None})
+        raise TaskCanceled("任务已取消")
+    if task.status in {"pause_requested", "paused"}:
+        task.status = "paused"
+        task.error_message = "任务已暂停"
+        task.updated_at = now_bj()
+        if node is not None:
+            add_log(db, task_id, node.id, f"{node.node_name} paused", log_type="warning")
+        db.commit()
+        _console("analysis workflow paused", {"task_id": task_id, "node_key": node.node_key if node else None})
+        raise TaskPaused("任务已暂停")
+
+
+def _run_node(
+    db: Session,
+    task_id: int,
+    node_key: str,
+    task_status: str,
+    fn: Callable[[AgentNode], None],
+    *,
+    force: bool = False,
+) -> None:
     node = _node(db, task_id, node_key)
+    _check_task_control(db, task_id, node)
+    if node.status == "success" and not force:
+        _console("node skipped because already completed", {"task_id": task_id, "node_key": node_key})
+        add_log(db, task_id, node.id, f"{node.node_name} skipped because it already completed")
+        db.commit()
+        return
     update_task_status(db, task_id, task_status)
-    started = datetime.utcnow()
+    started = now_bj()
     _console("node started", {"task_id": task_id, "node_key": node_key, "node_name": node.node_name})
     node.status = "running"
     node.started_at = started
@@ -58,15 +117,32 @@ def _run_node(db: Session, task_id: int, node_key: str, task_status: str, fn: Ca
     db.commit()
     try:
         fn(node)
-        ended = datetime.utcnow()
+        _check_task_control(db, task_id, node)
+        ended = now_bj()
         node.status = "success"
         node.ended_at = ended
         node.duration_ms = int((ended - started).total_seconds() * 1000)
         add_log(db, task_id, node.id, f"{node.node_name} completed")
         db.commit()
         _console("node completed", {"task_id": task_id, "node_key": node_key, "duration_ms": node.duration_ms})
+    except TaskPaused:
+        ended = now_bj()
+        node.status = "paused"
+        node.ended_at = ended
+        node.duration_ms = int((ended - started).total_seconds() * 1000)
+        node.error_message = "任务已暂停"
+        db.commit()
+        raise
+    except TaskCanceled:
+        ended = now_bj()
+        node.status = "canceled"
+        node.ended_at = ended
+        node.duration_ms = int((ended - started).total_seconds() * 1000)
+        node.error_message = "任务已取消"
+        db.commit()
+        raise
     except Exception as exc:
-        ended = datetime.utcnow()
+        ended = now_bj()
         node.status = "failed"
         node.ended_at = ended
         node.duration_ms = int((ended - started).total_seconds() * 1000)
@@ -248,19 +324,111 @@ def _scrape_firecrawl_url(payload: dict) -> dict:
     return {**payload, "scraped": scraped}
 
 
-def _embed_and_upsert_chunk(spec: dict) -> tuple[int, str]:
+def _batched(items: list[dict], batch_size: int) -> list[list[dict]]:
+    size = max(1, batch_size)
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _embed_chunk_batch(batch: list[dict]) -> tuple[list[dict], list[dict], int]:
     thread_llm = LLMClient()
-    thread_milvus = MilvusTool()
-    embedding = thread_llm.embed_text(spec["chunk_text"])
-    vector_id = thread_milvus.upsert_evidence_embedding(
-        chunk_id=spec["chunk_id"],
-        task_id=spec["task_id"],
-        competitor_name=spec.get("competitor_name"),
-        source_type=spec.get("source_type"),
-        source_url=spec["source_url"],
-        embedding=embedding,
-    )
-    return spec["chunk_id"], vector_id
+    started = perf_counter()
+    failures: list[dict] = []
+    try:
+        embeddings = thread_llm.embed_texts([spec["chunk_text"] for spec in batch])
+    except Exception as exc:
+        if len(batch) <= 1:
+            elapsed_ms = int((perf_counter() - started) * 1000)
+            return [], [{"chunk_id": batch[0]["chunk_id"], "error": str(exc)}], elapsed_ms
+        embedded: list[dict] = []
+        for spec in batch:
+            try:
+                single_embedding = thread_llm.embed_text(spec["chunk_text"])
+                embedded.append({**spec, "embedding": single_embedding})
+            except Exception as single_exc:
+                failures.append({"chunk_id": spec["chunk_id"], "error": str(single_exc)})
+        elapsed_ms = int((perf_counter() - started) * 1000)
+        return embedded, failures, elapsed_ms
+    elapsed_ms = int((perf_counter() - started) * 1000)
+    embedded: list[dict] = []
+    for spec, embedding in zip(batch, embeddings, strict=False):
+        embedded.append({**spec, "embedding": embedding})
+    return embedded, failures, elapsed_ms
+
+
+def _run_analyst_logic(db: Session, task_id: int, node: AgentNode, node_key: str, claim_type: str, dimension: str) -> list[int]:
+    task = db.get(AnalysisTask, task_id)
+    if task is None:
+        raise RuntimeError(f"Task {task_id} not found")
+    plan = get_task_plan(task)
+    retriever = EvidenceRetriever(db)
+    llm = LLMClient()
+    claim_ids: list[int] = []
+    for competitor in plan.competitors:
+        _check_task_control(db, task_id, node)
+        _console("llm analyst started", {"task_id": task_id, "node_key": node_key, "competitor": competitor})
+        query, source_type = _analysis_query(competitor, claim_type, dimension, plan.topic)
+        evidence = retriever.search(
+            task_id=task_id,
+            query=query,
+            competitor_name=competitor,
+            source_type=source_type,
+            top_k=8,
+            node_id=node.id,
+        )
+        if not evidence and source_type:
+            evidence = retriever.search(
+                task_id=task_id,
+                query=query,
+                competitor_name=competitor,
+                top_k=8,
+                node_id=node.id,
+            )
+        _console("analyst evidence retrieved", retriever.last_search_log)
+        prompt = f"""
+你是严谨的竞品分析 Agent。请只基于给定 evidence 生成 {dimension} 维度的结构化结论。
+竞品：{competitor}
+分析主题：{plan.topic}
+证据：
+{_evidence_context(evidence, limit=12)}
+
+输出 JSON 数组，最多 3 条。每条格式：
+{{"claim_text":"中文结论，必须具体且可被证据支撑","evidence_ids":[数字ID],"confidence":0.0到1.0,"risk_level":"low|medium|high"}}
+不要输出 JSON 之外的内容。
+"""
+        raw = llm.complete(prompt, system="你只输出合法 JSON，不编造证据。")
+        parsed = _json_from_text(raw)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("claims", [])
+        for item in parsed[:3]:
+            evidence_ids = [int(eid) for eid in item.get("evidence_ids", []) if str(eid).isdigit()]
+            valid_ids = [eid for eid in evidence_ids if any(chunk.id == eid for chunk in evidence)]
+            if not valid_ids and evidence:
+                valid_ids = [evidence[0].id]
+            claim = Claim(
+                task_id=task_id,
+                agent_node_id=node.id,
+                competitor_name=competitor,
+                claim_type=claim_type,
+                claim_text=str(item.get("claim_text") or "").strip(),
+                confidence=Decimal(str(item.get("confidence", 0.75))).quantize(Decimal("0.01")),
+                risk_level=str(item.get("risk_level") or "medium"),
+            )
+            if not claim.claim_text:
+                continue
+            db.add(claim)
+            db.flush()
+            for evidence_id in valid_ids[:4]:
+                db.add(ClaimEvidence(claim_id=claim.id, evidence_chunk_id=evidence_id))
+            claim_ids.append(claim.id)
+        _console(
+            "llm analyst completed",
+            {"task_id": task_id, "node_key": node_key, "competitor": competitor, "claim_count_so_far": len(claim_ids)},
+        )
+        db.commit()
+    if not claim_ids:
+        raise RuntimeError(f"{node_key} did not produce claims")
+    node.output_summary = f"{node_key} 使用 LLM 生成 {len(claim_ids)} 条 Claim"
+    return claim_ids
 
 
 def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisState:
@@ -285,14 +453,15 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
     web = WebContextProvider()
 
     def planner(node: AgentNode) -> None:
-        plan = parse_task_plan(task.user_input)
+        plan = get_task_plan(task)
         task.task_plan_json = plan.model_dump()
         task.topic = plan.topic
         task.industry = plan.industry
+        task.target_product = plan.target_product
         task.report_depth = plan.report_depth
         task.output_language = plan.output_language
         node.input_summary = task.user_input[:300]
-        node.output_summary = f"识别 {len(plan.competitors)} 个竞品、{len(plan.analysis_dimensions)} 个分析维度"
+        node.output_summary = f"确认任务计划：{len(plan.competitors)} 个竞品、{len(plan.analysis_dimensions)} 个分析维度"
         state["task_plan"] = plan.model_dump()
         state["competitors"] = plan.competitors
         state["analysis_dimensions"] = plan.analysis_dimensions
@@ -300,6 +469,7 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
     def collector(node: AgentNode) -> None:
         plan = get_task_plan(task)
         if plan.auto_discover_competitors and not plan.competitors:
+            _check_task_control(db, task_id, node)
             discovery_query = f"{plan.target_product or plan.topic} competitors alternatives {plan.industry or ''}".strip()
             _console("competitor discovery started", {"task_id": task_id, "query": discovery_query})
             discovery_results = web.search(discovery_query, max_results=8)
@@ -338,6 +508,7 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         saved_ids: list[int] = []
         seen_urls: set[str] = set()
         for competitor in plan.competitors:
+            _check_task_control(db, task_id, node)
             _console("collector competitor started", {"task_id": task_id, "competitor": competitor})
             queries = [
                 f"{competitor} {plan.industry or plan.topic} official product features",
@@ -360,6 +531,7 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"collector-search-{task_id}") as executor:
                 futures = {executor.submit(_search_firecrawl_query, query, 3): query for query in queries}
                 for future in as_completed(futures):
+                    _check_task_control(db, task_id, node)
                     query = futures[future]
                     try:
                         returned_query, results = future.result()
@@ -391,6 +563,7 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
             with ThreadPoolExecutor(max_workers=scrape_workers, thread_name_prefix=f"collector-scrape-{task_id}") as executor:
                 futures = {executor.submit(_scrape_firecrawl_url, payload): payload for payload in search_payloads}
                 for future in as_completed(futures):
+                    _check_task_control(db, task_id, node)
                     payload = futures[future]
                     url = payload["url"]
                     query = payload["query"]
@@ -431,12 +604,17 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         state["source_document_ids"] = saved_ids
 
     def evidence_extractor(node: AgentNode) -> None:
+        stage_started = perf_counter()
         docs = list(db.scalars(select(SourceDocument).where(SourceDocument.task_id == task_id).order_by(SourceDocument.id)))
         ids: list[int] = []
         pending_specs: list[dict] = []
+        chunk_objects: list[EvidenceChunk] = []
+        chunking_started = perf_counter()
         for doc in docs:
+            _check_task_control(db, task_id, node)
             _console("evidence document started", {"task_id": task_id, "source_document_id": doc.id, "competitor": doc.competitor_name})
             for idx, text in enumerate(_chunks(doc.content_text or doc.content_markdown or "")[:4]):
+                _check_task_control(db, task_id, node)
                 chunk = EvidenceChunk(
                     task_id=task_id,
                     source_document_id=doc.id,
@@ -449,146 +627,195 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
                     reliability_score=Decimal("0.92") if doc.source_type in {"official_website", "pricing_page"} else Decimal("0.78"),
                 )
                 db.add(chunk)
-                db.flush()
-                ids.append(chunk.id)
-                pending_specs.append(
-                    {
-                        "chunk_id": chunk.id,
-                        "task_id": task_id,
-                        "source_document_id": doc.id,
-                        "chunk_index": idx,
-                        "competitor_name": chunk.competitor_name,
-                        "source_type": chunk.source_type,
-                        "source_url": chunk.source_url,
-                        "chunk_text": text,
-                    }
-                )
-            db.commit()
+                chunk_objects.append(chunk)
+        chunking_ms = int((perf_counter() - chunking_started) * 1000)
+        mysql_create_started = perf_counter()
+        db.flush()
+        for chunk in chunk_objects:
+            ids.append(chunk.id)
+            pending_specs.append(
+                {
+                    "chunk_id": chunk.id,
+                    "task_id": task_id,
+                    "source_document_id": chunk.source_document_id,
+                    "chunk_index": chunk.chunk_index,
+                    "competitor_name": chunk.competitor_name,
+                    "source_type": chunk.source_type,
+                    "source_url": chunk.source_url,
+                    "chunk_text": chunk.chunk_text,
+                }
+            )
+        db.commit()
+        mysql_create_ms = int((perf_counter() - mysql_create_started) * 1000)
         if not ids:
             raise RuntimeError("No evidence chunks were extracted")
 
         max_workers = max(1, min(settings.evidence_extractor_max_workers, len(pending_specs)))
-        _console("parallel evidence embedding started", {"task_id": task_id, "chunk_count": len(pending_specs), "max_workers": max_workers})
+        batch_size = max(1, settings.evidence_embedding_batch_size)
+        batches = _batched(pending_specs, batch_size)
+        timing_payload = {
+            "stage": "evidence_extractor",
+            "chunk_count": len(pending_specs),
+            "document_count": len(docs),
+            "batch_count": len(batches),
+            "batch_size": batch_size,
+            "max_workers": max_workers,
+            "chunking_ms": chunking_ms,
+            "mysql_create_ms": mysql_create_ms,
+        }
+        _console("parallel batch evidence embedding started", {"task_id": task_id, **timing_payload})
         add_log(
             db,
             task_id,
             node.id,
-            "Parallel evidence embedding started",
-            {"chunk_count": len(pending_specs), "max_workers": max_workers},
+            "Evidence extraction timing: chunk creation completed",
+            timing_payload,
+            log_type="metric",
         )
         db.commit()
 
         failures: list[dict] = []
-        completed = 0
+        embedded_specs: list[dict] = []
+        embedding_started = perf_counter()
+        embedding_worker_ms = 0
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"evidence-{task_id}") as executor:
-            futures = {executor.submit(_embed_and_upsert_chunk, spec): spec for spec in pending_specs}
+            futures = {executor.submit(_embed_chunk_batch, batch): batch for batch in batches}
             for future in as_completed(futures):
-                spec = futures[future]
+                _check_task_control(db, task_id, node)
+                batch = futures[future]
                 try:
-                    chunk_id, vector_id = future.result()
+                    embedded_batch, batch_failures, batch_elapsed_ms = future.result()
                 except Exception as exc:
-                    failures.append({"chunk_id": spec["chunk_id"], "error": str(exc)})
-                    _console("evidence embedding failed", {"task_id": task_id, "chunk_id": spec["chunk_id"], "error": str(exc)})
+                    failures.append({"chunk_ids": [spec["chunk_id"] for spec in batch], "error": str(exc)})
+                    _console("evidence embedding batch failed", {"task_id": task_id, "chunk_count": len(batch), "error": str(exc)})
                     add_log(
                         db,
                         task_id,
                         node.id,
-                        "Evidence embedding failed",
-                        {"chunk_id": spec["chunk_id"], "error": str(exc)},
+                        "Evidence embedding batch failed",
+                        {"chunk_ids": [spec["chunk_id"] for spec in batch], "error": str(exc)},
                         log_type="error",
                     )
                     db.commit()
                     continue
 
-                chunk = db.get(EvidenceChunk, chunk_id)
-                if chunk is not None:
-                    chunk.milvus_vector_id = vector_id
-                completed += 1
-                _console("evidence embedded and saved", {"task_id": task_id, "chunk_id": chunk_id, "vector_id": vector_id})
-                add_log(db, task_id, node.id, "Evidence embedded and saved", {"chunk_id": chunk_id, "vector_id": vector_id})
-                db.commit()
+                if batch_failures:
+                    failures.extend(batch_failures)
+                    add_log(
+                        db,
+                        task_id,
+                        node.id,
+                        "Evidence embedding fallback left failed chunks",
+                        {"failures": batch_failures},
+                        log_type="warning",
+                    )
+                    db.commit()
+                embedding_worker_ms += batch_elapsed_ms
+                embedded_specs.extend(embedded_batch)
+                _console(
+                    "evidence embedding batch completed",
+                    {
+                        "task_id": task_id,
+                        "chunk_count": len(embedded_batch),
+                        "failed_count": len(batch_failures),
+                        "batch_elapsed_ms": batch_elapsed_ms,
+                    },
+                )
+        embedding_wall_ms = int((perf_counter() - embedding_started) * 1000)
 
-        if failures:
-            raise RuntimeError(f"Evidence embedding failed for {len(failures)} chunks")
+        _check_task_control(db, task_id, node)
+        milvus_started = perf_counter()
+        vector_ids = MilvusTool().upsert_evidence_embeddings_batch(embedded_specs) if embedded_specs else []
+        milvus_ms = int((perf_counter() - milvus_started) * 1000)
+
+        mysql_update_started = perf_counter()
+        for spec, vector_id in zip(embedded_specs, vector_ids, strict=False):
+            chunk = db.get(EvidenceChunk, spec["chunk_id"])
+            if chunk is not None:
+                chunk.milvus_vector_id = vector_id
+        for failure in failures:
+            chunk = db.get(EvidenceChunk, failure["chunk_id"])
+            if chunk is not None:
+                chunk.milvus_vector_id = f"embedding-failed-{chunk.id}"
+        db.commit()
+        mysql_update_ms = int((perf_counter() - mysql_update_started) * 1000)
+        total_ms = int((perf_counter() - stage_started) * 1000)
+
         node.output_summary = f"抽取并向量化 {len(ids)} 条 evidence_chunk"
         add_log(
             db,
             task_id,
             node.id,
-            "Parallel evidence embedding completed",
-            {"chunk_count": len(ids), "completed": completed, "failed": len(failures), "max_workers": max_workers},
+            "Evidence extraction timing completed",
+            {
+                "stage": "evidence_extractor",
+                "document_count": len(docs),
+                "chunk_count": len(ids),
+                "batch_count": len(batches),
+                "batch_size": batch_size,
+                "max_workers": max_workers,
+                "chunking_ms": chunking_ms,
+                "mysql_create_ms": mysql_create_ms,
+                "embedding_wall_ms": embedding_wall_ms,
+                "embedding_worker_ms": embedding_worker_ms,
+                "milvus_batch_insert_ms": milvus_ms,
+                "mysql_update_ms": mysql_update_ms,
+                "total_ms": total_ms,
+                "completed": len(vector_ids),
+                "failed": len(failures),
+                "failed_chunk_ids": [failure["chunk_id"] for failure in failures],
+            },
+            log_type="metric",
+        )
+        _console(
+            "evidence extraction timing completed",
+            {
+                "task_id": task_id,
+                "chunk_count": len(ids),
+                "batch_count": len(batches),
+                "embedding_wall_ms": embedding_wall_ms,
+                "milvus_batch_insert_ms": milvus_ms,
+                "mysql_update_ms": mysql_update_ms,
+                "total_ms": total_ms,
+            },
         )
         state["evidence_chunk_ids"] = ids
 
-    def analyst_factory(node_key: str, claim_type: str, dimension: str) -> Callable[[AgentNode], None]:
-        def analyst(node: AgentNode) -> None:
-            plan = get_task_plan(task)
-            retriever = EvidenceRetriever(db)
-            claim_ids: list[int] = []
-            for competitor in plan.competitors:
-                _console("llm analyst started", {"task_id": task_id, "node_key": node_key, "competitor": competitor})
-                query, source_type = _analysis_query(competitor, claim_type, dimension, plan.topic)
-                evidence = retriever.search(
-                    task_id=task_id,
-                    query=query,
-                    competitor_name=competitor,
-                    source_type=source_type,
-                    top_k=8,
-                    node_id=node.id,
+    def _run_one_analyst_thread(node_key: str, force: bool = False) -> tuple[str, list[int]]:
+        claim_type, dimension = ANALYST_SPECS[node_key]
+        local_db = SessionLocal()
+        local_claim_ids: list[int] = []
+        try:
+            def run_logic(node: AgentNode) -> None:
+                local_claim_ids.extend(_run_analyst_logic(local_db, task_id, node, node_key, claim_type, dimension))
+
+            _run_node(local_db, task_id, node_key, "analyzing", run_logic, force=force)
+            return node_key, local_claim_ids
+        finally:
+            local_db.close()
+
+    def run_parallel_analysts(node_keys: list[str] | None = None, force: bool = False) -> None:
+        selected_node_keys = node_keys or list(ANALYST_SPECS)
+        selected_node_keys = [node_key for node_key in selected_node_keys if node_key in ANALYST_SPECS]
+        if not selected_node_keys:
+            return
+        _console("parallel analysts started", {"task_id": task_id, "node_keys": selected_node_keys, "force": force})
+        add_log(db, task_id, None, "Parallel analysts started", {"node_keys": selected_node_keys, "force": force})
+        db.commit()
+        with ThreadPoolExecutor(max_workers=len(selected_node_keys), thread_name_prefix=f"analyst-{task_id}") as executor:
+            futures = {executor.submit(_run_one_analyst_thread, node_key, force): node_key for node_key in selected_node_keys}
+            for future in as_completed(futures):
+                node_key = futures[future]
+                completed_node_key, claim_ids = future.result()
+                state.setdefault("claim_ids", []).extend(claim_ids)
+                _console(
+                    "parallel analyst completed",
+                    {"task_id": task_id, "node_key": completed_node_key, "claim_count": len(claim_ids)},
                 )
-                if not evidence and source_type:
-                    evidence = retriever.search(
-                        task_id=task_id,
-                        query=query,
-                        competitor_name=competitor,
-                        top_k=8,
-                        node_id=node.id,
-                    )
-                _console("analyst evidence retrieved", retriever.last_search_log)
-                prompt = f"""
-你是严谨的竞品分析 Agent。请只基于给定 evidence 生成 {dimension} 维度的结构化结论。
-竞品：{competitor}
-分析主题：{plan.topic}
-证据：
-{_evidence_context(evidence, limit=12)}
-
-输出 JSON 数组，最多 3 条。每条格式：
-{{"claim_text":"中文结论，必须具体且可被证据支撑","evidence_ids":[数字ID],"confidence":0.0到1.0,"risk_level":"low|medium|high"}}
-不要输出 JSON 之外的内容。
-"""
-                raw = llm.complete(prompt, system="你只输出合法 JSON，不编造证据。")
-                parsed = _json_from_text(raw)
-                if isinstance(parsed, dict):
-                    parsed = parsed.get("claims", [])
-                for item in parsed[:3]:
-                    evidence_ids = [int(eid) for eid in item.get("evidence_ids", []) if str(eid).isdigit()]
-                    valid_ids = [eid for eid in evidence_ids if any(chunk.id == eid for chunk in evidence)]
-                    if not valid_ids and evidence:
-                        valid_ids = [evidence[0].id]
-                    claim = Claim(
-                        task_id=task_id,
-                        agent_node_id=node.id,
-                        competitor_name=competitor,
-                        claim_type=claim_type,
-                        claim_text=str(item.get("claim_text") or "").strip(),
-                        confidence=Decimal(str(item.get("confidence", 0.75))).quantize(Decimal("0.01")),
-                        risk_level=str(item.get("risk_level") or "medium"),
-                    )
-                    if not claim.claim_text:
-                        continue
-                    db.add(claim)
-                    db.flush()
-                    for evidence_id in valid_ids[:4]:
-                        db.add(ClaimEvidence(claim_id=claim.id, evidence_chunk_id=evidence_id))
-                    claim_ids.append(claim.id)
-                _console("llm analyst completed", {"task_id": task_id, "node_key": node_key, "competitor": competitor, "claim_count_so_far": len(claim_ids)})
+                add_log(db, task_id, None, "Parallel analyst completed", {"node_key": completed_node_key, "claim_count": len(claim_ids)})
                 db.commit()
-            if not claim_ids:
-                raise RuntimeError(f"{node_key} did not produce claims")
-            node.output_summary = f"{node_key} 使用 LLM 生成 {len(claim_ids)} 条 Claim"
-            state.setdefault("claim_ids", []).extend(claim_ids)
-
-        return analyst
+        db.expire_all()
+        _console("parallel analysts completed", {"task_id": task_id, "node_keys": selected_node_keys})
 
     def report_writer(node: AgentNode) -> None:
         plan = get_task_plan(task)
@@ -785,10 +1012,7 @@ Claims:
     _run_node(db, task_id, "planner", "planned", planner)
     _run_node(db, task_id, "collector", "collecting", collector)
     _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor)
-    _run_node(db, task_id, "feature_analysis", "analyzing", analyst_factory("feature_analysis", "feature", "产品定位、核心功能、Agent 能力、IDE 集成"))
-    _run_node(db, task_id, "pricing_analysis", "analyzing", analyst_factory("pricing_analysis", "pricing", "价格策略、套餐结构、个人与团队商业化"))
-    _run_node(db, task_id, "market_analysis", "analyzing", analyst_factory("market_analysis", "market", "适用用户、市场定位、企业能力"))
-    _run_node(db, task_id, "security_analysis", "analyzing", analyst_factory("security_analysis", "security", "安全合规、隐私、企业治理能力"))
+    run_parallel_analysts()
     _run_node(db, task_id, "report_writer", "writing", report_writer)
     _run_node(db, task_id, "qa", "qa_checking", qa)
     if not state.get("qa_passed") and state.get("revision_round", 0) < state.get("max_revision_rounds", 1):
@@ -815,40 +1039,25 @@ Claims:
             {"task_id": task_id, "next_action": action, "target_nodes": target_nodes, "revision_round": state["revision_round"]},
         )
         if action == "recollect":
-            _run_node(db, task_id, "collector", "collecting", collector)
-            _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor)
+            _run_node(db, task_id, "collector", "collecting", collector, force=True)
+            _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor, force=True)
             targets = [node_key for node_key in target_nodes if node_key.endswith("_analysis")] or [
                 "feature_analysis",
                 "pricing_analysis",
                 "market_analysis",
                 "security_analysis",
             ]
-            for target in targets:
-                if target == "feature_analysis":
-                    _run_node(db, task_id, target, "analyzing", analyst_factory(target, "feature", "产品定位、核心功能、Agent 能力、IDE 集成"))
-                elif target == "pricing_analysis":
-                    _run_node(db, task_id, target, "analyzing", analyst_factory(target, "pricing", "价格策略、套餐结构、个人与团队商业化"))
-                elif target == "market_analysis":
-                    _run_node(db, task_id, target, "analyzing", analyst_factory(target, "market", "适用用户、市场定位、企业能力"))
-                elif target == "security_analysis":
-                    _run_node(db, task_id, target, "analyzing", analyst_factory(target, "security", "安全合规、隐私、企业治理能力"))
-            _run_node(db, task_id, "report_writer", "writing", report_writer)
-            _run_node(db, task_id, "qa", "qa_checking", qa)
+            run_parallel_analysts(targets, force=True)
+            _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
+            _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
         elif action == "reanalyze":
-            for target in target_nodes or ["feature_analysis"]:
-                if target == "feature_analysis":
-                    _run_node(db, task_id, target, "analyzing", analyst_factory(target, "feature", "产品定位、核心功能、Agent 能力、IDE 集成"))
-                elif target == "pricing_analysis":
-                    _run_node(db, task_id, target, "analyzing", analyst_factory(target, "pricing", "价格策略、套餐结构、个人与团队商业化"))
-                elif target == "market_analysis":
-                    _run_node(db, task_id, target, "analyzing", analyst_factory(target, "market", "适用用户、市场定位、企业能力"))
-                elif target == "security_analysis":
-                    _run_node(db, task_id, target, "analyzing", analyst_factory(target, "security", "安全合规、隐私、企业治理能力"))
-            _run_node(db, task_id, "report_writer", "writing", report_writer)
-            _run_node(db, task_id, "qa", "qa_checking", qa)
+            run_parallel_analysts(target_nodes or ["feature_analysis"], force=True)
+            _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
+            _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
         elif action == "rewrite":
-            _run_node(db, task_id, "report_writer", "writing", report_writer)
-            _run_node(db, task_id, "qa", "qa_checking", qa)
+            _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
+            _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
+    _check_task_control(db, task_id)
     update_task_status(db, task_id, "success")
     _console("analysis workflow completed", {"task_id": task_id})
     return state

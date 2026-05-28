@@ -7,8 +7,16 @@ function addCompetitor() {
   model.value.competitors.push('')
 }
 
+function removeCompetitor(index: number) {
+  model.value.competitors.splice(index, 1)
+}
+
 function addDimension() {
   model.value.analysis_dimensions.push('')
+}
+
+function removeDimension(index: number) {
+  model.value.analysis_dimensions.splice(index, 1)
 }
 </script>
 
@@ -45,23 +53,19 @@ function addDimension() {
     </el-row>
     <el-form-item label="竞品列表">
       <div class="chip-editor">
-        <el-input
-          v-for="(_, index) in model.competitors"
-          :key="index"
-          v-model="model.competitors[index]"
-          class="chip-input"
-        />
+        <div v-for="(_, index) in model.competitors" :key="index" class="chip-row">
+          <el-input v-model="model.competitors[index]" class="chip-input" />
+          <el-button type="danger" plain @click="removeCompetitor(index)">删除</el-button>
+        </div>
         <el-button @click="addCompetitor">添加</el-button>
       </div>
     </el-form-item>
     <el-form-item label="分析维度">
       <div class="chip-editor">
-        <el-input
-          v-for="(_, index) in model.analysis_dimensions"
-          :key="index"
-          v-model="model.analysis_dimensions[index]"
-          class="chip-input"
-        />
+        <div v-for="(_, index) in model.analysis_dimensions" :key="index" class="chip-row">
+          <el-input v-model="model.analysis_dimensions[index]" class="chip-input" />
+          <el-button type="danger" plain @click="removeDimension(index)">删除</el-button>
+        </div>
         <el-button @click="addDimension">添加</el-button>
       </div>
     </el-form-item>
@@ -88,6 +92,12 @@ function addDimension() {
   flex-wrap: wrap;
   gap: 8px;
   width: 100%;
+}
+
+.chip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .chip-input {

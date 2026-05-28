@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 from threading import Event, Thread
 
 from celery.signals import worker_ready, worker_shutdown
@@ -8,7 +8,8 @@ from app.core.celery_app import CELERY_QUEUE_NAME, celery_app
 from app.core.database import SessionLocal
 from app.core.config import settings
 from app.core.redis_runtime import broker_analysis_task_ids, clear_worker_heartbeat, write_worker_heartbeat
-from app.graph.workflow import _console, run_competitive_analysis
+from app.core.timezone import now_bj
+from app.graph.workflow import TaskCanceled, TaskPaused, _console, run_competitive_analysis
 from app.models.agent_node import AgentNode
 from app.models.analysis_task import AnalysisTask
 from app.services.task_service import update_task_status
@@ -40,7 +41,7 @@ def _recover_missing_queued_tasks() -> None:
     db = SessionLocal()
     try:
         broker_task_ids = broker_analysis_task_ids()
-        recover_after = datetime.utcnow() - timedelta(seconds=settings.celery_queued_recovery_max_age_seconds)
+        recover_after = now_bj() - timedelta(seconds=settings.celery_queued_recovery_max_age_seconds)
         queued_tasks = list(db.scalars(select(AnalysisTask).where(AnalysisTask.status == "queued").order_by(AnalysisTask.id)))
         for task in queued_tasks:
             if task.updated_at and task.updated_at < recover_after:
@@ -79,7 +80,7 @@ def on_worker_shutdown(sender=None, **kwargs) -> None:
         _console("celery worker heartbeat cleanup failed", {"error": str(exc)})
 
 
-@celery_app.task(bind=True, max_retries=3, ignore_result=True, name="app.worker.run_analysis_task")
+@celery_app.task(bind=True, max_retries=0, ignore_result=True, name="app.worker.run_analysis_task")
 def run_analysis_task(self, task_id: int):
     _console("celery task received", {"task_id": task_id, "celery_task_id": self.request.id, "queue": CELERY_QUEUE_NAME})
     db = SessionLocal()
@@ -95,9 +96,28 @@ def run_analysis_task(self, task_id: int):
         result = run_competitive_analysis(db, task_id)
         _console("celery task completed", {"task_id": task_id, "celery_task_id": self.request.id})
         return result
+    except TaskPaused as exc:
+        _console("celery task paused", {"task_id": task_id, "celery_task_id": self.request.id})
+        update_task_status(db, task_id, "paused", str(exc))
+        return {"paused": True}
+    except TaskCanceled as exc:
+        _console("celery task canceled", {"task_id": task_id, "celery_task_id": self.request.id})
+        update_task_status(db, task_id, "canceled", str(exc))
+        return {"canceled": True}
     except Exception as exc:
+        task = db.get(AnalysisTask, task_id)
+        if task is not None:
+            db.refresh(task)
+            if task.status in {"cancel_requested", "canceled"}:
+                _console("celery task canceled after exception", {"task_id": task_id, "error": str(exc)})
+                update_task_status(db, task_id, "canceled", "任务已取消")
+                return {"canceled": True}
+            if task.status in {"pause_requested", "paused"}:
+                _console("celery task paused after exception", {"task_id": task_id, "error": str(exc)})
+                update_task_status(db, task_id, "paused", "任务已暂停")
+                return {"paused": True}
         _console("celery task failed", {"task_id": task_id, "error": str(exc)})
         update_task_status(db, task_id, "failed", str(exc))
-        raise self.retry(exc=exc, countdown=30)
+        return {"failed": True, "error": str(exc)}
     finally:
         db.close()

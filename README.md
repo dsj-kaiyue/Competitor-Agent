@@ -19,10 +19,17 @@ AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话�
 今晚新增或升级：
 
 - 资料采集 Agent 支持并行 Firecrawl search/scrape worker。
-- 证据抽取 Agent 支持并行 embedding + Milvus upsert worker。
+- 证据抽取 Agent 支持批量 embedding、批量 Milvus insert 和并行 embedding worker。
+- 证据抽取阶段会记录切块、MySQL、Embedding、Milvus 的阶段耗时。
+- 四个 Analyst Agent 已改为后端真正并行执行，并且每个 Analyst 使用独立 DB Session。
 - DAG 页面可视化展示并行采集 worker 和并行证据 worker。
 - Analyst Agent 改为 Milvus RAG 检索，不再只按竞品从 MySQL 全量读取 evidence。
 - ReportWriter 输出结构化 `report_json.sections`，报告段落可展开 Claim 和 Evidence。
+- 报告页支持导出 Markdown 文件和 PDF 文件。
+- 任务控制支持暂停、恢复、取消和手动重试；Celery 不再对业务失败自动反复 retry。
+- 任务规划 Agent 在正式执行时只确认用户修改后的 TaskPlan，不再二次 LLM 解析覆盖前端修改。
+- 创建页的竞品列表和分析维度支持添加、编辑和删除。
+- 数据库新写入时间统一使用北京时间。
 - QA 结果扩展为带 `next_action / target_nodes / revision_round` 的结构化 payload。
 - QA 不通过时最多返工 1 轮，可回流到 collector、analyst 或 report_writer。
 - DAG 页面支持 QA 回流虚线边。
@@ -68,6 +75,7 @@ Firecrawl -> SourceDocument -> EvidenceChunk -> Milvus
 - Redis 只做队列和运行态心跳。
 - Milvus 只做向量检索，Evidence 原文仍以 MySQL 为准。
 - 前端通过轮询任务、节点和日志接口展示动态执行过程。
+- 数据库新写入时间统一使用北京时间，历史 UTC 数据不会自动回写。
 
 ## 技术框架
 
@@ -83,6 +91,7 @@ Firecrawl -> SourceDocument -> EvidenceChunk -> Milvus
 - pymilvus：Milvus 写入和检索。
 - OpenAI 兼容 SDK：DeepSeek Chat 模型与 DashScope embedding 模型调用。
 - Firecrawl SDK：网页搜索与抓取。
+- markdown + reportlab：报告 Markdown 渲染与 PDF 文件导出。
 
 ### 前端
 
@@ -165,7 +174,7 @@ evidence_extractor
                           qa
 ```
 
-前端会把四个 Analyst 显示为并行分支。当前后端中四个 Analyst 仍按顺序执行，但每个 Analyst 已经使用 Milvus RAG 检索证据。
+前端会把四个 Analyst 显示为并行分支；后端也会使用独立线程并行执行四个 Analyst。每个 Analyst 都会创建独立 SQLAlchemy Session、独立 EvidenceRetriever 和独立 LLMClient，避免跨线程共享 DB Session。
 
 ### 运行时并行 worker 可视化
 
@@ -198,6 +207,7 @@ evidence_extractor
 ```env
 COLLECTOR_MAX_WORKERS=4
 EVIDENCE_EXTRACTOR_MAX_WORKERS=4
+EVIDENCE_EMBEDDING_BATCH_SIZE=8
 ```
 
 如果外部服务限流，可以调小；如果网络和 API 稳定，可以逐步调大。
@@ -224,11 +234,14 @@ Planner Agent 输出 TaskPlan：
 - `auto_discover_competitors`
 - `data_sources`
 
-重要修复：
+当前行为：
 
 - 以前 LLM 解析失败会 fallback 到 AI 编程助手 demo 数据。
 - 现在 fallback 会根据用户输入推断目标产品和行业，不再硬编码 Cursor / Copilot / Windsurf / Tabnine。
 - 如果用户只给目标产品和行业，不给竞品，则 `auto_discover_competitors=true`，collector 会自动搜索竞品。
+- 前端会展示 TaskPlan，用户可以继续编辑竞品、分析维度、报告深度和输出语言。
+- 竞品列表和分析维度都支持添加、编辑和删除。
+- 点击“开始分析”后，workflow 中的 `planner` 节点只确认和落库最终 TaskPlan，不再重新调用 LLM 解析 `user_input`，因此不会覆盖用户在前端修改过的竞品或分析维度。
 
 ### 2. 创建任务
 
@@ -277,10 +290,27 @@ Evidence Extractor 执行：
 1. 读取 `source_document`。
 2. 清洗 Markdown / HTML 文本。
 3. 按约 1400 字符切片，overlap 约 180。
-4. 先创建 `evidence_chunk` 行。
-5. 并发调用 embedding。
-6. 并发写入 Milvus。
-7. 主线程更新 `evidence_chunk.milvus_vector_id`。
+4. 批量创建 `evidence_chunk` 行。
+5. 按 `EVIDENCE_EMBEDDING_BATCH_SIZE` 分批调用 embedding。
+6. 使用 `EVIDENCE_EXTRACTOR_MAX_WORKERS` 并发处理 embedding batch。
+7. 批量写入 Milvus，并在每批 insert 后 flush。
+8. 批量更新 `evidence_chunk.milvus_vector_id`。
+9. 记录切块、MySQL 创建、Embedding、Milvus 写入、MySQL 更新和总耗时。
+
+DashScope `text-embedding-v4` 当前单次 embedding 请求最多 10 条 input，因此建议：
+
+```env
+EVIDENCE_EXTRACTOR_MAX_WORKERS=4
+EVIDENCE_EMBEDDING_BATCH_SIZE=8
+```
+
+如果 batch embedding 失败，系统会自动降级：
+
+1. 批量请求失败后拆成单条重试。
+2. 单条仍失败的 chunk 保留在 MySQL。
+3. 失败 chunk 的 `milvus_vector_id` 标记为 `embedding-failed-{chunk_id}`。
+4. 少量 chunk embedding 失败不会直接让整个任务失败。
+5. 后续 Analyst 如果 Milvus 没命中，会 fallback 到 MySQL evidence。
 
 Milvus collection：
 
@@ -368,6 +398,14 @@ fallback 示例：
 | `pricing_analysis` | pricing, plans, subscription, team, enterprise, official | `pricing_page` |
 | `market_analysis` | target users, market positioning, enterprise teams, strategy | 无强制 |
 | `security_analysis` | security, privacy, compliance, data protection, training data policy | 无强制 |
+
+执行方式：
+
+- 四个 Analyst 在后端使用 `ThreadPoolExecutor` 真正并行执行。
+- 每个 Analyst 线程独立创建 SQLAlchemy `SessionLocal()`。
+- 每个 Analyst 独立创建 `EvidenceRetriever`、`LLMClient` 和 Milvus 查询上下文。
+- 主线程只收集各 Analyst 生成的 claim id，并等待全部 Analyst 完成后再进入 `report_writer`。
+- QA 返工时，如果目标是多个 Analyst，也会并行重跑目标 Analyst。
 
 LLM 输出 Claim JSON：
 
@@ -509,6 +547,7 @@ frontend/src/components/DagFlow.vue
 - 展示按 Agent 分组的日志。
 - 日志按时间倒序显示，最新动态在上方。
 - 同一 Agent 的日志可折叠。
+- 跳转阶段耗时页面。
 
 ### 历史记录页
 
@@ -536,6 +575,23 @@ frontend/src/views/EvidenceView.vue
 
 - 查看 Evidence Chunk。
 - 查看来源 URL、标题、source_type、竞品、可信度。
+
+### 阶段耗时页
+
+文件：
+
+```text
+frontend/src/views/TimingView.vue
+```
+
+能力：
+
+- 查看 `log_type=metric` 的性能日志。
+- 展示证据抽取阶段的文档数、chunk 数、embedding 批次数、并发 worker 数。
+- 可视化展示文本切块、MySQL 创建 chunk、批量 embedding、Milvus 批量写入、MySQL 更新向量 ID 的耗时。
+- QA 返工导致多次证据抽取时，可通过“证据抽取轮次”选择器查看每一轮。
+- 显示 embedding 失败 chunk 数，辅助判断批量 embedding 是否触发限流或参数错误。
+- 用于判断瓶颈在 DashScope embedding、Milvus、MySQL 还是本地切块。
 
 ### 报告页
 
@@ -565,12 +621,12 @@ frontend/src/views/ReportView.vue
 | `topic` | 主题 |
 | `industry` | 行业 |
 | `target_product` | 目标产品 |
-| `status` | 任务状态 |
+| `status` | 任务状态，例如 `queued / running / paused / pause_requested / canceled / cancel_requested / success / failed` |
 | `report_depth` | 报告深度 |
 | `output_language` | 输出语言 |
 | `task_plan_json` | TaskPlan JSON |
 | `error_message` | 错误信息 |
-| `created_at / updated_at` | 时间戳 |
+| `created_at / updated_at` | 时间戳，新写入数据使用北京时间 |
 
 ### `agent_node`
 
@@ -582,7 +638,7 @@ frontend/src/views/ReportView.vue
 | `node_key` | 节点 key |
 | `node_name` | 节点名 |
 | `node_type` | 节点类型 |
-| `status` | `pending / running / success / failed` |
+| `status` | `pending / running / paused / canceled / success / failed` |
 | `input_summary` | 输入摘要 |
 | `output_summary` | 输出摘要 |
 | `started_at / ended_at` | 开始和结束时间 |
@@ -604,6 +660,13 @@ Agent 运行日志。
 | `message` | 日志文本 |
 | `payload_json` | 结构化 payload |
 | `created_at` | 时间 |
+
+`log_type` 目前包括：
+
+- `info`：普通执行日志。
+- `warning`：降级、跳过、弱错误等告警。
+- `error`：节点失败或外部调用失败。
+- `metric`：阶段耗时指标，目前主要用于证据抽取阶段。
 
 ### `source_document`
 
@@ -692,12 +755,27 @@ QA 结果。
 | `GET` | `/api/v1/analysis-tasks` | 历史任务 |
 | `POST` | `/api/v1/analysis-tasks` | 创建任务 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}` | 任务详情 |
+| `POST` | `/api/v1/analysis-tasks/{task_id}/pause` | 请求暂停任务，运行中任务会在最近的检查点停为 `paused` |
+| `POST` | `/api/v1/analysis-tasks/{task_id}/resume` | 恢复已暂停任务，重新入队并跳过已成功节点 |
+| `POST` | `/api/v1/analysis-tasks/{task_id}/cancel` | 请求取消任务，队列中任务直接取消，运行中任务在最近检查点取消 |
+| `POST` | `/api/v1/analysis-tasks/{task_id}/retry` | 重试任务，清理旧采集数据、证据、结论、报告和 QA 后从头执行 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/nodes` | DAG 节点和边，包含虚拟并行 worker |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/logs` | Agent 日志 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/evidence` | Evidence Chunk |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/claims` | Claim |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/report` | 报告、Claim、Evidence、QA payload |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/report/export?format=markdown` | 导出 Markdown 报告文件 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/report/export?format=pdf` | 导出 PDF 报告文件 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/qa` | QA 结果 |
+
+任务控制说明：
+
+- 暂停和取消是协作式控制，不会强杀正在进行中的 Firecrawl、LLM、Embedding 或 Milvus 调用。
+- 后端会在每个 Agent 节点开始前，以及采集、证据抽取、分析循环中检查控制状态。
+- 暂停后的任务状态为 `paused`，恢复时重新入队，已经 `success` 的节点会跳过，`paused` 节点会继续执行。
+- 取消后的任务状态为 `canceled`，不会自动清理已经写入的中间数据。
+- 重试会清理该任务旧的 `source_document / evidence_chunk / claim / claim_evidence / report / qa_result`，并将所有节点重置为 `pending` 后重新执行。
+- Celery 任务的自动业务 retry 已关闭，失败后不会自己反复重跑；需要用户在前端手动点击“重试”。
 
 ## 配置
 
@@ -744,12 +822,14 @@ CELERY_QUEUED_RECOVERY_MAX_AGE_SECONDS=1800
 
 COLLECTOR_MAX_WORKERS=4
 EVIDENCE_EXTRACTOR_MAX_WORKERS=4
+EVIDENCE_EMBEDDING_BATCH_SIZE=8
 ```
 
 并发配置建议：
 
 - `COLLECTOR_MAX_WORKERS=2~4`：Firecrawl 慢或限流时调小。
-- `EVIDENCE_EXTRACTOR_MAX_WORKERS=4~8`：embedding 服务稳定时可调大。
+- `EVIDENCE_EXTRACTOR_MAX_WORKERS=4~8`：embedding 服务稳定时可调大；并发过高会触发限流。
+- `EVIDENCE_EMBEDDING_BATCH_SIZE=1~10`：DashScope `text-embedding-v4` 单次请求最多 10 条 input，建议 8。
 - 并发越高，越可能触发 Firecrawl / embedding / Milvus 限流。
 
 前端配置：
@@ -908,6 +988,7 @@ python -c "from app.core.config import settings; from pymilvus import MilvusClie
 3. 点击“解析需求”。
 4. 检查 TaskPlan。
 5. 点击“开始分析”。
+   - 任务会使用前端最终确认的 TaskPlan，不会再二次规划覆盖你的修改。
 6. 进入任务详情页，观察：
    - 主 DAG。
    - 并行采集 worker。
@@ -915,9 +996,10 @@ python -c "from app.core.config import settings; from pymilvus import MilvusClie
    - 四个 Analyst 分支。
    - QA 回流边。
    - Agent 日志。
-7. 进入证据链页查看网页来源。
-8. 进入报告页展开段落依据，查看 Claim 和 Evidence。
-9. 进入历史记录页查看以前的任务。
+7. 进入阶段耗时页查看证据抽取每轮耗时。
+8. 进入证据链页查看网页来源。
+9. 进入报告页展开段落依据，查看 Claim 和 Evidence。
+10. 进入历史记录页查看以前的任务。
 
 ## 当前已验证
 
@@ -934,7 +1016,7 @@ npm run build
 
 当前系统已经是可运行 MVP+，但仍有一些边界：
 
-- 四个 Analyst 后端仍是顺序执行，前端展示为逻辑并行分支。
+- 四个 Analyst 后端已真正并行执行；后续仍可继续增加独立超时、限流和部分失败降级策略。
 - Collector 和 Evidence Extractor 已经做了并发 worker。
 - 并行 worker 是虚拟可视化节点，不是独立 Celery task。
 - QA 返工最多 1 轮，避免无限循环。
@@ -947,43 +1029,15 @@ npm run build
 
 建议后续优先级：
 
-1. 将四个 Analyst 改为真正并行执行，并保持 DB Session 隔离。
-2. 将 collector/evidence worker 从线程池升级为可观测的 Celery 子任务。
-3. 增加任务取消、暂停、重试能力。
+1. 将 collector/evidence worker 从线程池升级为可观测的 Celery 子任务。
+2. 为并行 Analyst 增加独立超时、限流和部分失败降级策略。
+3. 增强任务控制的生产级能力，例如 Celery revoke、任务取消补偿清理、断点级恢复。
 4. 增加每个 worker 的真实进度，而不是只跟随父节点状态。
 5. 增加 Firecrawl / LLM / Embedding / Milvus 的限流和重试策略。
 6. 增加死信队列和失败任务恢复。
 7. 优化 RAG query，根据用户选择的维度动态生成检索 query。
 8. 增加 Evidence 去重、来源权重、时间新鲜度评分。
 9. 增加更严格的 Claim schema 和报告评分 rubric。
-10. 增加导出能力：Markdown、PDF、Word、HTML。
+10. 扩展导出能力：Word、HTML、带证据附录的审计版 PDF。
 11. 增加多任务并发队列和任务优先级。
 12. 增加评测集，用固定需求自动评估报告质量和证据命中率。
-
-## 给 ChatGPT 的讨论摘要
-
-如果要和 ChatGPT 继续讨论，可以直接复制下面这段：
-
-```text
-我现在有一个 FastAPI + Vue + Redis/Celery + MySQL + Milvus + Firecrawl + LLM 的竞品分析 Agent 系统。
-
-当前主链路：
-1. Planner 解析用户需求为 TaskPlan，支持自动发现竞品。
-2. Collector 用 Firecrawl 搜索和抓取网页，已支持并行 search/scrape worker。
-3. Evidence Extractor 清洗网页、切 chunk、embedding、写 MySQL 和 Milvus，已支持并行 embedding/Milvus worker。
-4. 四个 Analyst：feature/pricing/market/security，使用 Milvus RAG 检索 evidence，再生成 Claim。
-5. ReportWriter 基于 Claim 生成结构化 report_json.sections 和 Markdown。
-6. 报告页可以展开每个段落对应的 Claim 和 Evidence。
-7. QA Agent 做规则检查和 LLM 复核，结果包含 issues、next_action、target_nodes、revision_round。
-8. QA 不通过时最多返工 1 轮，可回流 collector、analyst 或 report_writer。
-9. 前端 VueFlow 展示 DAG、并行 worker、四个 Analyst 分支和 QA 回流边。
-10. MySQL 保存业务数据，Milvus 保存向量，Redis 只做 Celery Broker 和 Worker 心跳。
-
-当前问题和下一步：
-- 四个 Analyst 现在后端仍是顺序执行，想改成真正并行。
-- collector/evidence worker 现在是线程池和虚拟可视化节点，不是独立 Celery 子任务。
-- 需要设计更可靠的任务取消、重试、恢复、限流和监控机制。
-- 需要进一步优化 RAG query、Evidence 去重、来源权重、报告质量评分和导出能力。
-
-请基于这个系统现状，帮我规划下一阶段最值得做的技术改进路线。
-```

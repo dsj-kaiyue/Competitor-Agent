@@ -12,8 +12,8 @@ const hasTasks = computed(() => tasks.value.length > 0)
 
 function statusTagType(status: string) {
   if (status === 'success') return 'success'
-  if (status === 'failed') return 'danger'
-  if (status === 'queued') return 'warning'
+  if (['failed', 'canceled', 'cancel_requested'].includes(status)) return 'danger'
+  if (['queued', 'paused', 'pause_requested'].includes(status)) return 'warning'
   if (status === 'running') return 'primary'
   return 'info'
 }
@@ -205,8 +205,15 @@ onMounted(loadHistory)
   background: #f56c6c;
 }
 
+.node-dot.canceled,
+.node-dot.cancel_requested {
+  background: #f56c6c;
+}
+
 .node-dot.queued,
-.node-dot.pending {
+.node-dot.pending,
+.node-dot.paused,
+.node-dot.pause_requested {
   background: #e6a23c;
 }
 

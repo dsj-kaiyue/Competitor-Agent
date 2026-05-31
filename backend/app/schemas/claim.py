@@ -9,6 +9,8 @@ class ClaimItem(BaseModel):
     task_id: int
     competitor_name: str | None
     claim_type: str | None
+    dimension_key: str | None = None
+    dimension_label: str | None = None
     claim_text: str
     confidence: Decimal | None
     risk_level: str | None

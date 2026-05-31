@@ -26,6 +26,8 @@ class ReportClaimItem(BaseModel):
     claim_text: str
     competitor_name: str | None = None
     claim_type: str | None = None
+    dimension_key: str | None = None
+    dimension_label: str | None = None
     confidence: Decimal | None = None
     risk_level: str | None = None
     evidence_ids: list[int] = []

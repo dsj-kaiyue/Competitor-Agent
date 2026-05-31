@@ -128,6 +128,12 @@ class CompetitorProfileService:
         label = str(field.get("label") or "")
         matched: list[Claim] = []
         for claim in claims:
+            if claim.dimension_key and claim.dimension_key == key:
+                matched.append(claim)
+                continue
+            if claim.dimension_label and label and claim.dimension_label == label:
+                matched.append(claim)
+                continue
             claim_type = claim.claim_type or ""
             text = claim.claim_text or ""
             if key in CLAIM_TYPE_FIELDS.get(claim_type, set()):

@@ -1,3 +1,5 @@
+import hashlib
+
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Session
@@ -16,33 +18,74 @@ from app.models.report import Report
 from app.models.source_document import SourceDocument
 from app.schemas.analysis_task import AnalysisTaskCreateRequest
 from app.schemas.task_plan import TaskPlan
+from app.services.profile_schema_builder import ProfileSchemaBuilder
 
 
 NODE_DEFINITIONS = [
     ("planner", "任务规划 Agent", "planner"),
+    ("dimension_planner", "维度 Prompt Planner Agent", "dimension_planner"),
     ("collector", "资料采集 Agent", "collector"),
     ("evidence_extractor", "证据抽取 Agent", "evidence_extractor"),
-    ("feature_analysis", "功能分析 Agent", "analyst"),
-    ("pricing_analysis", "价格分析 Agent", "analyst"),
-    ("market_analysis", "市场分析 Agent", "analyst"),
-    ("security_analysis", "安全合规分析 Agent", "analyst"),
     ("report_writer", "报告撰写 Agent", "writer"),
     ("qa", "质量检查 Agent", "qa"),
 ]
 
 DAG_EDGES = [
-    {"source": "planner", "target": "collector", "type": "normal"},
+    {"source": "planner", "target": "dimension_planner", "type": "normal"},
+    {"source": "dimension_planner", "target": "collector", "type": "normal"},
     {"source": "collector", "target": "evidence_extractor", "type": "normal"},
-    {"source": "evidence_extractor", "target": "feature_analysis", "type": "normal"},
-    {"source": "evidence_extractor", "target": "pricing_analysis", "type": "normal"},
-    {"source": "evidence_extractor", "target": "market_analysis", "type": "normal"},
-    {"source": "evidence_extractor", "target": "security_analysis", "type": "normal"},
-    {"source": "feature_analysis", "target": "report_writer", "type": "normal"},
-    {"source": "pricing_analysis", "target": "report_writer", "type": "normal"},
-    {"source": "market_analysis", "target": "report_writer", "type": "normal"},
-    {"source": "security_analysis", "target": "report_writer", "type": "normal"},
     {"source": "report_writer", "target": "qa", "type": "normal"},
 ]
+
+
+def dimension_node_key(dimension_key: str) -> str:
+    safe_key = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in dimension_key.lower()).strip("_")
+    digest = hashlib.sha1(dimension_key.encode("utf-8")).hexdigest()[:8]
+    return f"dimension_analysis_{safe_key[:60]}_{digest}"
+
+
+def build_dimension_node_specs(plan: TaskPlan) -> list[dict]:
+    schema = ProfileSchemaBuilder().build_schema(plan.model_dump())
+    specs = []
+    for field in schema.get("fields", []):
+        dimension_key = str(field.get("key") or "").strip()
+        dimension_label = str(field.get("label") or dimension_key).strip()
+        if not dimension_key or not dimension_label:
+            continue
+        specs.append(
+            {
+                "node_key": dimension_node_key(dimension_key),
+                "node_name": f"{dimension_label}分析 Agent",
+                "dimension_key": dimension_key,
+                "dimension_label": dimension_label,
+                "field": field,
+            }
+        )
+    return specs
+
+
+def ensure_dimension_nodes(db: Session, task: AnalysisTask, plan: TaskPlan | None = None) -> list[AgentNode]:
+    plan = plan or get_task_plan(task)
+    specs = build_dimension_node_specs(plan)
+    existing = {node.node_key: node for node in db.scalars(select(AgentNode).where(AgentNode.task_id == task.id))}
+    nodes = []
+    for spec in specs:
+        node = existing.get(spec["node_key"])
+        if node is None:
+            node = AgentNode(
+                task_id=task.id,
+                node_key=spec["node_key"],
+                node_name=spec["node_name"],
+                node_type="dimension_analyst",
+                status="pending",
+            )
+            db.add(node)
+            db.flush()
+        else:
+            node.node_name = spec["node_name"]
+            node.node_type = "dimension_analyst"
+        nodes.append(node)
+    return nodes
 
 
 def create_task(db: Session, request: AnalysisTaskCreateRequest) -> AnalysisTask:
@@ -61,6 +104,7 @@ def create_task(db: Session, request: AnalysisTaskCreateRequest) -> AnalysisTask
     db.flush()
     for node_key, node_name, node_type in NODE_DEFINITIONS:
         db.add(AgentNode(task_id=task.id, node_key=node_key, node_name=node_name, node_type=node_type, status="pending"))
+    ensure_dimension_nodes(db, task, plan)
     db.commit()
     db.refresh(task)
     return task
@@ -161,7 +205,15 @@ def reset_task_for_retry(db: Session, task_id: int) -> AnalysisTask | None:
     db.execute(delete(EvidenceChunk).where(EvidenceChunk.task_id == task_id).execution_options(synchronize_session=False))
     db.execute(delete(SourceDocument).where(SourceDocument.task_id == task_id).execution_options(synchronize_session=False))
 
-    for node in task.nodes:
+    existing_node_keys = {node.node_key for node in task.nodes}
+    for node_key, node_name, node_type in NODE_DEFINITIONS:
+        if node_key not in existing_node_keys:
+            db.add(AgentNode(task_id=task.id, node_key=node_key, node_name=node_name, node_type=node_type, status="pending"))
+    ensure_dimension_nodes(db, task)
+    db.flush()
+
+    nodes = list(db.scalars(select(AgentNode).where(AgentNode.task_id == task_id)))
+    for node in nodes:
         node.status = "pending"
         node.input_summary = None
         node.output_summary = None
@@ -190,6 +242,28 @@ def list_nodes(db: Session, task_id: int) -> list[AgentNode]:
 
 def list_edges(db: Session, task_id: int) -> list[dict]:
     edges = [dict(edge) for edge in DAG_EDGES]
+    dimension_nodes = list(
+        db.scalars(
+            select(AgentNode)
+            .where(AgentNode.task_id == task_id, AgentNode.node_type == "dimension_analyst")
+            .order_by(AgentNode.id)
+        )
+    )
+    for node in dimension_nodes:
+        edges.append({"source": "evidence_extractor", "target": node.node_key, "type": "normal"})
+        edges.append({"source": node.node_key, "target": "report_writer", "type": "normal"})
+    existing_keys = {
+        row
+        for row in db.scalars(
+            select(AgentNode.node_key).where(
+                AgentNode.task_id == task_id,
+                AgentNode.node_key.in_(["feature_analysis", "pricing_analysis", "market_analysis", "security_analysis"]),
+            )
+        )
+    }
+    for node_key in sorted(existing_keys):
+        edges.append({"source": "evidence_extractor", "target": node_key, "type": "normal"})
+        edges.append({"source": node_key, "target": "report_writer", "type": "normal"})
     qa_results = list(db.scalars(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id.desc())))
     for qa_result in qa_results:
         payload = qa_result.issues_json

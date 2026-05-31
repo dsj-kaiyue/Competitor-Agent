@@ -154,6 +154,9 @@ def _with_parallel_worker_nodes(task_id: int, nodes: list, edges: list[dict]) ->
     node_by_key = {node.node_key: node for node in nodes}
     next_nodes = list(nodes)
     next_edges = [dict(edge) for edge in edges if edge.get("source") not in {"collector", "evidence_extractor"} or edge.get("type") == "revision"]
+    dimension_targets = [node.node_key for node in nodes if getattr(node, "node_type", None) == "dimension_analyst"]
+    if not dimension_targets:
+        dimension_targets = ["report_writer"]
 
     def add_workers(parent_key: str, worker_prefix: str, worker_name: str, worker_count: int, downstream_targets: list[str]) -> None:
         parent = node_by_key.get(parent_key)
@@ -190,7 +193,7 @@ def _with_parallel_worker_nodes(task_id: int, nodes: list, edges: list[dict]) ->
         "evidence_worker",
         "证据 Worker",
         settings.evidence_extractor_max_workers,
-        ["feature_analysis", "pricing_analysis", "market_analysis", "security_analysis"],
+        dimension_targets,
     )
     return next_nodes, next_edges
 
@@ -330,6 +333,8 @@ def get_task_claims(task_id: int, db: Session = Depends(get_db)) -> ClaimListRes
             task_id=claim.task_id,
             competitor_name=claim.competitor_name,
             claim_type=claim.claim_type,
+            dimension_key=claim.dimension_key,
+            dimension_label=claim.dimension_label,
             claim_text=claim.claim_text,
             confidence=claim.confidence,
             risk_level=claim.risk_level,
@@ -357,6 +362,8 @@ def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportRespon
                 claim_text=claim.claim_text,
                 competitor_name=claim.competitor_name,
                 claim_type=claim.claim_type,
+                dimension_key=claim.dimension_key,
+                dimension_label=claim.dimension_label,
                 confidence=claim.confidence,
                 risk_level=claim.risk_level,
                 evidence_ids=claim_evidence_ids,

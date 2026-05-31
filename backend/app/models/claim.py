@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
+from sqlalchemy import DateTime, ForeignKey, JSON, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -16,6 +16,9 @@ class Claim(Base):
     agent_node_id: Mapped[int | None] = mapped_column(ForeignKey("agent_node.id"))
     competitor_name: Mapped[str | None] = mapped_column(String(255))
     claim_type: Mapped[str | None] = mapped_column(String(100))
+    dimension_key: Mapped[str | None] = mapped_column(String(100), index=True)
+    dimension_label: Mapped[str | None] = mapped_column(String(255))
+    dimension_prompt_json: Mapped[dict | None] = mapped_column(JSON)
     claim_text: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(4, 2))
     risk_level: Mapped[str | None] = mapped_column(String(50))

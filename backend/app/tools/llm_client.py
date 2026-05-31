@@ -8,6 +8,17 @@ class LLMClient:
             models.extend(["qwen-plus", "qwen-turbo"])
         return list(dict.fromkeys([model for model in models if model]))
 
+    def _deepseek_thinking_kwargs(self, model_name: str) -> dict:
+        base_url = (settings.llm_base_url or "").lower()
+        model = model_name.lower()
+        if "deepseek" not in base_url and "deepseek" not in model:
+            return {}
+        thinking_type = "enabled" if settings.llm_thinking_enabled else "disabled"
+        kwargs: dict = {"extra_body": {"thinking": {"type": thinking_type}}}
+        if settings.llm_thinking_enabled and settings.llm_reasoning_effort:
+            kwargs["reasoning_effort"] = settings.llm_reasoning_effort
+        return kwargs
+
     def complete(self, prompt: str, system: str | None = None) -> str:
         if not settings.llm_api_key:
             return ""
@@ -21,7 +32,8 @@ class LLMClient:
                     api_key=settings.llm_api_key,
                     base_url=settings.llm_base_url,
                     timeout=90,
-                    temperature=0.2,
+                    temperature=0.2 if not settings.llm_thinking_enabled else None,
+                    **self._deepseek_thinking_kwargs(model_name),
                 )
                 messages = []
                 if system:

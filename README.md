@@ -2,11 +2,11 @@
 
 AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话竞品分析需求解析成结构化任务计划，然后通过多 Agent 协作完成资料采集、证据抽取、向量检索、结构化分析、报告生成、QA 复核和报告溯源。
 
-这份 README 记录当前项目的真实状态，重点覆盖今晚完成的核心升级，适合拿去和 ChatGPT 继续讨论下一步行动方案。
+这份 README 记录项目的真实系统形态，覆盖整体架构、Agent 协作方式、数据流、配置流程、数据库设计、运行方式和当前能力边界，适合拿去和 ChatGPT 继续讨论下一步行动方案。
 
-## 当前版本状态
+## 系统能力概览
 
-当前版本已经跑通真实主链路：
+系统已经跑通真实主链路：
 
 - Firecrawl：公开网页搜索和抓取。
 - DeepSeek 兼容 OpenAI API：需求解析、Claim 生成、报告撰写、QA 复核。
@@ -14,34 +14,34 @@ AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话�
 - Milvus：Evidence Chunk 向量存储与 RAG 检索。
 - MySQL：任务、节点、日志、网页、证据、结论、报告、QA 结果的主存储。
 - Redis + Celery：长任务异步执行。
-- Vue 3 + VueFlow：前端展示任务 DAG、并行 worker、日志、证据链、报告和历史任务。
+- Vue 3 + VueFlow：前端展示任务 DAG、并行 worker、日志、证据链、报告、阶段耗时和历史任务。
 
-今晚新增或升级：
+核心能力：
 
 - 资料采集 Agent 支持并行 Firecrawl search/scrape worker。
 - 证据抽取 Agent 支持批量 embedding、批量 Milvus insert 和并行 embedding worker。
-- 证据抽取阶段会记录切块、MySQL、Embedding、Milvus 的阶段耗时。
-- 四个 Analyst Agent 已改为后端真正并行执行，并且每个 Analyst 使用独立 DB Session。
-- DAG 页面可视化展示并行采集 worker 和并行证据 worker。
-- Analyst Agent 改为 Milvus RAG 检索，不再只按竞品从 MySQL 全量读取 evidence。
+- 证据抽取阶段记录切块、MySQL、Embedding、Milvus 的阶段耗时。
+- Analyst 执行层采用动态维度 Agent：`Dimension Prompt Planner Agent` 为每个分析维度生成 prompt spec，后端并行启动一个 `dimension_analysis_*` Agent 只分析该维度。
+- 每个动态维度 Analyst 使用独立 DB Session、独立 EvidenceRetriever、独立 LLMClient 和独立 Milvus 查询上下文。
+- DAG 页面可视化展示并行采集 worker、并行证据 worker、动态维度 Analyst 和 QA 回流边。
+- Analyst Agent 使用 Milvus RAG 检索 evidence，Milvus 未命中时 fallback 到 MySQL evidence。
 - ReportWriter 输出结构化 `report_json.sections`，报告段落可展开 Claim 和 Evidence。
-- 报告页支持导出 Markdown 文件和 PDF 文件。
-- 任务控制支持暂停、恢复、取消和手动重试；Celery 不再对业务失败自动反复 retry。
-- 任务规划 Agent 在正式执行时只确认用户修改后的 TaskPlan，不再二次 LLM 解析覆盖前端修改。
+- 报告页支持导出 Markdown 文件和 PDF 文件，并导出动态对比矩阵、QA 结果、结构化 Claim 和证据链。
+- 任务控制支持暂停、恢复、取消和手动重试；Celery 不对业务失败自动反复 retry。
+- 任务规划 Agent 在正式执行时只确认用户修改后的 TaskPlan，不二次 LLM 解析覆盖前端修改。
 - 创建页的竞品列表和分析维度支持添加、编辑和删除。
-- 创建页顶部保留“自动发现竞品”开关；只要打开，不管用户是否已输入竞品，解析阶段都会补充竞品并立即回填到前端供用户增删。
-- 创建页顶部新增“自动添加分析维度”开关；只要打开，不管用户是否已输入分析维度，解析阶段都会补充新的推荐维度并立即回填到前端供用户增删。
-- Planner Agent 会根据用户输入场景动态推荐 `analysis_dimensions`，不再固定套用 AI 编程助手字段；用户最终确认后的维度会生成动态画像 Schema。
-- 新增动态竞品画像 `competitor_profile` 和动态对比矩阵 `comparison_matrix`，画像字段全部存储在 JSON 中，不增加行业固定列。
-- ReportWriter 会优先基于动态画像和动态矩阵组织报告，同时保留 Claim/Evidence 溯源。
-- 报告接口仍返回动态画像和动态矩阵；报告页只展示“竞品动态对比矩阵”，避免把同一批画像信息重复显示两次。
-- 新增 `/api/v1/analysis-tasks/{task_id}/metrics`，任务详情页新增运行指标面板。
+- 创建页顶部提供“自动发现竞品”开关；只要打开，不管用户是否已输入竞品，解析阶段都会补充竞品并立即回填到前端供用户增删。
+- 创建页顶部提供“自动添加分析维度”开关；只要打开，不管用户是否已输入分析维度，解析阶段都会补充推荐维度并立即回填到前端供用户增删。
+- Planner Agent 根据用户输入场景动态推荐 `analysis_dimensions`，用户最终确认后的维度会生成动态画像 Schema。
+- 系统生成动态竞品画像 `competitor_profile` 和动态对比矩阵 `comparison_matrix`，画像字段全部存储在 JSON 中，不增加行业固定列。
+- ReportWriter 优先基于动态画像和动态矩阵组织报告，同时保留 Claim/Evidence 溯源。
+- 报告接口返回动态画像和动态矩阵；报告页只展示“竞品动态对比矩阵”，避免把同一批画像信息重复显示两次。
+- `/api/v1/analysis-tasks/{task_id}/metrics` 提供任务运行指标，任务详情页提供运行指标面板。
 - 数据库新写入时间统一使用北京时间。
-- QA 结果扩展为带 `next_action / target_nodes / revision_round` 的结构化 payload。
+- QA 结果使用带 `next_action / target_nodes / revision_round` 的结构化 payload。
 - QA 不通过时最多返工 1 轮，可回流到 collector、analyst 或 report_writer。
-- DAG 页面支持 QA 回流虚线边。
-- 首页新增历史分析记录入口，历史页可查看以往任务、节点状态、报告和证据链。
-- Planner 修复了 demo fallback 问题，不再把任意需求错误解析成 AI 编程工具竞品。
+- 首页提供历史分析记录入口，历史页可查看以往任务、节点状态、报告和证据链。
+- Planner fallback 根据用户输入推断目标产品、行业和竞品，不使用固定 AI 编程助手 demo 数据。
 
 ## 整体架构
 
@@ -140,7 +140,9 @@ model = ChatOpenAI(
     api_key=settings.llm_api_key,
     base_url=settings.llm_base_url,
     timeout=90,
-    temperature=0.2,
+    temperature=0.2 if not settings.llm_thinking_enabled else None,
+    extra_body={"thinking": {"type": "enabled/disabled"}},
+    reasoning_effort="high",  # 仅在 LLM_THINKING_ENABLED=true 时传入
 )
 
 messages = []
@@ -158,6 +160,8 @@ return str(model.invoke(messages).content)
 ```env
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-v4-pro
+LLM_THINKING_ENABLED=false
+LLM_REASONING_EFFORT=high
 ```
 
 因为使用的是 OpenAI 兼容 Chat Completions 协议，所以实际请求地址等价于：
@@ -174,6 +178,9 @@ POST https://api.deepseek.com/v1/chat/completions
 {
   "model": "deepseek-v4-pro",
   "temperature": 0.2,
+  "thinking": {
+    "type": "disabled"
+  },
   "messages": [
     {
       "role": "system",
@@ -188,6 +195,56 @@ POST https://api.deepseek.com/v1/chat/completions
 ```
 
 `timeout=90` 是客户端超时配置，不是请求体字段。
+
+### DeepSeek 思考模式开关
+
+DeepSeek 官方文档说明，OpenAI 兼容请求可通过 `extra_body` 中的 `thinking` 参数控制思考模式：
+
+```json
+{
+  "thinking": {
+    "type": "enabled"
+  }
+}
+```
+
+本项目提供两个 `.env` 配置：
+
+```env
+LLM_THINKING_ENABLED=false
+LLM_REASONING_EFFORT=high
+```
+
+含义：
+
+- `LLM_THINKING_ENABLED=false`：所有 DeepSeek Chat 请求都会携带 `thinking.type=disabled`，关闭思考模式。
+- `LLM_THINKING_ENABLED=true`：所有 DeepSeek Chat 请求都会携带 `thinking.type=enabled`，并传入 `reasoning_effort=LLM_REASONING_EFFORT`。
+- `LLM_REASONING_EFFORT` 建议使用 `high` 或 `max`。
+
+关闭思考模式时等价请求体：
+
+```json
+{
+  "model": "deepseek-v4-pro",
+  "messages": [],
+  "thinking": {
+    "type": "disabled"
+  }
+}
+```
+
+开启思考模式时等价请求体：
+
+```json
+{
+  "model": "deepseek-v4-pro",
+  "messages": [],
+  "reasoning_effort": "high",
+  "thinking": {
+    "type": "enabled"
+  }
+}
+```
 
 ### 返回取值与思考内容
 
@@ -399,63 +456,88 @@ competitors
 5. 返回前端后由用户最终增删确认。
 ```
 
-### 3. 四个 Analyst Agent
+### 3. 动态维度 Analyst Agent
 
 触发时机：
 
 ```text
-evidence_extractor 完成后
+dimension_planner 完成 prompt spec 规划，evidence_extractor 完成证据抽取后
 ```
 
-四个 Analyst 当前后端真正并行执行：
+系统不固定执行 `feature_analysis / pricing_analysis / market_analysis / security_analysis` 四个 Analyst，而是按用户确认的分析维度动态生成 Analyst。执行方式是：
 
 ```text
-feature_analysis
-pricing_analysis
-market_analysis
-security_analysis
+TaskPlan.analysis_dimensions
+  -> Dimension Prompt Planner Agent
+  -> 为每个维度生成一个 prompt spec
+  -> 并行启动 N 个 dimension_analysis_* Agent
+  -> 每个 Agent 只负责一个分析维度
 ```
 
 代码位置：
 
 ```text
 backend/app/graph/workflow.py
+backend/app/services/task_service.py
 ```
 
-System prompt：
+Dimension Prompt Planner 的 system prompt：
+
+```text
+你只输出合法 JSON。
+```
+
+Dimension Prompt Planner 的 user prompt 核心要求：
+
+```text
+你是 Dimension Prompt Planner Agent。请为每一个分析维度生成专属 prompt spec，供后续独立维度分析 Agent 使用。
+
+要求：
+1. 必须为每个字段输出一条 spec，不能新增或删除维度。
+2. dimension_key 必须等于字段 key，dimension_label 必须等于字段 label。
+3. analysis_goal、must_answer、evidence_focus、comparison_criteria 必须适配该维度和行业。
+4. 不要输出完整报告，不要执行分析。
+5. 只输出合法 JSON 数组。
+```
+
+Prompt spec 返回示例：
+
+```json
+[
+  {
+    "dimension_key": "structured_extraction_capabilities",
+    "dimension_label": "结构化抽取能力",
+    "analysis_goal": "比较各竞品在网页内容结构化抽取、字段还原和输出稳定性上的能力。",
+    "evidence_focus": ["official_website", "docs", "blog"],
+    "must_answer": ["支持哪些结构化输出", "是否有 API 或 SDK 支撑", "证据是否来自官方文档"],
+    "comparison_criteria": ["输出格式", "抽取稳定性", "开发者易用性"]
+  }
+]
+```
+
+每个动态 Dimension Analyst 的 system prompt：
 
 ```text
 你只输出合法 JSON，不编造证据。
 ```
 
-User prompt 模板：
+每个动态 Dimension Analyst 的 user prompt 会注入对应维度的 prompt spec，并要求只分析当前维度：
 
 ```text
-你是严谨的竞品分析 Agent。请只基于给定 evidence 生成 {dimension} 维度的结构化结论。
+你是一个动态维度竞品分析 Agent。你只负责一个分析维度，不要分析其它维度。
+当前维度 key：{dimension_key}
+当前维度名称：{dimension_label}
+分析目标：{analysis_goal}
+比较标准：{comparison_criteria}
+必须回答：
+{must_answer}
+
 竞品：{competitor}
 分析主题：{plan.topic}
 证据：
 {_evidence_context(evidence, limit=12)}
 
-输出 JSON 数组，最多 3 条。每条格式：
-{"claim_text":"中文结论，必须具体且可被证据支撑","evidence_ids":[数字ID],"confidence":0.0到1.0,"risk_level":"low|medium|high"}
-不要输出 JSON 之外的内容。
-```
-
-`dimension` 按 Agent 不同而不同：
-
-```text
-feature_analysis: 产品定位、核心功能、Agent 能力、IDE 集成
-pricing_analysis: 价格策略、套餐结构、个人与团队商业化
-market_analysis: 适用用户、市场定位、企业能力
-security_analysis: 安全合规、隐私、企业治理能力
-```
-
-`_evidence_context()` 会把 RAG 检索到的 evidence 拼进 prompt，格式大致为：
-
-```text
-[evidence_id=101] title=...; url=...; source_type=...
-证据正文片段...
+输出 JSON 数组，最多 3 条。
 ```
 
 期望返回：
@@ -463,7 +545,10 @@ security_analysis: 安全合规、隐私、企业治理能力
 ```json
 [
   {
-    "claim_text": "Apify 更偏向通用 Web 自动化和数据采集平台，提供面向开发者的 Actor 生态。",
+    "competitor_name": "Firecrawl",
+    "dimension_key": "structured_extraction_capabilities",
+    "dimension_label": "结构化抽取能力",
+    "claim_text": "Firecrawl 强调将网页转换为 LLM 友好的 Markdown 和结构化数据，适合 AI 应用的数据准备。",
     "evidence_ids": [101, 104],
     "confidence": 0.86,
     "risk_level": "low"
@@ -508,14 +593,22 @@ claim_evidence.evidence_chunk_id
 
 - `evidence_ids` 只允许引用本次传给 LLM 的 evidence。
 - 如果 LLM 没返回有效 `evidence_ids`，但本次 RAG 有 evidence，系统默认绑定第一条 evidence。
-- 每个竞品每个 Analyst 最多取 3 条 Claim。
+- 每个竞品每个动态维度 Analyst 最多取 3 条 Claim。
+
+容错策略：
+
+- 如果 DeepSeek 第一次返回空内容、解释性文字或非 JSON，后端会自动发起一次 JSON 修正请求。
+- 如果修正后仍不能解析、DeepSeek 返回 402/余额不足、请求超时、返回非数组 JSON、或在已有 evidence 的情况下返回空 Claim，该动态维度 Analyst 会失败，整个 workflow 会停在分析阶段，不会继续生成空报告。
+- 只有一种情况允许跳过：该动态维度 Analyst 对所有竞品都没有检索到任何可用 evidence。此时节点会记录 warning 和 `output_summary`，表示该维度因 evidence 缺失被跳过。
+- 如果所有动态维度 Analyst 都没有生成 Claim，workflow 会在 ReportWriter 之前失败，避免生成空报告。
+- QA 只处理已经进入报告阶段的结果；分析阶段真实失败不会被 QA 吞掉。
 
 ### 4. ReportWriter Agent
 
 触发时机：
 
 ```text
-四个 Analyst 全部完成后
+动态维度 Analyst 全部完成，且至少生成了 1 条 Claim 后
 ```
 
 代码位置：
@@ -765,17 +858,15 @@ POST https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
 
 ## Agent 与 DAG 设计
 
-系统会为每个分析任务创建 9 个持久化 Agent 节点，定义在 `backend/app/services/task_service.py`，执行逻辑在 `backend/app/graph/workflow.py`。
+系统会为每个分析任务创建基础 Agent 节点，并根据用户最终确认的 `analysis_dimensions` 动态创建 N 个维度分析节点。节点定义在 `backend/app/services/task_service.py`，执行逻辑在 `backend/app/graph/workflow.py`。
 
 | node_key | Agent | 职责 | 主要输出 |
 | --- | --- | --- | --- |
 | `planner` | 任务规划 Agent | 将用户自然语言解析为 TaskPlan；必要时自动发现竞品 | `task_plan_json` |
+| `dimension_planner` | 维度 Prompt Planner Agent | 为每个分析维度生成专属 prompt spec | `agent_node.input_summary` / 运行态 prompt spec |
 | `collector` | 资料采集 Agent | 生成搜索 query，调用 Firecrawl search/scrape | `source_document` |
 | `evidence_extractor` | 证据抽取 Agent | 清洗网页、切 chunk、embedding、写 Milvus | `evidence_chunk` |
-| `feature_analysis` | 功能分析 Agent | 基于 RAG evidence 生成产品/功能 Claim | `claim` |
-| `pricing_analysis` | 价格分析 Agent | 基于 RAG evidence 生成价格 Claim | `claim` |
-| `market_analysis` | 市场分析 Agent | 基于 RAG evidence 生成市场 Claim | `claim` |
-| `security_analysis` | 安全合规分析 Agent | 基于 RAG evidence 生成安全合规 Claim | `claim` |
+| `dimension_analysis_*` | 动态维度分析 Agent | 每个节点只负责一个分析维度，基于 RAG evidence 生成带 `dimension_key / dimension_label` 的 Claim | `claim` |
 | `report_writer` | 报告撰写 Agent | 基于 Claim 生成结构化报告 JSON 和 Markdown | `report` |
 | `qa` | QA Agent | 规则检查 + LLM 复核，必要时触发一次返工 | `qa_result` |
 
@@ -784,24 +875,26 @@ POST https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
 ```text
 planner
   |
+dimension_planner
+  |
 collector
   |
 evidence_extractor
-  |---------------- feature_analysis
-  |---------------- pricing_analysis
-  |---------------- market_analysis
-  |---------------- security_analysis
+  |---------------- dimension_analysis_维度1
+  |---------------- dimension_analysis_维度2
+  |---------------- dimension_analysis_维度3
+  |---------------- ...
                            |
                     report_writer
                            |
                           qa
 ```
 
-前端会把四个 Analyst 显示为并行分支；后端也会使用独立线程并行执行四个 Analyst。每个 Analyst 都会创建独立 SQLAlchemy Session、独立 EvidenceRetriever 和独立 LLMClient，避免跨线程共享 DB Session。
+前端会把动态维度 Analyst 显示为并行分支；后端也会使用独立线程并行执行这些维度 Analyst。每个维度 Analyst 都会创建独立 SQLAlchemy Session、独立 EvidenceRetriever 和独立 LLMClient，避免跨线程共享 DB Session。
 
 ### 运行时并行 worker 可视化
 
-今晚新增了两类虚拟 worker：
+系统提供两类虚拟 worker：
 
 ```text
 collector
@@ -857,10 +950,9 @@ Planner Agent 输出 TaskPlan：
 - `auto_discover_competitors`
 - `data_sources`
 
-当前行为：
+行为说明：
 
-- 以前 LLM 解析失败会 fallback 到 AI 编程助手 demo 数据。
-- 现在 fallback 会根据用户输入推断目标产品和行业，不再硬编码 Cursor / Copilot / Windsurf / Tabnine。
+- LLM 解析失败时，fallback 会根据用户输入推断目标产品和行业，不使用固定 Cursor / Copilot / Windsurf / Tabnine demo 数据。
 - 创建页顶部有“自动发现竞品”和“自动添加分析维度”两个开关，默认打开。
 - 只要解析请求中的 `auto_discover_competitors=true`，后端就会额外执行竞品发现，并把发现结果追加到 `competitors` 返回前端；即使用户原始输入里已经写了竞品，也会继续补充。
 - 只要解析请求中的 `auto_add_analysis_dimensions=true`，后端会在 Planner 原始维度基础上再调用 Agent 推荐增量维度，并合并去重返回前端；即使用户原始输入里已经写了重点维度，也会继续补充适合场景的新维度。
@@ -883,7 +975,8 @@ POST /api/v1/analysis-tasks
 后端创建：
 
 - 1 条 `analysis_task`
-- 9 条 `agent_node`
+- 基础 `agent_node`
+- N 条动态 `dimension_analysis_*` 节点，数量由用户最终确认的 `analysis_dimensions` 决定
 
 然后：
 
@@ -902,7 +995,7 @@ Collector 对每个竞品生成 query：
 
 若 QA 返工要求补采，还会追加 QA 生成的 follow-up query。
 
-今晚已改为并行：
+分析阶段采用并行执行：
 
 1. 每个竞品内部并发执行多个 Firecrawl search。
 2. URL 去重。
@@ -963,7 +1056,7 @@ embedding
 
 ### 5. Milvus RAG 检索
 
-新增服务：
+相关服务：
 
 ```text
 backend/app/services/evidence_retriever.py
@@ -1019,28 +1112,33 @@ fallback 示例：
 
 ### 6. Claim 生成
 
-四个 Analyst 分别构造不同 query：
+Claim 现在由动态维度 Analyst 生成，而不是由四个固定 Analyst 生成。每个维度 Analyst 的 query 会基于：
 
-| Agent | query 方向 | source_type 偏好 |
-| --- | --- | --- |
-| `feature_analysis` | product positioning, core features, topic, dimension | 无强制 |
-| `pricing_analysis` | pricing, plans, subscription, team, enterprise, official | `pricing_page` |
-| `market_analysis` | target users, market positioning, enterprise teams, strategy | 无强制 |
-| `security_analysis` | security, privacy, compliance, data protection, training data policy | 无强制 |
+- 竞品名称。
+- 当前 `dimension_label`。
+- Dimension Prompt Planner 生成的 `evidence_focus`。
+- 任务主题 `topic`。
+
+如果维度或 `evidence_focus` 中包含 `pricing / 价格 / billing` 等价格信号，RAG 检索会优先尝试 `pricing_page` 来源；其它维度默认使用 Milvus RAG 检索，不强制来源类型。
 
 执行方式：
 
-- 四个 Analyst 在后端使用 `ThreadPoolExecutor` 真正并行执行。
-- 每个 Analyst 线程独立创建 SQLAlchemy `SessionLocal()`。
-- 每个 Analyst 独立创建 `EvidenceRetriever`、`LLMClient` 和 Milvus 查询上下文。
-- 主线程只收集各 Analyst 生成的 claim id，并等待全部 Analyst 完成后再进入 `report_writer`。
-- QA 返工时，如果目标是多个 Analyst，也会并行重跑目标 Analyst。
+- N 个动态维度 Analyst 在后端使用 `ThreadPoolExecutor` 真正并行执行。
+- 每个维度 Analyst 线程独立创建 SQLAlchemy `SessionLocal()`。
+- 每个维度 Analyst 独立创建 `EvidenceRetriever`、`LLMClient` 和 Milvus 查询上下文。
+- 主线程收集各维度 Analyst 生成的 claim id，并等待全部维度 Analyst 完成后再进入动态画像、矩阵和 `report_writer`。
+- 如果任一维度 Analyst 因 LLM 调用失败、JSON 无法修复、DB/Milvus 异常、或“已有 evidence 但没有生成 Claim”而失败，主 workflow 会立即停止，任务进入失败状态，避免继续生成空报告。
+- 只有当某个维度对所有竞品都没有检索到 evidence 时，该维度才允许被跳过；如果最终所有维度都没有 Claim，ReportWriter 不会执行。
+- QA 返工时，如果目标是多个维度 Analyst，也会并行重跑目标维度；如果 QA 没给出具体目标，会重跑全部动态维度 Analyst。
 
 LLM 输出 Claim JSON：
 
 ```json
 [
   {
+    "competitor_name": "Firecrawl",
+    "dimension_key": "structured_extraction_capabilities",
+    "dimension_label": "结构化抽取能力",
     "claim_text": "中文结论",
     "evidence_ids": [101, 102],
     "confidence": 0.86,
@@ -1055,7 +1153,7 @@ Claim 只允许绑定本次传给 LLM 的 evidence，避免把全量 evidence �
 
 ### 7. 动态竞品画像与动态对比矩阵
 
-四个 Analyst 完成后，ReportWriter 之前，workflow 会执行动态知识构建：
+动态维度 Analyst 完成后，ReportWriter 之前，workflow 会执行动态知识构建：
 
 ```text
 task_plan_json.analysis_dimensions
@@ -1065,7 +1163,7 @@ task_plan_json.analysis_dimensions
   -> comparison_matrix.matrix_schema_json / matrix_data_json
 ```
 
-新增后端文件：
+相关后端文件：
 
 ```text
 backend/app/services/profile_schema_builder.py
@@ -1279,7 +1377,7 @@ frontend/src/components/DagFlow.vue
 - 展示任务状态。
 - 展示 DAG。
 - 展示并行 collector worker 和 evidence worker。
-- 展示四个 Analyst 分支。
+- 展示动态维度 Analyst 分支。
 - 展示 QA 回流虚线边。
 - 展示按 Agent 分组的日志。
 - 日志按时间倒序显示，最新动态在上方。
@@ -1445,7 +1543,10 @@ Firecrawl 抓取网页。
 | `task_id` | 任务 ID |
 | `agent_node_id` | 生成 Agent |
 | `competitor_name` | 竞品 |
-| `claim_type` | `feature / pricing / market / security` |
+| `claim_type` | 当前动态维度 Claim 使用 `dimension`；历史任务可能仍是 `feature / pricing / market / security` |
+| `dimension_key` | 动态分析维度 key |
+| `dimension_label` | 动态分析维度名称 |
+| `dimension_prompt_json` | 生成该 Claim 使用的维度 prompt spec |
 | `claim_text` | 结论 |
 | `confidence` | 置信度 |
 | `risk_level` | 风险等级 |
@@ -1609,6 +1710,8 @@ FIRECRAWL_API_KEY=your_firecrawl_key
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_API_KEY=your_deepseek_key
 LLM_MODEL=deepseek-v4-pro
+LLM_THINKING_ENABLED=false
+LLM_REASONING_EFFORT=high
 
 EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 EMBEDDING_API_KEY=your_dashscope_key
@@ -1801,17 +1904,17 @@ python -c "from app.core.config import settings; from pymilvus import MilvusClie
    - 主 DAG。
    - 并行采集 worker。
    - 并行证据 worker。
-   - 四个 Analyst 分支。
+   - 动态维度 Analyst 分支。
    - QA 回流边。
    - Agent 日志。
 7. 进入阶段耗时页查看证据抽取每轮耗时。
 8. 进入证据链页查看网页来源。
 9. 进入报告页展开段落依据，查看 Claim 和 Evidence。
-10. 进入历史记录页查看以前的任务。
+10. 进入历史记录页查看历史任务。
 
-## 当前已验证
+## 已验证
 
-今晚代码层面已做过：
+代码层面已做过：
 
 ```powershell
 python -m compileall app
@@ -1822,9 +1925,10 @@ npm run build
 
 ## 当前能力边界
 
-当前系统已经是可运行 MVP+，但仍有一些边界：
+系统已经是可运行 MVP+，但仍有一些边界：
 
-- 四个 Analyst 后端已真正并行执行；后续仍可继续增加独立超时、限流和部分失败降级策略。
+- 分析阶段采用动态维度 Analyst：每个分析维度一个独立 Agent，并在后端真正并行执行。
+- 动态维度 Analyst 采用严格失败策略：除“该维度没有检索到 evidence”外，LLM/JSON/DB/Milvus 等真实失败都会中断任务，防止空报告。
 - Collector 和 Evidence Extractor 已经做了并发 worker。
 - 并行 worker 是虚拟可视化节点，不是独立 Celery task。
 - QA 返工最多 1 轮，避免无限循环。
@@ -1838,7 +1942,7 @@ npm run build
 建议后续优先级：
 
 1. 将 collector/evidence worker 从线程池升级为可观测的 Celery 子任务。
-2. 为并行 Analyst 增加独立超时、限流和部分失败降级策略。
+2. 为并行 Analyst 增加独立超时、限流和更清晰的失败恢复入口。
 3. 增强任务控制的生产级能力，例如 Celery revoke、任务取消补偿清理、断点级恢复。
 4. 增加每个 worker 的真实进度，而不是只跟随父节点状态。
 5. 增加 Firecrawl / LLM / Embedding / Milvus 的限流和重试策略。

@@ -38,28 +38,28 @@ interface AgentLogGroup {
   logs: AgentLog[]
 }
 
-const orderedNodeKeys = [
-  'planner',
-  'collector',
-  'evidence_extractor',
-  'feature_analysis',
-  'pricing_analysis',
-  'market_analysis',
-  'security_analysis',
-  'report_writer',
-  'qa',
-]
+const baseNodeOrder = ['planner', 'dimension_planner', 'collector', 'evidence_extractor']
+const tailNodeOrder = ['report_writer', 'qa']
+const orderedNodes = computed(() => {
+  const byKey = new Map(nodes.value.map((node) => [node.node_key, node]))
+  const head = baseNodeOrder.map((key) => byKey.get(key)).filter((node): node is AgentNode => Boolean(node))
+  const dimensionNodes = nodes.value.filter((node) => node.node_type === 'dimension_analyst')
+  const tail = tailNodeOrder.map((key) => byKey.get(key)).filter((node): node is AgentNode => Boolean(node))
+  const seen = new Set([...head, ...dimensionNodes, ...tail].map((node) => node.node_key))
+  const rest = nodes.value.filter((node) => !seen.has(node.node_key) && node.node_type !== 'virtual_worker')
+  return [...head, ...dimensionNodes, ...tail, ...rest]
+})
 
 const currentNode = computed(() => nodes.value.find((node) => node.status === 'running'))
 const completedCount = computed(() => nodes.value.filter((node) => node.status === 'success').length)
 const canPause = computed(() =>
-  ['queued', 'running', 'planned', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking'].includes(
+  ['queued', 'running', 'planned', 'planning_dimensions', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking'].includes(
     task.value?.status || '',
   ),
 )
 const canResume = computed(() => ['paused', 'pause_requested'].includes(task.value?.status || ''))
 const canCancel = computed(() =>
-  ['queued', 'running', 'planned', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking', 'pause_requested', 'paused'].includes(
+  ['queued', 'running', 'planned', 'planning_dimensions', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking', 'pause_requested', 'paused'].includes(
     task.value?.status || '',
   ),
 )
@@ -228,13 +228,13 @@ onBeforeUnmount(() => {
 
     <section class="node-grid">
       <div
-        v-for="key in orderedNodeKeys"
-        :key="key"
+        v-for="node in orderedNodes"
+        :key="node.node_key"
         class="node-card"
-        :class="nodes.find((node) => node.node_key === key)?.status || 'pending'"
+        :class="node.status || 'pending'"
       >
-        <strong>{{ nodes.find((node) => node.node_key === key)?.node_name || key }}</strong>
-        <span>{{ nodes.find((node) => node.node_key === key)?.status || 'pending' }}</span>
+        <strong>{{ node.node_name }}</strong>
+        <span>{{ node.status || 'pending' }}</span>
       </div>
     </section>
 

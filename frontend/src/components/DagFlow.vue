@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { VueFlow } from '@vue-flow/core'
+import { computed, reactive } from 'vue'
+import { Position, VueFlow } from '@vue-flow/core'
 import type { AgentNode, DagEdge } from '@/types/agentNode'
 
 const props = defineProps<{
@@ -21,16 +21,16 @@ const statusColor: Record<string, string> = {
   needs_revision: '#e6a23c',
 }
 
+const centerY = 390
+const manualNodePositions = reactive<Record<string, { x: number; y: number }>>({})
+
 const nodePositions: Record<string, { x: number; y: number }> = {
-  planner: { x: 0, y: 260 },
-  collector: { x: 230, y: 260 },
-  evidence_extractor: { x: 620, y: 260 },
-  feature_analysis: { x: 1040, y: 40 },
-  pricing_analysis: { x: 1040, y: 180 },
-  market_analysis: { x: 1040, y: 320 },
-  security_analysis: { x: 1040, y: 460 },
-  report_writer: { x: 1340, y: 260 },
-  qa: { x: 1600, y: 260 },
+  planner: { x: 0, y: centerY },
+  dimension_planner: { x: 300, y: centerY },
+  collector: { x: 620, y: centerY },
+  evidence_extractor: { x: 1160, y: centerY },
+  report_writer: { x: 2060, y: centerY },
+  qa: { x: 2380, y: centerY },
 }
 
 const workerCounts = computed(() => ({
@@ -38,37 +38,59 @@ const workerCounts = computed(() => ({
   evidence: props.nodes.filter((node) => node.node_key.startsWith('evidence_worker_')).length || 1,
 }))
 
+const dimensionNodes = computed(() =>
+  props.nodes.filter((node) => node.node_type === 'dimension_analyst' || node.node_key.startsWith('dimension_analysis_')),
+)
+
 function workerPosition(nodeKey: string, prefix: string, x: number, total: number) {
   const match = nodeKey.match(new RegExp(`^${prefix}_(\\d+)$`))
   if (!match) return null
   const index = Number(match[1]) - 1
-  const rowGap = 88
-  const startY = 260 - ((Math.max(0, total - 1) * rowGap) / 2)
+  const rowGap = 120
+  const startY = centerY - ((Math.max(0, total - 1) * rowGap) / 2)
   return { x, y: startY + index * rowGap }
 }
 
 function getNodePosition(node: AgentNode, index: number) {
+  const manualPosition = manualNodePositions[node.node_key]
+  if (manualPosition) return manualPosition
+
+  if (node.node_type === 'dimension_analyst' || node.node_key.startsWith('dimension_analysis_')) {
+    const dimensionIndex = Math.max(0, dimensionNodes.value.findIndex((item) => item.node_key === node.node_key))
+    const rowGap = 126
+    const total = Math.max(1, dimensionNodes.value.length)
+    const startY = centerY - ((total - 1) * rowGap) / 2
+    return { x: 1580, y: startY + dimensionIndex * rowGap }
+  }
   return (
     nodePositions[node.node_key] ||
-    workerPosition(node.node_key, 'collector_worker', 430, workerCounts.value.collector) ||
-    workerPosition(node.node_key, 'evidence_worker', 820, workerCounts.value.evidence) ||
+    workerPosition(node.node_key, 'collector_worker', 880, workerCounts.value.collector) ||
+    workerPosition(node.node_key, 'evidence_worker', 1360, workerCounts.value.evidence) ||
     { x: (index % 3) * 260, y: Math.floor(index / 3) * 120 }
   )
+}
+
+function rememberNodePosition(payload: { node?: { id?: string; position?: { x: number; y: number } } }) {
+  const node = payload.node
+  if (!node?.id || !node.position) return
+  manualNodePositions[node.id] = { x: node.position.x, y: node.position.y }
 }
 
 const flowNodes = computed(() =>
   props.nodes.map((node, index) => ({
     id: node.node_key,
     position: getNodePosition(node, index),
+    sourcePosition: Position.Right,
+    targetPosition: Position.Left,
     data: { label: `${node.node_name}\n${node.status}` },
     style: {
       border: `2px solid ${statusColor[node.status] ?? '#c0c4cc'}`,
       borderRadius: '8px',
-      width: node.node_type === 'virtual_worker' ? '160px' : '210px',
+      width: node.node_type === 'virtual_worker' ? '160px' : node.node_type === 'dimension_analyst' ? '190px' : '210px',
       padding: node.node_type === 'virtual_worker' ? '9px' : '12px',
       whiteSpace: 'pre-line',
       fontSize: node.node_type === 'virtual_worker' ? '12px' : '13px',
-      background: node.node_type === 'virtual_worker' ? '#fffaf0' : '#fff',
+      background: node.node_type === 'virtual_worker' ? '#fffaf0' : node.node_type === 'dimension_analyst' ? '#f5f9ff' : '#fff',
     },
   })),
 )
@@ -98,13 +120,19 @@ const flowEdges = computed(() =>
 
 <template>
   <div class="flow-shell">
-    <VueFlow :nodes="flowNodes" :edges="flowEdges" fit-view-on-init />
+    <VueFlow
+      :nodes="flowNodes"
+      :edges="flowEdges"
+      fit-view-on-init
+      @node-drag="rememberNodePosition"
+      @node-drag-stop="rememberNodePosition"
+    />
   </div>
 </template>
 
 <style scoped>
 .flow-shell {
-  height: 680px;
+  height: 860px;
   border: 1px solid var(--el-border-color);
   border-radius: 8px;
   overflow: hidden;

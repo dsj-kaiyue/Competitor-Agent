@@ -7,7 +7,7 @@ import re
 from time import perf_counter
 
 import markdown
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -28,21 +28,14 @@ from app.services.comparison_matrix_service import ComparisonMatrixService
 from app.services.competitor_profile_service import CompetitorProfileService
 from app.services.evidence_retriever import EvidenceRetriever
 from app.services.log_service import add_log
-from app.services.task_service import get_task_plan, update_task_status
+from app.services.profile_schema_builder import ProfileSchemaBuilder
+from app.services.task_service import build_dimension_node_specs, ensure_dimension_nodes, get_task_plan, update_task_status
 from app.tools.llm_client import LLMClient
 from app.tools.milvus_tool import MilvusTool
 from app.tools.web_context_provider import WebContextProvider
 
 
 logger = logging.getLogger("competitive-agent")
-
-ANALYST_SPECS: dict[str, tuple[str, str]] = {
-    "feature_analysis": ("feature", "产品定位、核心功能、Agent 能力、IDE 集成"),
-    "pricing_analysis": ("pricing", "价格策略、套餐结构、个人与团队商业化"),
-    "market_analysis": ("market", "适用用户、市场定位、企业能力"),
-    "security_analysis": ("security", "安全合规、隐私、企业治理能力"),
-}
-
 
 class TaskControlException(Exception):
     pass
@@ -202,6 +195,29 @@ def _json_from_text(text: str):
         return json.loads(match.group(1))
 
 
+def _parse_llm_json_with_repair(llm: LLMClient, raw: str, original_prompt: str, *, expected: str) -> object:
+    try:
+        return _json_from_text(raw)
+    except Exception as first_exc:
+        repair_prompt = f"""
+上一次模型输出不是合法 JSON，解析失败：{first_exc}
+
+请把下面内容修正为合法 JSON。
+要求：
+1. 只输出合法 JSON，不要 Markdown，不要解释。
+2. 期望 JSON 类型：{expected}
+3. 如果原内容为空或无法修复，请基于原始任务 prompt 输出一个空 JSON 数组 []。
+
+原始任务 prompt：
+{original_prompt[-5000:]}
+
+上一次模型输出：
+{(raw or '')[:5000]}
+"""
+        repaired = llm.complete(repair_prompt, system="你只输出合法 JSON。")
+        return _json_from_text(repaired)
+
+
 def _evidence_context(chunks: list[EvidenceChunk], limit: int = 10) -> str:
     lines = []
     for chunk in chunks[:limit]:
@@ -212,29 +228,41 @@ def _evidence_context(chunks: list[EvidenceChunk], limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-def _analysis_query(competitor: str, claim_type: str, dimension: str, topic: str) -> tuple[str, str | None]:
-    if claim_type == "pricing":
-        return f"{competitor} pricing plans subscription team enterprise billing official", "pricing_page"
-    if claim_type == "market":
-        return f"{competitor} target users market positioning enterprise teams developers product strategy", None
-    if claim_type == "security":
-        return f"{competitor} security privacy compliance enterprise data protection training data policy", None
-    return f"{competitor} product positioning core features {topic} {dimension}", None
+def _dimension_analysis_query(competitor: str, prompt_spec: dict, topic: str) -> tuple[str, str | None]:
+    dimension_label = prompt_spec.get("dimension_label") or prompt_spec.get("label") or ""
+    focus_terms = " ".join(str(item) for item in prompt_spec.get("evidence_focus", [])[:5])
+    source_type = None
+    lowered = f"{dimension_label} {focus_terms}".lower()
+    if "pricing" in lowered or "价格" in lowered or "billing" in lowered:
+        source_type = "pricing_page"
+    query = f"{competitor} {dimension_label} {focus_terms} {topic} official docs".strip()
+    return query, source_type
+
+
+def _fallback_dimension_prompt_spec(task_plan: dict, field: dict) -> dict:
+    label = str(field.get("label") or field.get("key") or "").strip()
+    key = str(field.get("key") or label).strip()
+    return {
+        "dimension_key": key,
+        "dimension_label": label,
+        "analysis_goal": f"围绕“{label}”比较所有竞品在能力、差异、限制和证据支撑上的表现。",
+        "evidence_focus": field.get("source_requirements") or ["official_website", "docs", "blog"],
+        "must_answer": [
+            f"各竞品在“{label}”上的明确能力或策略是什么",
+            "这些结论分别由哪些 evidence 支撑",
+            "是否存在缺失、限制或不确定信息",
+        ],
+        "comparison_criteria": [label, "证据强度", "差异化", "风险或限制"],
+        "output_schema": "claims[] with competitor_name, dimension_key, dimension_label, claim_text, evidence_ids, confidence, risk_level",
+        "industry": task_plan.get("industry"),
+        "topic": task_plan.get("topic"),
+    }
 
 
 def _target_nodes_from_issue(issue: dict) -> list[str]:
     target_node = issue.get("target_node")
     if target_node:
         return [target_node]
-    dimension = str(issue.get("related_dimension") or issue.get("type") or "").lower()
-    if "pricing" in dimension or "价格" in dimension:
-        return ["pricing_analysis"]
-    if "security" in dimension or "privacy" in dimension or "安全" in dimension:
-        return ["security_analysis"]
-    if "market" in dimension or "市场" in dimension:
-        return ["market_analysis"]
-    if "feature" in dimension or "功能" in dimension:
-        return ["feature_analysis"]
     return []
 
 
@@ -247,7 +275,7 @@ def _decide_next_action(issues: list[dict]) -> tuple[str, list[str]]:
         target_nodes: list[str] = []
         for issue in candidates:
             target_nodes.extend(_target_nodes_from_issue(issue))
-        return "reanalyze", sorted(set(target_nodes)) or ["feature_analysis"]
+        return "reanalyze", sorted(set(target_nodes))
     if any(issue.get("suggested_action") == "rewrite" for issue in candidates):
         return "rewrite", ["report_writer"]
     return "end", []
@@ -292,24 +320,24 @@ def _render_report_markdown(report_json: dict) -> str:
 
 def _fallback_report_json(task: AnalysisTask, claims: list[Claim], evidence_by_claim: dict[int, list[int]]) -> dict:
     sections = []
-    for claim_type, title in [
-        ("feature", "产品与功能"),
-        ("pricing", "价格策略"),
-        ("market", "市场定位"),
-        ("security", "安全合规"),
-    ]:
-        type_claims = [claim for claim in claims if claim.claim_type == claim_type]
-        if not type_claims:
+    dimension_labels = []
+    for claim in claims:
+        label = claim.dimension_label or claim.claim_type or "结构化结论"
+        if label not in dimension_labels:
+            dimension_labels.append(label)
+    for label in dimension_labels:
+        dimension_claims = [claim for claim in claims if (claim.dimension_label or claim.claim_type or "结构化结论") == label]
+        if not dimension_claims:
             continue
         sections.append(
             {
-                "section_id": claim_type,
-                "title": title,
+                "section_id": re.sub(r"\W+", "_", label.lower()).strip("_") or "dimension",
+                "title": label,
                 "paragraphs": [
                     {
-                        "paragraph_id": f"{claim_type}_p1",
-                        "text": "；".join(claim.claim_text for claim in type_claims[:4]),
-                        "claim_ids": [claim.id for claim in type_claims[:4]],
+                        "paragraph_id": f"dimension_{len(sections) + 1}_p1",
+                        "text": "；".join(claim.claim_text for claim in dimension_claims[:4]),
+                        "claim_ids": [claim.id for claim in dimension_claims[:4]],
                     }
                 ],
             }
@@ -359,7 +387,7 @@ def _embed_chunk_batch(batch: list[dict]) -> tuple[list[dict], list[dict], int]:
     return embedded, failures, elapsed_ms
 
 
-def _run_analyst_logic(db: Session, task_id: int, node: AgentNode, node_key: str, claim_type: str, dimension: str) -> list[int]:
+def _run_dimension_analyst_logic(db: Session, task_id: int, node: AgentNode, prompt_spec: dict) -> list[int]:
     task = db.get(AnalysisTask, task_id)
     if task is None:
         raise RuntimeError(f"Task {task_id} not found")
@@ -367,10 +395,18 @@ def _run_analyst_logic(db: Session, task_id: int, node: AgentNode, node_key: str
     retriever = EvidenceRetriever(db)
     llm = LLMClient()
     claim_ids: list[int] = []
+    no_evidence_competitors: list[str] = []
+    dimension_key = str(prompt_spec.get("dimension_key") or "").strip()
+    dimension_label = str(prompt_spec.get("dimension_label") or dimension_key).strip()
+    if not dimension_key or not dimension_label:
+        raise RuntimeError(f"{node.node_key} missing dimension prompt spec")
     for competitor in plan.competitors:
         _check_task_control(db, task_id, node)
-        _console("llm analyst started", {"task_id": task_id, "node_key": node_key, "competitor": competitor})
-        query, source_type = _analysis_query(competitor, claim_type, dimension, plan.topic)
+        _console(
+            "dimension analyst started",
+            {"task_id": task_id, "node_key": node.node_key, "competitor": competitor, "dimension": dimension_label},
+        )
+        query, source_type = _dimension_analysis_query(competitor, prompt_spec, plan.topic)
         evidence = retriever.search(
             task_id=task_id,
             query=query,
@@ -386,23 +422,78 @@ def _run_analyst_logic(db: Session, task_id: int, node: AgentNode, node_key: str
                 competitor_name=competitor,
                 top_k=8,
                 node_id=node.id,
-            )
+        )
         _console("analyst evidence retrieved", retriever.last_search_log)
+        if not evidence:
+            no_evidence_competitors.append(competitor)
+            add_log(
+                db,
+                task_id,
+                node.id,
+                "Dimension analyst skipped competitor because no evidence was retrieved",
+                {"competitor": competitor, "dimension_key": dimension_key, "dimension_label": dimension_label, "query": query},
+                log_type="warning",
+            )
+            db.commit()
+            continue
+        must_answer = "\n".join(f"- {item}" for item in prompt_spec.get("must_answer", [])[:8])
+        criteria = "、".join(str(item) for item in prompt_spec.get("comparison_criteria", [])[:8])
         prompt = f"""
-你是严谨的竞品分析 Agent。请只基于给定 evidence 生成 {dimension} 维度的结构化结论。
+你是一个动态维度竞品分析 Agent。你只负责一个分析维度，不要分析其它维度。
+当前维度 key：{dimension_key}
+当前维度名称：{dimension_label}
+分析目标：{prompt_spec.get("analysis_goal") or f"分析 {dimension_label}"}
+比较标准：{criteria}
+必须回答：
+{must_answer}
+
 竞品：{competitor}
 分析主题：{plan.topic}
 证据：
 {_evidence_context(evidence, limit=12)}
 
 输出 JSON 数组，最多 3 条。每条格式：
-{{"claim_text":"中文结论，必须具体且可被证据支撑","evidence_ids":[数字ID],"confidence":0.0到1.0,"risk_level":"low|medium|high"}}
+{{"competitor_name":"{competitor}","dimension_key":"{dimension_key}","dimension_label":"{dimension_label}","claim_text":"中文结论，必须具体且可被证据支撑","evidence_ids":[数字ID],"confidence":0.0到1.0,"risk_level":"low|medium|high"}}
 不要输出 JSON 之外的内容。
 """
         raw = llm.complete(prompt, system="你只输出合法 JSON，不编造证据。")
-        parsed = _json_from_text(raw)
+        try:
+            parsed = _parse_llm_json_with_repair(llm, raw, prompt, expected="JSON array")
+        except Exception as exc:
+            add_log(
+                db,
+                task_id,
+                node.id,
+                "Dimension analyst JSON parsing failed for competitor",
+                {"competitor": competitor, "dimension": dimension_label, "error": str(exc), "raw_preview": (raw or "")[:500]},
+                log_type="warning",
+            )
+            _console(
+                "dimension analyst json parse failed",
+                {"task_id": task_id, "node_key": node.node_key, "competitor": competitor, "error": str(exc)},
+            )
+            db.commit()
+            raise RuntimeError(
+                f"{dimension_label}分析 Agent 在分析 {competitor} 时返回了无法解析的 JSON：{exc}"
+            ) from exc
         if isinstance(parsed, dict):
             parsed = parsed.get("claims", [])
+        if not isinstance(parsed, list):
+            add_log(
+                db,
+                task_id,
+                node.id,
+                "Dimension analyst returned non-list JSON",
+                {"competitor": competitor, "dimension": dimension_label, "json_type": type(parsed).__name__},
+                log_type="warning",
+            )
+            db.commit()
+            raise RuntimeError(
+                f"{dimension_label}分析 Agent 在分析 {competitor} 时返回了错误 JSON 类型：{type(parsed).__name__}"
+            )
+        if not parsed:
+            raise RuntimeError(f"{dimension_label}分析 Agent 在已有 evidence 的情况下未返回 Claim：{competitor}")
+        created_for_competitor = 0
         for item in parsed[:3]:
             evidence_ids = [int(eid) for eid in item.get("evidence_ids", []) if str(eid).isdigit()]
             valid_ids = [eid for eid in evidence_ids if any(chunk.id == eid for chunk in evidence)]
@@ -411,8 +502,11 @@ def _run_analyst_logic(db: Session, task_id: int, node: AgentNode, node_key: str
             claim = Claim(
                 task_id=task_id,
                 agent_node_id=node.id,
-                competitor_name=competitor,
-                claim_type=claim_type,
+                competitor_name=str(item.get("competitor_name") or competitor),
+                claim_type="dimension",
+                dimension_key=dimension_key,
+                dimension_label=dimension_label,
+                dimension_prompt_json=prompt_spec,
                 claim_text=str(item.get("claim_text") or "").strip(),
                 confidence=Decimal(str(item.get("confidence", 0.75))).quantize(Decimal("0.01")),
                 risk_level=str(item.get("risk_level") or "medium"),
@@ -424,14 +518,49 @@ def _run_analyst_logic(db: Session, task_id: int, node: AgentNode, node_key: str
             for evidence_id in valid_ids[:4]:
                 db.add(ClaimEvidence(claim_id=claim.id, evidence_chunk_id=evidence_id))
             claim_ids.append(claim.id)
+            created_for_competitor += 1
+        if created_for_competitor == 0:
+            db.commit()
+            raise RuntimeError(f"{dimension_label}分析 Agent 在已有 evidence 的情况下没有生成可用 Claim：{competitor}")
         _console(
-            "llm analyst completed",
-            {"task_id": task_id, "node_key": node_key, "competitor": competitor, "claim_count_so_far": len(claim_ids)},
+            "dimension analyst completed",
+            {
+                "task_id": task_id,
+                "node_key": node.node_key,
+                "competitor": competitor,
+                "dimension": dimension_label,
+                "claim_count_so_far": len(claim_ids),
+            },
         )
         db.commit()
     if not claim_ids:
-        raise RuntimeError(f"{node_key} did not produce claims")
-    node.output_summary = f"{node_key} 使用 LLM 生成 {len(claim_ids)} 条 Claim"
+        if no_evidence_competitors and len(no_evidence_competitors) == len(plan.competitors):
+            node.output_summary = f"{dimension_label}维度没有检索到可用 evidence，已跳过"
+            add_log(
+                db,
+                task_id,
+                node.id,
+                "Dimension analyst skipped because no evidence was retrieved",
+                {
+                    "dimension_key": dimension_key,
+                    "dimension_label": dimension_label,
+                    "competitors": no_evidence_competitors,
+                },
+                log_type="warning",
+            )
+            db.commit()
+            return []
+        add_log(
+            db,
+            task_id,
+            node.id,
+            "Dimension analyst produced no claims",
+            {"dimension_key": dimension_key, "dimension_label": dimension_label},
+            log_type="warning",
+        )
+        db.commit()
+        raise RuntimeError(f"{dimension_label}分析 Agent 已检索到 evidence，但没有生成任何 Claim")
+    node.output_summary = f"{dimension_label}维度生成 {len(claim_ids)} 条 Claim"
     return claim_ids
 
 
@@ -447,6 +576,7 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         "qa_issues": [],
         "qa_followup_queries": [],
         "reanalyze_dimensions": [],
+        "dimension_failures": [],
     }
     task = db.get(AnalysisTask, task_id)
     if task is None:
@@ -469,6 +599,75 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         state["task_plan"] = plan.model_dump()
         state["competitors"] = plan.competitors
         state["analysis_dimensions"] = plan.analysis_dimensions
+
+    def dimension_planner(node: AgentNode) -> None:
+        plan = get_task_plan(task)
+        dimension_nodes = ensure_dimension_nodes(db, task, plan)
+        schema = ProfileSchemaBuilder().build_schema(plan.model_dump())
+        fields = schema.get("fields", [])
+        fallback_specs = {
+            str(field.get("key")): _fallback_dimension_prompt_spec(plan.model_dump(), field)
+            for field in fields
+            if field.get("key")
+        }
+        prompt = f"""
+你是 Dimension Prompt Planner Agent。请为每一个分析维度生成专属 prompt spec，供后续独立维度分析 Agent 使用。
+
+任务主题：{plan.topic}
+行业：{plan.industry}
+目标产品：{plan.target_product}
+竞品：{', '.join(plan.competitors)}
+动态维度字段：
+{json.dumps(fields, ensure_ascii=False)}
+
+要求：
+1. 必须为每个字段输出一条 spec，不能新增或删除维度。
+2. dimension_key 必须等于字段 key，dimension_label 必须等于字段 label。
+3. analysis_goal、must_answer、evidence_focus、comparison_criteria 必须适配该维度和行业。
+4. 不要输出完整报告，不要执行分析。
+5. 只输出合法 JSON 数组。
+
+格式：
+[
+  {{"dimension_key":"...","dimension_label":"...","analysis_goal":"...","evidence_focus":["official docs"],"must_answer":["..."],"comparison_criteria":["..."]}}
+]
+"""
+        specs_by_key = dict(fallback_specs)
+        try:
+            parsed = _json_from_text(llm.complete(prompt, system="你只输出合法 JSON。"))
+            if isinstance(parsed, dict):
+                parsed = parsed.get("dimensions", [])
+            for item in parsed if isinstance(parsed, list) else []:
+                key = str(item.get("dimension_key") or "").strip()
+                if key in specs_by_key:
+                    specs_by_key[key] = {**specs_by_key[key], **item}
+        except Exception as exc:
+            add_log(db, task_id, node.id, "Dimension prompt planning fallback used", {"error": str(exc)}, log_type="warning")
+
+        node_specs = build_dimension_node_specs(plan)
+        node_key_by_dimension_key = {spec["dimension_key"]: spec["node_key"] for spec in node_specs}
+        existing_node_keys = {node.node_key for node in dimension_nodes}
+        specs_by_node = {}
+        for dimension_key, spec in specs_by_key.items():
+            node_key = node_key_by_dimension_key.get(dimension_key)
+            if node_key not in existing_node_keys:
+                continue
+            dim_node = next(node for node in dimension_nodes if node.node_key == node_key)
+            if spec is None:
+                continue
+            dim_node.input_summary = json.dumps(spec, ensure_ascii=False)[:1800]
+            specs_by_node[node_key] = spec
+
+        state["dimension_prompt_specs"] = specs_by_node
+        node.output_summary = f"生成 {len(specs_by_node)} 个动态维度 Agent prompt spec"
+        add_log(
+            db,
+            task_id,
+            node.id,
+            "Dimension prompt specs generated",
+            {"dimension_count": len(specs_by_node), "dimensions": [spec.get("dimension_label") for spec in specs_by_node.values()]},
+        )
+        db.commit()
 
     def collector(node: AgentNode) -> None:
         plan = get_task_plan(task)
@@ -785,50 +984,86 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         )
         state["evidence_chunk_ids"] = ids
 
-    def _run_one_analyst_thread(node_key: str, force: bool = False) -> tuple[str, list[int]]:
-        claim_type, dimension = ANALYST_SPECS[node_key]
+    def _dimension_specs_from_state() -> dict[str, dict]:
+        specs = state.get("dimension_prompt_specs")
+        if isinstance(specs, dict) and specs:
+            return specs
+        plan = get_task_plan(task)
+        node_specs = build_dimension_node_specs(plan)
+        fallback_by_key = {
+            spec["node_key"]: _fallback_dimension_prompt_spec(plan.model_dump(), spec["field"])
+            for spec in node_specs
+        }
+        state["dimension_prompt_specs"] = fallback_by_key
+        return fallback_by_key
+
+    def _run_one_dimension_analyst_thread(node_key: str, prompt_spec: dict, force: bool = False) -> tuple[str, list[int]]:
         local_db = SessionLocal()
         local_claim_ids: list[int] = []
         try:
             def run_logic(node: AgentNode) -> None:
-                local_claim_ids.extend(_run_analyst_logic(local_db, task_id, node, node_key, claim_type, dimension))
+                local_claim_ids.extend(_run_dimension_analyst_logic(local_db, task_id, node, prompt_spec))
 
             _run_node(local_db, task_id, node_key, "analyzing", run_logic, force=force)
             return node_key, local_claim_ids
         finally:
             local_db.close()
 
-    def run_parallel_analysts(node_keys: list[str] | None = None, force: bool = False) -> None:
-        selected_node_keys = node_keys or list(ANALYST_SPECS)
-        selected_node_keys = [node_key for node_key in selected_node_keys if node_key in ANALYST_SPECS]
+    def run_parallel_dimension_analysts(node_keys: list[str] | None = None, force: bool = False) -> None:
+        specs_by_node = _dimension_specs_from_state()
+        selected_node_keys = node_keys or list(specs_by_node)
+        selected_node_keys = [node_key for node_key in selected_node_keys if node_key in specs_by_node]
         if not selected_node_keys:
             return
-        _console("parallel analysts started", {"task_id": task_id, "node_keys": selected_node_keys, "force": force})
-        add_log(db, task_id, None, "Parallel analysts started", {"node_keys": selected_node_keys, "force": force})
+        _console("parallel dimension analysts started", {"task_id": task_id, "node_keys": selected_node_keys, "force": force})
+        add_log(db, task_id, None, "Parallel dimension analysts started", {"node_keys": selected_node_keys, "force": force})
         db.commit()
         with ThreadPoolExecutor(max_workers=len(selected_node_keys), thread_name_prefix=f"analyst-{task_id}") as executor:
-            futures = {executor.submit(_run_one_analyst_thread, node_key, force): node_key for node_key in selected_node_keys}
+            futures = {
+                executor.submit(_run_one_dimension_analyst_thread, node_key, specs_by_node[node_key], force): node_key
+                for node_key in selected_node_keys
+            }
             for future in as_completed(futures):
                 node_key = futures[future]
-                completed_node_key, claim_ids = future.result()
+                try:
+                    completed_node_key, claim_ids = future.result()
+                except Exception as exc:
+                    state.setdefault("dimension_failures", []).append({"node_key": node_key, "error": str(exc)})
+                    _console("parallel dimension analyst failed", {"task_id": task_id, "node_key": node_key, "error": str(exc)})
+                    add_log(
+                        db,
+                        task_id,
+                        None,
+                        "Dimension analyst failed; workflow stopped before report generation",
+                        {"node_key": node_key, "error": str(exc)},
+                        log_type="error",
+                    )
+                    db.commit()
+                    raise RuntimeError(f"动态分析 Agent 执行失败，已停止生成报告：{node_key} - {exc}") from exc
                 state.setdefault("claim_ids", []).extend(claim_ids)
                 _console(
-                    "parallel analyst completed",
+                    "parallel dimension analyst completed",
                     {"task_id": task_id, "node_key": completed_node_key, "claim_count": len(claim_ids)},
                 )
-                add_log(db, task_id, None, "Parallel analyst completed", {"node_key": completed_node_key, "claim_count": len(claim_ids)})
+                add_log(db, task_id, None, "Parallel dimension analyst completed", {"node_key": completed_node_key, "claim_count": len(claim_ids)})
                 db.commit()
         db.expire_all()
-        _console("parallel analysts completed", {"task_id": task_id, "node_keys": selected_node_keys})
+        _console("parallel dimension analysts completed", {"task_id": task_id, "node_keys": selected_node_keys})
+        claim_count = db.scalar(select(func.count(Claim.id)).where(Claim.task_id == task_id))
+        if not claim_count:
+            raise RuntimeError("所有动态分析 Agent 都没有生成 Claim，已停止生成空报告")
 
     def report_writer(node: AgentNode) -> None:
         plan = get_task_plan(task)
         claims = list(db.scalars(select(Claim).where(Claim.task_id == task_id).order_by(Claim.id)))
+        if not claims:
+            raise RuntimeError("没有可用于生成报告的 Claim，已停止生成空报告")
         profiles = list(db.scalars(select(CompetitorProfile).where(CompetitorProfile.task_id == task_id).order_by(CompetitorProfile.id)))
         matrices = list(db.scalars(select(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).order_by(ComparisonMatrix.id)))
         evidence_by_claim = _claim_evidence_map(db, [claim.id for claim in claims])
         claim_context = "\n".join(
             f"[claim_id={claim.id}] competitor={claim.competitor_name}; type={claim.claim_type}; "
+            f"dimension_key={claim.dimension_key}; dimension_label={claim.dimension_label}; "
             f"evidence_ids={evidence_by_claim.get(claim.id, [])}; text={claim.claim_text}"
             for claim in claims
         )
@@ -917,12 +1152,18 @@ Claims:
         profiles = CompetitorProfileService(db).build_profiles_for_task(task_id)
         matrices = ComparisonMatrixService(db).build_matrices_for_task(task_id) if profiles else []
         plan = get_task_plan(task)
+        failed_dimensions = [
+            item.get("node_key")
+            for item in state.get("dimension_failures", [])
+            if isinstance(item, dict)
+        ]
         payload = {
             "profile_count": len(profiles),
             "matrix_count": len(matrices),
             "template_key": plan.template_key,
             "field_count": len(plan.analysis_dimensions),
             "analysis_dimensions": plan.analysis_dimensions,
+            "failed_dimension_nodes": failed_dimensions,
         }
         add_log(db, task_id, None, "Built dynamic competitor profiles and comparison matrices", payload)
         db.commit()
@@ -942,7 +1183,25 @@ Claims:
             chunk.id: chunk
             for chunk in db.scalars(select(EvidenceChunk).where(EvidenceChunk.id.in_([item.evidence_chunk_id for item in linked])))
         } if linked else {}
+        node_key_by_id = {node.id: node.node_key for node in db.scalars(select(AgentNode).where(AgentNode.task_id == task_id))}
         issues = []
+        for failure in state.get("dimension_failures", []):
+            if not isinstance(failure, dict):
+                continue
+            failed_node = db.scalar(
+                select(AgentNode).where(AgentNode.task_id == task_id, AgentNode.node_key == failure.get("node_key"))
+            )
+            issues.append(
+                {
+                    "type": "schema_incomplete",
+                    "severity": "medium",
+                    "message": f"{failed_node.node_name if failed_node else failure.get('node_key')} 执行失败，报告可能缺少该维度结论",
+                    "related_claim_id": None,
+                    "related_dimension": failed_node.node_name if failed_node else failure.get("node_key"),
+                    "suggested_action": "reanalyze",
+                    "target_node": failure.get("node_key"),
+                }
+            )
         for claim in claims:
             if claim.id not in linked_claim_ids:
                 issues.append(
@@ -952,8 +1211,9 @@ Claims:
                         "message": f"Claim {claim.id} 缺少证据绑定",
                         "related_claim_id": claim.id,
                         "related_competitor": claim.competitor_name,
-                        "related_dimension": claim.claim_type,
+                        "related_dimension": claim.dimension_label or claim.claim_type,
                         "suggested_action": "reanalyze",
+                        "target_node": node_key_by_id.get(claim.agent_node_id) if claim.agent_node_id else None,
                     }
                 )
             if claim.confidence is not None and claim.confidence < Decimal("0.60"):
@@ -964,8 +1224,9 @@ Claims:
                         "message": f"Claim {claim.id} 置信度偏低",
                         "related_claim_id": claim.id,
                         "related_competitor": claim.competitor_name,
-                        "related_dimension": claim.claim_type,
+                        "related_dimension": claim.dimension_label or claim.claim_type,
                         "suggested_action": "reanalyze",
+                        "target_node": node_key_by_id.get(claim.agent_node_id) if claim.agent_node_id else None,
                     }
                 )
             if claim.claim_type == "pricing":
@@ -1004,10 +1265,12 @@ Claims:
                 issues.append({"type": "schema_incomplete", "severity": "medium", "message": f"报告可能未显式覆盖维度：{', '.join(missing_dimensions)}", "related_claim_id": None, "suggested_action": "rewrite"})
             if not report.content_markdown or len(report.content_markdown) < 500 or "##" not in report.content_markdown:
                 issues.append({"type": "writing_issue", "severity": "high", "message": "报告为空、过短或缺少结构化章节", "suggested_action": "rewrite"})
+        if not claims:
+            issues.append({"type": "schema_incomplete", "severity": "high", "message": "所有动态维度 Agent 都未生成 Claim", "related_claim_id": None, "suggested_action": "reanalyze"})
         qa_prompt = f"""
 请复核这份竞品分析报告是否存在明显逻辑或证据问题。
 仅基于报告和问题列表输出 JSON：
-{{"passed":true/false,"score":0.0到1.0,"issues":[{{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"feature|pricing|market|security","suggested_action":"recollect|reanalyze|rewrite|ignore"}}]}}
+{{"passed":true/false,"score":0.0到1.0,"issues":[{{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null}}]}}
 
 报告：
 {(report.content_markdown if report else '')[:6000]}
@@ -1065,9 +1328,10 @@ Claims:
 
     update_task_status(db, task_id, "running")
     _run_node(db, task_id, "planner", "planned", planner)
+    _run_node(db, task_id, "dimension_planner", "planning_dimensions", dimension_planner)
     _run_node(db, task_id, "collector", "collecting", collector)
     _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor)
-    run_parallel_analysts()
+    run_parallel_dimension_analysts()
     build_dynamic_knowledge()
     _run_node(db, task_id, "report_writer", "writing", report_writer)
     _run_node(db, task_id, "qa", "qa_checking", qa)
@@ -1097,18 +1361,14 @@ Claims:
         if action == "recollect":
             _run_node(db, task_id, "collector", "collecting", collector, force=True)
             _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor, force=True)
-            targets = [node_key for node_key in target_nodes if node_key.endswith("_analysis")] or [
-                "feature_analysis",
-                "pricing_analysis",
-                "market_analysis",
-                "security_analysis",
-            ]
-            run_parallel_analysts(targets, force=True)
+            targets = [node_key for node_key in target_nodes if node_key.startswith("dimension_analysis_")]
+            run_parallel_dimension_analysts(targets or None, force=True)
             build_dynamic_knowledge()
             _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
             _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
         elif action == "reanalyze":
-            run_parallel_analysts(target_nodes or ["feature_analysis"], force=True)
+            targets = [node_key for node_key in target_nodes if node_key.startswith("dimension_analysis_")]
+            run_parallel_dimension_analysts(targets or None, force=True)
             build_dynamic_knowledge()
             _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
             _run_node(db, task_id, "qa", "qa_checking", qa, force=True)

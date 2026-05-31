@@ -15,6 +15,7 @@ class TaskPlan(BaseModel):
 
 class TaskPlanParseRequest(BaseModel):
     user_input: str
+    auto_discover_competitors: bool = True
 
 
 class TaskPlanParseResponse(BaseModel):

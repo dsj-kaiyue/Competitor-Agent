@@ -29,6 +29,7 @@ AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话�
 - 任务控制支持暂停、恢复、取消和手动重试；Celery 不再对业务失败自动反复 retry。
 - 任务规划 Agent 在正式执行时只确认用户修改后的 TaskPlan，不再二次 LLM 解析覆盖前端修改。
 - 创建页的竞品列表和分析维度支持添加、编辑和删除。
+- 创建页解析需求时支持“自动发现竞品”开关；只要打开，不管用户是否已输入竞品，解析阶段都会补充竞品并立即回填到前端供用户增删。
 - 数据库新写入时间统一使用北京时间。
 - QA 结果扩展为带 `next_action / target_nodes / revision_round` 的结构化 payload。
 - QA 不通过时最多返工 1 轮，可回流到 collector、analyst 或 report_writer。
@@ -76,6 +77,7 @@ Firecrawl -> SourceDocument -> EvidenceChunk -> Milvus
 - Milvus 只做向量检索，Evidence 原文仍以 MySQL 为准。
 - 前端通过轮询任务、节点和日志接口展示动态执行过程。
 - 数据库新写入时间统一使用北京时间，历史 UTC 数据不会自动回写。
+- 项目功能变更需要同步更新 README，保证文档和真实系统行为一致。
 
 ## 技术框架
 
@@ -110,6 +112,616 @@ Firecrawl -> SourceDocument -> EvidenceChunk -> Milvus
 - Firecrawl：公开网页采集。
 - DeepSeek：LLM。
 - DashScope：Embedding。
+
+## DeepSeek 调用链、请求体与返回取值
+
+当前系统所有 DeepSeek Chat 请求都统一经过：
+
+```text
+backend/app/tools/llm_client.py
+```
+
+核心代码：
+
+```python
+model = ChatOpenAI(
+    model=model_name,
+    api_key=settings.llm_api_key,
+    base_url=settings.llm_base_url,
+    timeout=90,
+    temperature=0.2,
+)
+
+messages = []
+if system:
+    messages.append(("system", system))
+messages.append(("human", prompt))
+
+return str(model.invoke(messages).content)
+```
+
+### 请求地址
+
+`.env` 中配置：
+
+```env
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_MODEL=deepseek-v4-pro
+```
+
+因为使用的是 OpenAI 兼容 Chat Completions 协议，所以实际请求地址等价于：
+
+```http
+POST https://api.deepseek.com/v1/chat/completions
+```
+
+### 统一请求体结构
+
+代码没有手写 HTTP body，而是由 `langchain_openai.ChatOpenAI` 生成。等价请求体如下：
+
+```json
+{
+  "model": "deepseek-v4-pro",
+  "temperature": 0.2,
+  "messages": [
+    {
+      "role": "system",
+      "content": "系统提示词"
+    },
+    {
+      "role": "user",
+      "content": "用户提示词"
+    }
+  ]
+}
+```
+
+`timeout=90` 是客户端超时配置，不是请求体字段。
+
+### 返回取值与思考内容
+
+DeepSeek 思考模式会把思考内容放在：
+
+```text
+response.choices[0].message.reasoning_content
+```
+
+当前系统不会读取这个字段。系统只通过 LangChain 取：
+
+```python
+model.invoke(messages).content
+```
+
+等价于只使用：
+
+```text
+response.choices[0].message.content
+```
+
+因此当前系统不会保存、解析或使用 DeepSeek 的思考内容。后续 JSON 解析也只针对 `content` 字段中的最终回答。
+
+### JSON 解析方式
+
+多数 Agent 都要求 DeepSeek 只输出 JSON。后端统一用 `_json_from_text()` 解析：
+
+```text
+1. 如果 content 中有 ```json fenced block，先取 fenced block 内文本。
+2. 优先直接 json.loads(content)。
+3. 如果直接解析失败，再用正则从 content 中提取最外层 JSON 对象。
+```
+
+因此，后端使用的是最终回答里的 JSON，不使用 `reasoning_content`。
+
+### 1. 需求解析 Planner Agent
+
+触发时机：
+
+```text
+前端点击“解析需求”
+POST /api/v1/task-plans/parse
+```
+
+代码位置：
+
+```text
+backend/app/agents/planner_agent.py
+```
+
+System prompt：
+
+```text
+你只输出合法 JSON。
+```
+
+User prompt 模板：
+
+```text
+你是竞品分析 Planner Agent。请把用户输入解析成通用竞品分析 TaskPlan。
+
+用户输入：
+{user_input}
+
+只输出 JSON，不要输出解释。格式：
+{
+  "topic": "string",
+  "industry": "string or null",
+  "target_product": null,
+  "competitors": ["string"],
+  "analysis_dimensions": ["string"],
+  "report_depth": "simple|standard|deep",
+  "output_language": "zh-CN",
+  "auto_discover_competitors": true,
+  "data_sources": ["official_website","pricing_page","docs","blog","news","reviews"]
+}
+
+规则：
+- 如果用户只给了目标产品和行业，没有明确列出竞品，competitors 输出空数组，并把 auto_discover_competitors 设为 true。
+- 不要使用示例产品或默认竞品填充结果。
+- topic、industry、target_product 必须忠实来自用户输入。
+```
+
+期望返回：
+
+```json
+{
+  "topic": "Firecrawl 竞品分析",
+  "industry": "AI 数据采集",
+  "target_product": "Firecrawl",
+  "competitors": [],
+  "analysis_dimensions": ["产品定位", "核心功能", "价格策略", "安全合规"],
+  "report_depth": "standard",
+  "output_language": "zh-CN",
+  "auto_discover_competitors": true,
+  "data_sources": ["official_website", "pricing_page", "docs", "blog", "news", "reviews"]
+}
+```
+
+系统取出的数据：
+
+```text
+content -> JSON -> TaskPlan
+```
+
+然后写入或返回：
+
+```text
+topic
+industry
+target_product
+competitors
+analysis_dimensions
+report_depth
+output_language
+auto_discover_competitors
+data_sources
+```
+
+注意：
+
+- 如果 DeepSeek 解析失败，会进入本地 fallback `_infer_task_plan()`。
+- 解析接口请求体包含 `auto_discover_competitors`。
+- 如果 `auto_discover_competitors=true`，后端会在 Planner 解析后继续执行竞品发现，不管 Planner 是否已经解析出竞品。
+- 自动发现出的竞品会与 Planner 返回的 `competitors` 合并去重，再立刻返回前端展示。
+- 如果用户在高级配置中重新打开自动发现，前端会再次调用解析接口并只合并新竞品，不覆盖其它已编辑配置。
+- 用户可以在前端继续增加或删除竞品，正式分析只使用用户最终确认的列表。
+- 点击“开始分析”后的 `planner` 节点不再二次调用 LLM，只确认前端最终 TaskPlan。
+
+### 2. Collector 自动发现竞品
+
+触发时机：
+
+```text
+解析需求阶段：
+POST /api/v1/task-plans/parse
+且请求体 auto_discover_competitors=true
+
+正式分析阶段：
+仅作为兜底逻辑，当 TaskPlan.auto_discover_competitors=true 且 competitors 仍为空时触发
+```
+
+代码位置：
+
+```text
+backend/app/graph/workflow.py
+```
+
+System prompt：
+
+```text
+你只输出合法 JSON。
+```
+
+User prompt 模板：
+
+```text
+请从搜索结果中识别与目标产品最相关的直接竞品或替代产品。
+目标产品：{plan.target_product or plan.topic}
+行业：{plan.industry}
+搜索结果：
+{discovery_context}
+
+只输出 JSON 数组，最多 6 个产品名。不要包含目标产品本身，不要输出解释。
+```
+
+其中 `discovery_context` 来自 Firecrawl search，形如：
+
+```text
+- title=...; url=...; description=...
+- title=...; url=...; description=...
+```
+
+期望返回：
+
+```json
+["Apify", "Bright Data", "Diffbot", "Browse AI"]
+```
+
+兼容返回：
+
+```json
+{
+  "competitors": ["Apify", "Bright Data", "Diffbot", "Browse AI"]
+}
+```
+
+系统取出的数据：
+
+```text
+content -> JSON
+```
+
+如果是数组，直接作为 `plan.competitors`；如果是对象，取：
+
+```text
+competitors
+```
+
+然后过滤空值和目标产品自身，最多保留 6 个竞品。
+
+合并策略：
+
+```text
+1. 保留 Planner 或用户输入中已有的 competitors。
+2. 自动发现结果按名称去重。
+3. 不加入目标产品自身。
+4. 将新增竞品追加到 competitors 后面。
+5. 返回前端后由用户最终增删确认。
+```
+
+### 3. 四个 Analyst Agent
+
+触发时机：
+
+```text
+evidence_extractor 完成后
+```
+
+四个 Analyst 当前后端真正并行执行：
+
+```text
+feature_analysis
+pricing_analysis
+market_analysis
+security_analysis
+```
+
+代码位置：
+
+```text
+backend/app/graph/workflow.py
+```
+
+System prompt：
+
+```text
+你只输出合法 JSON，不编造证据。
+```
+
+User prompt 模板：
+
+```text
+你是严谨的竞品分析 Agent。请只基于给定 evidence 生成 {dimension} 维度的结构化结论。
+竞品：{competitor}
+分析主题：{plan.topic}
+证据：
+{_evidence_context(evidence, limit=12)}
+
+输出 JSON 数组，最多 3 条。每条格式：
+{"claim_text":"中文结论，必须具体且可被证据支撑","evidence_ids":[数字ID],"confidence":0.0到1.0,"risk_level":"low|medium|high"}
+不要输出 JSON 之外的内容。
+```
+
+`dimension` 按 Agent 不同而不同：
+
+```text
+feature_analysis: 产品定位、核心功能、Agent 能力、IDE 集成
+pricing_analysis: 价格策略、套餐结构、个人与团队商业化
+market_analysis: 适用用户、市场定位、企业能力
+security_analysis: 安全合规、隐私、企业治理能力
+```
+
+`_evidence_context()` 会把 RAG 检索到的 evidence 拼进 prompt，格式大致为：
+
+```text
+[evidence_id=101] title=...; url=...; source_type=...
+证据正文片段...
+```
+
+期望返回：
+
+```json
+[
+  {
+    "claim_text": "Apify 更偏向通用 Web 自动化和数据采集平台，提供面向开发者的 Actor 生态。",
+    "evidence_ids": [101, 104],
+    "confidence": 0.86,
+    "risk_level": "low"
+  },
+  {
+    "claim_text": "其价格策略通常围绕平台用量和执行资源展开，团队使用场景需要结合套餐限制评估。",
+    "evidence_ids": [109],
+    "confidence": 0.74,
+    "risk_level": "medium"
+  }
+]
+```
+
+系统取出的数据：
+
+```text
+content -> JSON array
+```
+
+每条数据取：
+
+```text
+claim_text
+evidence_ids
+confidence
+risk_level
+```
+
+写入：
+
+```text
+claim.claim_text
+claim.claim_type
+claim.competitor_name
+claim.confidence
+claim.risk_level
+claim_evidence.claim_id
+claim_evidence.evidence_chunk_id
+```
+
+约束：
+
+- `evidence_ids` 只允许引用本次传给 LLM 的 evidence。
+- 如果 LLM 没返回有效 `evidence_ids`，但本次 RAG 有 evidence，系统默认绑定第一条 evidence。
+- 每个竞品每个 Analyst 最多取 3 条 Claim。
+
+### 4. ReportWriter Agent
+
+触发时机：
+
+```text
+四个 Analyst 全部完成后
+```
+
+代码位置：
+
+```text
+backend/app/graph/workflow.py
+```
+
+System prompt：
+
+```text
+你只输出合法 JSON。
+```
+
+User prompt 模板：
+
+```text
+请基于以下结构化 Claim 生成中文竞品分析报告 JSON。
+主题：{plan.topic}
+行业：{plan.industry}
+竞品：{', '.join(plan.competitors)}
+分析维度：{', '.join(plan.analysis_dimensions)}
+返工要求：{revision_instruction}
+
+要求：
+1. 只输出合法 JSON，不要 Markdown。
+2. 每个 section 至少包含 section_id、title、paragraphs。
+3. 每个关键 paragraph 必须包含 paragraph_id、text、claim_ids。
+4. claim_ids 只能引用下方已有 claim_id，不要编造。
+5. 不要输出 evidence_ids，后端会自动补齐。
+6. 必须覆盖所有分析维度。
+
+JSON 格式：
+{"title":"...","sections":[{"section_id":"executive_summary","title":"执行摘要","paragraphs":[{"paragraph_id":"executive_summary_p1","text":"...","claim_ids":[1,2]}]}]}
+
+Claims:
+{claim_context}
+```
+
+`claim_context` 形如：
+
+```text
+[claim_id=1] competitor=Apify; type=feature; evidence_ids=[101, 102]; text=...
+[claim_id=2] competitor=Bright Data; type=pricing; evidence_ids=[120]; text=...
+```
+
+期望返回：
+
+```json
+{
+  "title": "Firecrawl 在 AI 数据采集领域的竞品分析报告",
+  "sections": [
+    {
+      "section_id": "executive_summary",
+      "title": "执行摘要",
+      "paragraphs": [
+        {
+          "paragraph_id": "executive_summary_p1",
+          "text": "Firecrawl 的主要竞品覆盖通用网页采集、企业数据平台和开发者自动化工具三类。",
+          "claim_ids": [1, 3, 7]
+        }
+      ]
+    }
+  ]
+}
+```
+
+系统取出的数据：
+
+```text
+content -> JSON object
+```
+
+重点字段：
+
+```text
+title
+sections
+sections[].section_id
+sections[].title
+sections[].paragraphs
+paragraphs[].paragraph_id
+paragraphs[].text
+paragraphs[].claim_ids
+```
+
+后端会自动补充：
+
+```text
+paragraphs[].evidence_ids
+report_json.mode = "firecrawl_llm_milvus_rag"
+```
+
+然后生成并保存：
+
+```text
+report.title
+report.report_json
+report.content_markdown
+report.content_html
+```
+
+如果 DeepSeek 返回 JSON 不合法或缺少 `sections`，后端会使用 `_fallback_report_json()` 基于 Claim 生成基础报告。
+
+### 5. QA Agent
+
+触发时机：
+
+```text
+ReportWriter 完成后
+```
+
+代码位置：
+
+```text
+backend/app/graph/workflow.py
+```
+
+QA 先做本地规则检查，再把报告和规则问题交给 DeepSeek 复核。
+
+System prompt：
+
+```text
+你只输出合法 JSON。
+```
+
+User prompt 模板：
+
+```text
+请复核这份竞品分析报告是否存在明显逻辑或证据问题。
+仅基于报告和问题列表输出 JSON：
+{"passed":true/false,"score":0.0到1.0,"issues":[{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"feature|pricing|market|security","suggested_action":"recollect|reanalyze|rewrite|ignore"}]}
+
+报告：
+{report.content_markdown[:6000]}
+
+规则检查问题：
+{json.dumps(issues, ensure_ascii=False)}
+```
+
+期望返回：
+
+```json
+{
+  "passed": false,
+  "score": 0.72,
+  "issues": [
+    {
+      "type": "weak_evidence",
+      "severity": "medium",
+      "message": "价格结论缺少官方价格页证据，建议补采价格页后重跑价格分析。",
+      "related_claim_id": 12,
+      "related_dimension": "pricing",
+      "suggested_action": "recollect"
+    }
+  ]
+}
+```
+
+系统取出的数据：
+
+```text
+content -> JSON object
+```
+
+重点字段：
+
+```text
+passed
+score
+issues
+```
+
+随后系统会把本地规则问题和 LLM 返回问题合并，生成：
+
+```text
+qa_result.passed
+qa_result.score
+qa_result.issues_json
+```
+
+`issues_json` 中还会补充工作流控制字段：
+
+```json
+{
+  "passed": false,
+  "score": 0.72,
+  "issues": [],
+  "next_action": "recollect",
+  "target_nodes": ["collector"],
+  "revision_reason": "...",
+  "followup_queries": ["Example pricing plans official"],
+  "revision_round": 0
+}
+```
+
+### 不调用 DeepSeek 的 Agent 或步骤
+
+以下步骤不向 DeepSeek Chat API 发送请求：
+
+- 正式执行中的 `planner` 节点：只确认前端已编辑 TaskPlan。
+- `collector` 的 Firecrawl search/scrape：调用 Firecrawl，不调用 DeepSeek；只有自动发现竞品时会调用 DeepSeek。
+- `evidence_extractor`：调用 DashScope embedding 和 Milvus，不调用 DeepSeek Chat。
+- `EvidenceRetriever.search()`：调用 DashScope embedding 生成 query vector，再查 Milvus，不调用 DeepSeek Chat。
+
+DashScope embedding 请求地址来自：
+
+```env
+EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+EMBEDDING_MODEL=text-embedding-v4
+```
+
+实际等价于：
+
+```http
+POST https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
+```
 
 ## 项目结构
 
@@ -238,7 +850,10 @@ Planner Agent 输出 TaskPlan：
 
 - 以前 LLM 解析失败会 fallback 到 AI 编程助手 demo 数据。
 - 现在 fallback 会根据用户输入推断目标产品和行业，不再硬编码 Cursor / Copilot / Windsurf / Tabnine。
-- 如果用户只给目标产品和行业，不给竞品，则 `auto_discover_competitors=true`，collector 会自动搜索竞品。
+- 创建页有“自动发现竞品”开关，默认打开。
+- 只要解析请求中的 `auto_discover_competitors=true`，后端就会额外执行竞品发现，并把发现结果追加到 `competitors` 返回前端；即使用户原始输入里已经写了竞品，也会继续补充。
+- 如果用户关闭“自动发现竞品”，后端只做需求解析，不额外搜索补充竞品。
+- 如果解析后在高级配置中把“自动发现竞品”从关闭切换为开启，前端会再次请求解析与自动发现，但只合并新增竞品，不覆盖用户已经编辑过的主题、维度、语言等其它 TaskPlan 字段。
 - 前端会展示 TaskPlan，用户可以继续编辑竞品、分析维度、报告深度和输出语言。
 - 竞品列表和分析维度都支持添加、编辑和删除。
 - 点击“开始分析”后，workflow 中的 `planner` 节点只确认和落库最终 TaskPlan，不再重新调用 LLM 解析 `user_input`，因此不会覆盖用户在前端修改过的竞品或分析维度。
@@ -751,7 +1366,7 @@ QA 结果。
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
-| `POST` | `/api/v1/task-plans/parse` | 解析自然语言需求 |
+| `POST` | `/api/v1/task-plans/parse` | 解析自然语言需求；请求体支持 `auto_discover_competitors`，打开后会补充竞品并立即返回前端 |
 | `GET` | `/api/v1/analysis-tasks` | 历史任务 |
 | `POST` | `/api/v1/analysis-tasks` | 创建任务 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}` | 任务详情 |

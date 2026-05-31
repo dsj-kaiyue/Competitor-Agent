@@ -2,6 +2,9 @@
 import type { TaskPlan } from '@/types/taskPlan'
 
 const model = defineModel<TaskPlan>({ required: true })
+const emit = defineEmits<{
+  requestDiscover: []
+}>()
 
 function addCompetitor() {
   model.value.competitors.push('')
@@ -47,7 +50,10 @@ function removeDimension(index: number) {
       </el-col>
       <el-col :span="8">
         <el-form-item label="自动发现竞品">
-          <el-switch v-model="model.auto_discover_competitors" />
+          <el-switch
+            v-model="model.auto_discover_competitors"
+            @change="(enabled: boolean) => enabled && emit('requestDiscover')"
+          />
         </el-form-item>
       </el-col>
     </el-row>

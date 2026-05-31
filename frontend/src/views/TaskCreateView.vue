@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
@@ -15,17 +15,28 @@ const demoInput =
 
 const userInput = ref(demoInput)
 const autoDiscoverCompetitors = ref(true)
+const autoAddAnalysisDimensions = ref(true)
 const taskPlan = ref<TaskPlan | null>(null)
 const parsing = ref(false)
 const creating = ref(false)
 const discovering = ref(false)
+const addingDimensions = ref(false)
 const lastError = ref('')
 const loadingText = computed(() => {
   if (discovering.value) return '正在补充自动发现竞品...'
+  if (addingDimensions.value) return '正在补充分析维度...'
+  if (parsing.value && autoDiscoverCompetitors.value && autoAddAnalysisDimensions.value) return '正在解析需求、发现竞品并补充分析维度...'
   if (parsing.value && autoDiscoverCompetitors.value) return '正在解析需求并自动发现竞品...'
+  if (parsing.value && autoAddAnalysisDimensions.value) return '正在解析需求并补充分析维度...'
   if (parsing.value) return '正在解析需求，生成 TaskPlan...'
   if (creating.value) return '正在提交后台分析任务...'
   return ''
+})
+
+watch(autoDiscoverCompetitors, (enabled) => {
+  if (taskPlan.value) {
+    taskPlan.value.auto_discover_competitors = enabled
+  }
 })
 
 function formatError(error: unknown) {
@@ -45,9 +56,10 @@ async function handleParse() {
   parsing.value = true
   lastError.value = ''
   try {
-    taskPlan.value = await parseTaskPlan(userInput.value, autoDiscoverCompetitors.value)
+    taskPlan.value = await parseTaskPlan(userInput.value, autoDiscoverCompetitors.value, autoAddAnalysisDimensions.value)
     const competitorCount = taskPlan.value.competitors.filter((name) => name.trim()).length
-    ElMessage.success(autoDiscoverCompetitors.value ? `需求解析完成，已补充 ${competitorCount} 个竞品` : '需求解析完成')
+    const dimensionCount = taskPlan.value.analysis_dimensions.filter((name) => name.trim()).length
+    ElMessage.success(`需求解析完成：${competitorCount} 个竞品，${dimensionCount} 个分析维度`)
   } catch (error) {
     console.error(error)
     lastError.value = formatError(error)
@@ -69,12 +81,24 @@ function mergeCompetitors(existing: string[], discovered: string[]) {
   return merged
 }
 
+function mergeDimensions(existing: string[], suggested: string[]) {
+  const names = new Set(existing.map((name) => name.trim().toLowerCase()).filter(Boolean))
+  const merged = [...existing]
+  for (const name of suggested) {
+    const normalized = name.trim().toLowerCase()
+    if (!normalized || names.has(normalized)) continue
+    names.add(normalized)
+    merged.push(name)
+  }
+  return merged
+}
+
 async function handleDiscoverCompetitors() {
   if (!taskPlan.value || discovering.value) return
   discovering.value = true
   lastError.value = ''
   try {
-    const discoveredPlan = await parseTaskPlan(userInput.value, true)
+    const discoveredPlan = await parseTaskPlan(userInput.value, true, false)
     const before = taskPlan.value.competitors.filter((name) => name.trim()).length
     taskPlan.value.competitors = mergeCompetitors(taskPlan.value.competitors, discoveredPlan.competitors)
     const after = taskPlan.value.competitors.filter((name) => name.trim()).length
@@ -85,6 +109,25 @@ async function handleDiscoverCompetitors() {
     ElMessage.error(`自动发现竞品失败：${lastError.value}`)
   } finally {
     discovering.value = false
+  }
+}
+
+async function handleAddAnalysisDimensions(enabled: boolean | string | number) {
+  if (!enabled || !taskPlan.value || addingDimensions.value) return
+  addingDimensions.value = true
+  lastError.value = ''
+  try {
+    const suggestedPlan = await parseTaskPlan(userInput.value, false, true)
+    const before = taskPlan.value.analysis_dimensions.filter((name) => name.trim()).length
+    taskPlan.value.analysis_dimensions = mergeDimensions(taskPlan.value.analysis_dimensions, suggestedPlan.analysis_dimensions)
+    const after = taskPlan.value.analysis_dimensions.filter((name) => name.trim()).length
+    ElMessage.success(`已补充 ${Math.max(0, after - before)} 个分析维度`)
+  } catch (error) {
+    console.error(error)
+    lastError.value = formatError(error)
+    ElMessage.error(`自动添加分析维度失败：${lastError.value}`)
+  } finally {
+    addingDimensions.value = false
   }
 }
 
@@ -107,7 +150,7 @@ async function handleCreate() {
 </script>
 
 <template>
-  <main v-loading="parsing || creating || discovering" :element-loading-text="loadingText" class="page">
+  <main v-loading="parsing || creating || discovering || addingDimensions" :element-loading-text="loadingText" class="page">
     <section class="toolbar">
       <div>
         <h1>竞品分析 Agent 工作台</h1>
@@ -121,9 +164,16 @@ async function handleCreate() {
         <el-switch
           v-model="autoDiscoverCompetitors"
           active-text="自动发现竞品"
-          :disabled="parsing || creating || discovering"
+          :disabled="parsing || creating || discovering || addingDimensions"
+          @change="(enabled: boolean | string | number) => enabled && handleDiscoverCompetitors()"
         />
-        <el-button type="primary" :loading="parsing" :disabled="creating || discovering" @click="handleParse">
+        <el-switch
+          v-model="autoAddAnalysisDimensions"
+          active-text="自动添加分析维度"
+          :disabled="parsing || creating || discovering || addingDimensions"
+          @change="handleAddAnalysisDimensions"
+        />
+        <el-button type="primary" :loading="parsing" :disabled="creating || discovering || addingDimensions" @click="handleParse">
           解析需求
         </el-button>
       </div>
@@ -136,11 +186,11 @@ async function handleCreate() {
     <section v-if="taskPlan" class="section">
       <div class="section-header">
         <h2>高级配置</h2>
-        <el-button type="success" :loading="creating" :disabled="parsing || discovering" @click="handleCreate">
+        <el-button type="success" :loading="creating" :disabled="parsing || discovering || addingDimensions" @click="handleCreate">
           开始分析
         </el-button>
       </div>
-      <TaskPlanForm v-model="taskPlan" @request-discover="handleDiscoverCompetitors" />
+      <TaskPlanForm v-model="taskPlan" />
     </section>
   </main>
 </template>

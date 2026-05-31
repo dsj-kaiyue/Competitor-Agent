@@ -3,10 +3,12 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import ClaimList from '@/components/ClaimList.vue'
+import ComparisonMatrixTable from '@/components/ComparisonMatrixTable.vue'
 import QaResultPanel from '@/components/QaResultPanel.vue'
 import ReportMarkdown from '@/components/ReportMarkdown.vue'
 import { downloadTaskReport, getTaskClaims, getTaskQa, getTaskReportDetail } from '@/api/analysisTaskApi'
 import type { ClaimItem } from '@/types/claim'
+import type { ComparisonMatrix } from '@/types/comparisonMatrix'
 import type { QAResult } from '@/types/qa'
 import type { ReportEvidenceItem, ReportItem } from '@/types/report'
 
@@ -15,6 +17,7 @@ const report = ref<ReportItem | null>(null)
 const qa = ref<QAResult | null>(null)
 const claims = ref<ClaimItem[]>([])
 const evidence = ref<ReportEvidenceItem[]>([])
+const matrices = ref<ComparisonMatrix[]>([])
 const exporting = ref(false)
 
 const claimById = computed(() => new Map(claims.value.map((claim) => [claim.id, claim])))
@@ -31,6 +34,7 @@ onMounted(async () => {
   qa.value = detail.qa_result || qaResult
   claims.value = detail.claims?.length ? detail.claims : claimItems
   evidence.value = detail.evidence || []
+  matrices.value = detail.matrices || []
 })
 
 async function handleExport(format: 'markdown' | 'pdf') {
@@ -120,6 +124,11 @@ async function handleExport(format: 'markdown' | 'pdf') {
       </article>
     </section>
     <ReportMarkdown v-else :markdown="report.content_markdown" />
+
+    <section v-if="matrices.length" class="section">
+      <h2>动态对比矩阵</h2>
+      <ComparisonMatrixTable :matrices="matrices" />
+    </section>
 
     <section class="section">
       <h2>QA 结果</h2>

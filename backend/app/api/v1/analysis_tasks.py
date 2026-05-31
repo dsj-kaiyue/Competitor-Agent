@@ -2,6 +2,7 @@ from threading import Thread
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -19,11 +20,17 @@ from app.schemas.analysis_task import (
 )
 from app.schemas.claim import ClaimItem, ClaimListResponse
 from app.schemas.evidence import EvidenceListResponse
+from app.schemas.matrix import ComparisonMatrixItem, ComparisonMatrixListResponse
+from app.schemas.metrics import TaskMetricsResponse
+from app.schemas.profile import CompetitorProfileItem, CompetitorProfileListResponse
 from app.schemas.qa import QAResultItem, QAResultResponse
 from app.schemas.report import ReportClaimItem, ReportEvidenceItem, ReportItem, ReportResponse
+from app.models.comparison_matrix import ComparisonMatrix
+from app.models.competitor_profile import CompetitorProfile
 from app.services.claim_service import list_claims_with_evidence
 from app.services.evidence_service import list_evidence
 from app.services.log_service import list_logs
+from app.services.metrics_service import MetricsService
 from app.services.qa_service import get_qa_result
 from app.services.report_service import build_markdown_export, build_pdf_export, get_report, safe_report_filename
 from app.services.task_service import (
@@ -114,8 +121,13 @@ def _enqueue_or_run_task(db: Session, task_id: int) -> None:
 
 def _normalize_qa_payload(qa_result) -> dict:
     payload = qa_result.issues_json or []
+    base_payload = {
+        "passed": qa_result.passed,
+        "score": float(qa_result.score) if qa_result.score is not None else None,
+    }
     if isinstance(payload, dict):
         return {
+            **base_payload,
             "issues": payload.get("issues") or [],
             "next_action": payload.get("next_action") or "end",
             "target_nodes": payload.get("target_nodes") or [],
@@ -123,6 +135,7 @@ def _normalize_qa_payload(qa_result) -> dict:
             "revision_round": payload.get("revision_round") or 0,
         }
     return {
+        **base_payload,
         "issues": payload if isinstance(payload, list) else [],
         "next_action": "end",
         "target_nodes": [],
@@ -364,6 +377,8 @@ def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportRespon
         if item.id in evidence_ids
     ]
     qa_result = get_qa_result(db, task_id)
+    profiles = list(db.scalars(select(CompetitorProfile).where(CompetitorProfile.task_id == task_id).order_by(CompetitorProfile.id)))
+    matrices = list(db.scalars(select(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).order_by(ComparisonMatrix.id)))
     return ReportResponse(
         report=ReportItem(
             id=report.id,
@@ -378,7 +393,32 @@ def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportRespon
         claims=claim_items,
         evidence=evidence_items,
         qa_result=_normalize_qa_payload(qa_result) if qa_result else None,
+        profiles=[CompetitorProfileItem.model_validate(item) for item in profiles],
+        matrices=[ComparisonMatrixItem.model_validate(item) for item in matrices],
     )
+
+
+@router.get("/{task_id}/profiles", response_model=CompetitorProfileListResponse)
+def get_task_profiles(task_id: int, db: Session = Depends(get_db)) -> CompetitorProfileListResponse:
+    if get_task(db, task_id) is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    items = list(db.scalars(select(CompetitorProfile).where(CompetitorProfile.task_id == task_id).order_by(CompetitorProfile.id)))
+    return CompetitorProfileListResponse(items=[CompetitorProfileItem.model_validate(item) for item in items])
+
+
+@router.get("/{task_id}/matrices", response_model=ComparisonMatrixListResponse)
+def get_task_matrices(task_id: int, db: Session = Depends(get_db)) -> ComparisonMatrixListResponse:
+    if get_task(db, task_id) is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    items = list(db.scalars(select(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).order_by(ComparisonMatrix.id)))
+    return ComparisonMatrixListResponse(items=[ComparisonMatrixItem.model_validate(item) for item in items])
+
+
+@router.get("/{task_id}/metrics", response_model=TaskMetricsResponse)
+def get_task_metrics(task_id: int, db: Session = Depends(get_db)) -> TaskMetricsResponse:
+    if get_task(db, task_id) is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return MetricsService(db).build_metrics(task_id)
 
 
 @router.get("/{task_id}/report/export")
@@ -394,12 +434,28 @@ def export_task_report(
     normalized_format = "markdown" if format in {"markdown", "md"} else "pdf"
     if normalized_format == "markdown":
         filename = safe_report_filename(report, "md")
-        body = build_markdown_export(report).encode("utf-8")
+        matrices = list(db.scalars(select(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).order_by(ComparisonMatrix.id)))
+        qa_result = get_qa_result(db, task_id)
+        claims_with_evidence = list_claims_with_evidence(db, task_id)
+        body = build_markdown_export(
+            report,
+            matrices=matrices,
+            qa_payload=_normalize_qa_payload(qa_result) if qa_result else None,
+            claims_with_evidence=claims_with_evidence,
+        ).encode("utf-8")
         media_type = "text/markdown; charset=utf-8"
     else:
         filename = safe_report_filename(report, "pdf")
         try:
-            body = build_pdf_export(report)
+            matrices = list(db.scalars(select(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).order_by(ComparisonMatrix.id)))
+            qa_result = get_qa_result(db, task_id)
+            claims_with_evidence = list_claims_with_evidence(db, task_id)
+            body = build_pdf_export(
+                report,
+                matrices=matrices,
+                qa_payload=_normalize_qa_payload(qa_result) if qa_result else None,
+                claims_with_evidence=claims_with_evidence,
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         media_type = "application/pdf"

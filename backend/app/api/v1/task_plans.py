@@ -11,15 +11,24 @@ router = APIRouter()
 def parse_user_input(request: TaskPlanParseRequest) -> TaskPlanParseResponse:
     _console(
         "task plan parse requested",
-        {"input_length": len(request.user_input), "auto_discover_competitors": request.auto_discover_competitors},
+        {
+            "input_length": len(request.user_input),
+            "auto_discover_competitors": request.auto_discover_competitors,
+            "auto_add_analysis_dimensions": request.auto_add_analysis_dimensions,
+        },
     )
-    task_plan = parse_task_plan(request.user_input, auto_discover_competitors=request.auto_discover_competitors)
+    task_plan = parse_task_plan(
+        request.user_input,
+        auto_discover_competitors=request.auto_discover_competitors,
+        auto_add_analysis_dimensions=request.auto_add_analysis_dimensions,
+    )
     _console(
         "task plan parse completed",
         {
             "competitor_count": len(task_plan.competitors),
             "dimension_count": len(task_plan.analysis_dimensions),
             "auto_discover_competitors": task_plan.auto_discover_competitors,
+            "auto_add_analysis_dimensions": request.auto_add_analysis_dimensions,
         },
     )
     return TaskPlanParseResponse(task_plan=task_plan)

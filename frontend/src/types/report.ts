@@ -1,4 +1,6 @@
 import type { ClaimItem } from './claim'
+import type { ComparisonMatrix } from './comparisonMatrix'
+import type { CompetitorProfile } from './competitorProfile'
 import type { QAResult } from './qa'
 
 export interface ReportParagraph {
@@ -44,4 +46,6 @@ export interface ReportResponse {
   claims: ClaimItem[]
   evidence: ReportEvidenceItem[]
   qa_result?: QAResult | null
+  profiles?: CompetitorProfile[]
+  matrices?: ComparisonMatrix[]
 }

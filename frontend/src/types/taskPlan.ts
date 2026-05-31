@@ -8,4 +8,5 @@ export interface TaskPlan {
   output_language: string
   auto_discover_competitors: boolean
   data_sources: string[]
+  template_key?: string | null
 }

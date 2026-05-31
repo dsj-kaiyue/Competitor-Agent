@@ -18,10 +18,14 @@ from app.models.agent_node import AgentNode
 from app.models.analysis_task import AnalysisTask
 from app.models.claim import Claim
 from app.models.claim_evidence import ClaimEvidence
+from app.models.comparison_matrix import ComparisonMatrix
+from app.models.competitor_profile import CompetitorProfile
 from app.models.evidence_chunk import EvidenceChunk
 from app.models.qa_result import QAResult
 from app.models.report import Report
 from app.models.source_document import SourceDocument
+from app.services.comparison_matrix_service import ComparisonMatrixService
+from app.services.competitor_profile_service import CompetitorProfileService
 from app.services.evidence_retriever import EvidenceRetriever
 from app.services.log_service import add_log
 from app.services.task_service import get_task_plan, update_task_status
@@ -820,15 +824,39 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
     def report_writer(node: AgentNode) -> None:
         plan = get_task_plan(task)
         claims = list(db.scalars(select(Claim).where(Claim.task_id == task_id).order_by(Claim.id)))
+        profiles = list(db.scalars(select(CompetitorProfile).where(CompetitorProfile.task_id == task_id).order_by(CompetitorProfile.id)))
+        matrices = list(db.scalars(select(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).order_by(ComparisonMatrix.id)))
         evidence_by_claim = _claim_evidence_map(db, [claim.id for claim in claims])
         claim_context = "\n".join(
             f"[claim_id={claim.id}] competitor={claim.competitor_name}; type={claim.claim_type}; "
             f"evidence_ids={evidence_by_claim.get(claim.id, [])}; text={claim.claim_text}"
             for claim in claims
         )
+        profile_context = json.dumps(
+            [
+                {
+                    "profile_id": profile.id,
+                    "competitor_name": profile.competitor_name,
+                    "profile_data": profile.profile_data_json,
+                }
+                for profile in profiles
+            ],
+            ensure_ascii=False,
+        )[:9000]
+        matrix_context = json.dumps(
+            [
+                {
+                    "matrix_id": matrix.id,
+                    "title": matrix.title,
+                    "matrix_data": matrix.matrix_data_json,
+                }
+                for matrix in matrices
+            ],
+            ensure_ascii=False,
+        )[:9000]
         revision_instruction = state.get("revision_reason") or ""
         prompt = f"""
-请基于以下结构化 Claim 生成中文竞品分析报告 JSON。
+请基于动态竞品画像、对比矩阵和结构化 Claim 生成中文竞品分析报告 JSON。
 主题：{plan.topic}
 行业：{plan.industry}
 竞品：{', '.join(plan.competitors)}
@@ -842,9 +870,16 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
 4. claim_ids 只能引用下方已有 claim_id，不要编造。
 5. 不要输出 evidence_ids，后端会自动补齐。
 6. 必须覆盖所有分析维度。
+7. 优先基于 CompetitorProfiles 和 ComparisonMatrices 组织内容，但关键段落仍要引用 claim_ids。
 
 JSON 格式：
 {{"title":"...","sections":[{{"section_id":"executive_summary","title":"执行摘要","paragraphs":[{{"paragraph_id":"executive_summary_p1","text":"...","claim_ids":[1,2]}}]}}]}}
+
+CompetitorProfiles:
+{profile_context}
+
+ComparisonMatrices:
+{matrix_context}
 
 Claims:
 {claim_context}
@@ -865,13 +900,33 @@ Claims:
             title=report_json.get("title") or f"{plan.topic}报告",
             content_markdown=content,
             content_html=markdown.markdown(content, extensions=["tables"]),
-            report_json={**report_json, "mode": "firecrawl_llm_milvus_rag"},
+            report_json={
+                **report_json,
+                "mode": "firecrawl_llm_milvus_rag",
+                "profile_ids": [profile.id for profile in profiles],
+                "matrix_ids": [matrix.id for matrix in matrices],
+            },
         )
         db.add(report)
         db.flush()
         node.output_summary = f"使用 LLM 生成报告 #{report.id}"
         _console("llm report writer completed", {"task_id": task_id, "report_id": report.id})
         state["report_id"] = report.id
+
+    def build_dynamic_knowledge() -> None:
+        profiles = CompetitorProfileService(db).build_profiles_for_task(task_id)
+        matrices = ComparisonMatrixService(db).build_matrices_for_task(task_id) if profiles else []
+        plan = get_task_plan(task)
+        payload = {
+            "profile_count": len(profiles),
+            "matrix_count": len(matrices),
+            "template_key": plan.template_key,
+            "field_count": len(plan.analysis_dimensions),
+            "analysis_dimensions": plan.analysis_dimensions,
+        }
+        add_log(db, task_id, None, "Built dynamic competitor profiles and comparison matrices", payload)
+        db.commit()
+        _console("dynamic competitor knowledge built", {"task_id": task_id, **payload})
 
     def qa(node: AgentNode) -> None:
         plan = get_task_plan(task)
@@ -1013,6 +1068,7 @@ Claims:
     _run_node(db, task_id, "collector", "collecting", collector)
     _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor)
     run_parallel_analysts()
+    build_dynamic_knowledge()
     _run_node(db, task_id, "report_writer", "writing", report_writer)
     _run_node(db, task_id, "qa", "qa_checking", qa)
     if not state.get("qa_passed") and state.get("revision_round", 0) < state.get("max_revision_rounds", 1):
@@ -1048,10 +1104,12 @@ Claims:
                 "security_analysis",
             ]
             run_parallel_analysts(targets, force=True)
+            build_dynamic_knowledge()
             _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
             _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
         elif action == "reanalyze":
             run_parallel_analysts(target_nodes or ["feature_analysis"], force=True)
+            build_dynamic_knowledge()
             _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
             _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
         elif action == "rewrite":

@@ -3,9 +3,11 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import DagFlow from '@/components/DagFlow.vue'
+import TaskMetricsPanel from '@/components/TaskMetricsPanel.vue'
 import {
   cancelAnalysisTask,
   getAnalysisTask,
+  getTaskMetrics,
   getTaskLogs,
   getTaskNodes,
   pauseAnalysisTask,
@@ -14,6 +16,7 @@ import {
 } from '@/api/analysisTaskApi'
 import type { AgentLog, AgentNode, DagEdge } from '@/types/agentNode'
 import type { AnalysisTask } from '@/types/analysisTask'
+import type { TaskMetrics } from '@/types/metrics'
 
 const route = useRoute()
 const taskId = Number(route.params.id)
@@ -21,6 +24,7 @@ const task = ref<AnalysisTask | null>(null)
 const nodes = ref<AgentNode[]>([])
 const edges = ref<DagEdge[]>([])
 const logs = ref<AgentLog[]>([])
+const metrics = ref<TaskMetrics | null>(null)
 const activeLogGroups = ref<string[]>([])
 const knownLogGroupKeys = ref(new Set<string>())
 const controlLoading = ref<string | null>(null)
@@ -120,6 +124,7 @@ async function load() {
   nodes.value = flow.nodes
   edges.value = flow.edges
   logs.value = await getTaskLogs(taskId)
+  metrics.value = await getTaskMetrics(taskId)
   syncNewLogGroups()
 }
 
@@ -234,6 +239,8 @@ onBeforeUnmount(() => {
     </section>
 
     <DagFlow :nodes="nodes" :edges="edges" />
+
+    <TaskMetricsPanel :metrics="metrics" />
 
     <section class="section">
       <h2>Agent 日志</h2>

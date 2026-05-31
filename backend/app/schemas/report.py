@@ -3,6 +3,9 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict
 
+from app.schemas.matrix import ComparisonMatrixItem
+from app.schemas.profile import CompetitorProfileItem
+
 
 class ReportItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -44,3 +47,5 @@ class ReportResponse(BaseModel):
     claims: list[ReportClaimItem] = []
     evidence: list[ReportEvidenceItem] = []
     qa_result: dict | None = None
+    profiles: list[CompetitorProfileItem] = []
+    matrices: list[ComparisonMatrixItem] = []

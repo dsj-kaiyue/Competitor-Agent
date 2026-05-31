@@ -29,7 +29,13 @@ AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话�
 - 任务控制支持暂停、恢复、取消和手动重试；Celery 不再对业务失败自动反复 retry。
 - 任务规划 Agent 在正式执行时只确认用户修改后的 TaskPlan，不再二次 LLM 解析覆盖前端修改。
 - 创建页的竞品列表和分析维度支持添加、编辑和删除。
-- 创建页解析需求时支持“自动发现竞品”开关；只要打开，不管用户是否已输入竞品，解析阶段都会补充竞品并立即回填到前端供用户增删。
+- 创建页顶部保留“自动发现竞品”开关；只要打开，不管用户是否已输入竞品，解析阶段都会补充竞品并立即回填到前端供用户增删。
+- 创建页顶部新增“自动添加分析维度”开关；只要打开，不管用户是否已输入分析维度，解析阶段都会补充新的推荐维度并立即回填到前端供用户增删。
+- Planner Agent 会根据用户输入场景动态推荐 `analysis_dimensions`，不再固定套用 AI 编程助手字段；用户最终确认后的维度会生成动态画像 Schema。
+- 新增动态竞品画像 `competitor_profile` 和动态对比矩阵 `comparison_matrix`，画像字段全部存储在 JSON 中，不增加行业固定列。
+- ReportWriter 会优先基于动态画像和动态矩阵组织报告，同时保留 Claim/Evidence 溯源。
+- 报告接口仍返回动态画像和动态矩阵；报告页只展示“竞品动态对比矩阵”，避免把同一批画像信息重复显示两次。
+- 新增 `/api/v1/analysis-tasks/{task_id}/metrics`，任务详情页新增运行指标面板。
 - 数据库新写入时间统一使用北京时间。
 - QA 结果扩展为带 `next_action / target_nodes / revision_round` 的结构化 payload。
 - QA 不通过时最多返工 1 轮，可回流到 collector、analyst 或 report_writer。
@@ -65,7 +71,10 @@ Firecrawl -> SourceDocument -> EvidenceChunk -> Milvus
                          +--> Analyst RAG
                                   |
                                   v
-                          Claim -> Report -> QA
+                          Claim -> CompetitorProfile -> ComparisonMatrix
+                                      |
+                                      v
+                                  Report -> QA
 ```
 
 核心设计原则：
@@ -76,6 +85,8 @@ Firecrawl -> SourceDocument -> EvidenceChunk -> Milvus
 - Redis 只做队列和运行态心跳。
 - Milvus 只做向量检索，Evidence 原文仍以 MySQL 为准。
 - 前端通过轮询任务、节点和日志接口展示动态执行过程。
+- 分析维度由 Planner 推荐、用户最终确认，后端根据最终 `analysis_dimensions` 动态生成画像 Schema。
+- 画像和矩阵用 JSON 保存，不把行业字段写死成数据库列。
 - 数据库新写入时间统一使用北京时间，历史 UTC 数据不会自动回写。
 - 项目功能变更需要同步更新 README，保证文档和真实系统行为一致。
 
@@ -850,10 +861,13 @@ Planner Agent 输出 TaskPlan：
 
 - 以前 LLM 解析失败会 fallback 到 AI 编程助手 demo 数据。
 - 现在 fallback 会根据用户输入推断目标产品和行业，不再硬编码 Cursor / Copilot / Windsurf / Tabnine。
-- 创建页有“自动发现竞品”开关，默认打开。
+- 创建页顶部有“自动发现竞品”和“自动添加分析维度”两个开关，默认打开。
 - 只要解析请求中的 `auto_discover_competitors=true`，后端就会额外执行竞品发现，并把发现结果追加到 `competitors` 返回前端；即使用户原始输入里已经写了竞品，也会继续补充。
+- 只要解析请求中的 `auto_add_analysis_dimensions=true`，后端会在 Planner 原始维度基础上再调用 Agent 推荐增量维度，并合并去重返回前端；即使用户原始输入里已经写了重点维度，也会继续补充适合场景的新维度。
 - 如果用户关闭“自动发现竞品”，后端只做需求解析，不额外搜索补充竞品。
-- 如果解析后在高级配置中把“自动发现竞品”从关闭切换为开启，前端会再次请求解析与自动发现，但只合并新增竞品，不覆盖用户已经编辑过的主题、维度、语言等其它 TaskPlan 字段。
+- 如果用户关闭“自动添加分析维度”，后端只使用 Planner 解析出的维度，不额外补充维度。
+- 如果解析后在顶部把“自动发现竞品”从关闭切换为开启，前端会再次请求解析与自动发现，但只合并新增竞品，不覆盖用户已经编辑过的主题、维度、语言等其它 TaskPlan 字段。
+- 如果解析后在顶部把“自动添加分析维度”从关闭切换为开启，前端会再次请求维度推荐，但只合并新增分析维度，不覆盖用户已经编辑过的主题、竞品、语言等其它 TaskPlan 字段。
 - 前端会展示 TaskPlan，用户可以继续编辑竞品、分析维度、报告深度和输出语言。
 - 竞品列表和分析维度都支持添加、编辑和删除。
 - 点击“开始分析”后，workflow 中的 `planner` 节点只确认和落库最终 TaskPlan，不再重新调用 LLM 解析 `user_input`，因此不会覆盖用户在前端修改过的竞品或分析维度。
@@ -1039,7 +1053,99 @@ LLM 输出 Claim JSON：
 
 Claim 只允许绑定本次传给 LLM 的 evidence，避免把全量 evidence 都挂上去。
 
-### 7. 报告生成与段落溯源
+### 7. 动态竞品画像与动态对比矩阵
+
+四个 Analyst 完成后，ReportWriter 之前，workflow 会执行动态知识构建：
+
+```text
+task_plan_json.analysis_dimensions
+  -> ProfileSchemaBuilder
+  -> competitor_profile.profile_schema_json
+  -> competitor_profile.profile_data_json
+  -> comparison_matrix.matrix_schema_json / matrix_data_json
+```
+
+新增后端文件：
+
+```text
+backend/app/services/profile_schema_builder.py
+backend/app/services/competitor_profile_service.py
+backend/app/services/comparison_matrix_service.py
+backend/app/models/competitor_profile.py
+backend/app/models/comparison_matrix.py
+```
+
+`ProfileSchemaBuilder` 会把用户最终确认的 `analysis_dimensions` 转成动态字段：
+
+```json
+{
+  "template_key": "web_data_collection",
+  "industry": "AI 数据采集 / Web Data Infrastructure",
+  "fields": [
+    {
+      "key": "data_collection_capabilities",
+      "label": "数据采集能力",
+      "type": "text",
+      "required": false,
+      "source_requirements": ["official_website", "docs", "blog"],
+      "query_templates": ["{competitor} {label} official"]
+    }
+  ]
+}
+```
+
+字段 key 规则：
+
+- 常见维度使用内置映射，例如 `价格策略 -> pricing_strategy`、`安全合规 -> security_compliance`、`数据采集能力 -> data_collection_capabilities`。
+- 未知维度不会丢弃；如果包含英文/数字，会生成稳定英文 key，例如 `MCP 支持 -> mcp_support`。
+- 纯中文未知维度会生成 `dimension_{index}_{hash}`，保证不同任务之间稳定可存储。
+
+`CompetitorProfileService` 会按竞品读取 Claim，并根据 `claim_type` 和关键词匹配到动态字段：
+
+- `pricing` 优先进入 `pricing_strategy`。
+- `security` 优先进入 `security_compliance / enterprise_capabilities`。
+- `market` 优先进入 `target_users / positioning`。
+- `feature` 优先进入 `core_features / agent_capabilities / ide_integration`。
+- 如果字段 label 出现在 Claim 文本中，也会视为相关。
+
+`profile_data_json` 示例：
+
+```json
+{
+  "pricing_strategy": {
+    "value": "Apify 提供按量和套餐计费，适合爬虫与数据采集任务。",
+    "claim_ids": [101],
+    "evidence_ids": [201, 202],
+    "confidence": 0.86
+  },
+  "mcp_support": {
+    "value": null,
+    "claim_ids": [],
+    "evidence_ids": [],
+    "confidence": 0,
+    "missing_reason": "缺少相关 Claim"
+  }
+}
+```
+
+`ComparisonMatrixService` 会基于所有竞品画像生成整体矩阵：
+
+```json
+{
+  "columns": ["Apify", "Bright Data", "Tavily"],
+  "rows": [
+    { "key": "pricing_strategy", "label": "价格策略" },
+    { "key": "developer_ecosystem", "label": "开发者生态" }
+  ]
+}
+```
+
+前端报告页会动态渲染：
+
+- `ComparisonMatrixTable.vue`：按 `matrix_schema_json.columns` 和 `matrix_data_json.rows` 展示“维度 + 每个竞品一列”。
+- `CompetitorProfileCards.vue` 保留为可复用组件，但报告页默认不展示画像卡片；因为矩阵本身就是由 `CompetitorProfile` 转置生成，二者信息源相同，矩阵更适合竞品横向对比。
+
+### 8. 报告生成与段落溯源
 
 ReportWriter 不再只让 LLM 输出 Markdown，而是要求 LLM 输出结构化 JSON：
 
@@ -1077,7 +1183,23 @@ ReportWriter 不再只让 LLM 输出 Markdown，而是要求 LLM 输出结构化
 - 每个段落显示“查看依据：N 条 Claim，M 条 Evidence”。
 - 点击展开后显示相关 Claim、置信度、Evidence 来源 URL、source_type 和原文片段。
 
-### 8. QA 反馈闭环
+ReportWriter 现在会同时接收：
+
+- `claims`
+- `evidence`
+- `competitor_profiles`
+- `comparison_matrices`
+
+报告要求优先基于动态画像和动态矩阵组织内容，但关键段落仍必须引用已有 `claim_ids`。`report_json` 会额外保存：
+
+```json
+{
+  "profile_ids": [1, 2, 3],
+  "matrix_ids": [1]
+}
+```
+
+### 9. QA 反馈闭环
 
 QA Agent 至少检查：
 
@@ -1347,7 +1469,44 @@ Claim 与 Evidence 多对多关联表。
 | `title` | 标题 |
 | `content_markdown` | Markdown |
 | `content_html` | HTML |
-| `report_json` | 结构化报告，包含 sections / paragraphs / claim_ids / evidence_ids |
+| `report_json` | 结构化报告，包含 sections / paragraphs / claim_ids / evidence_ids / profile_ids / matrix_ids |
+
+### `competitor_profile`
+
+动态竞品画像表。本表不包含任何行业固定画像列，所有维度字段都来自用户最终确认后的 `analysis_dimensions`。
+
+| 字段 | 含义 |
+| --- | --- |
+| `task_id` | 任务 ID |
+| `competitor_name` | 竞品名 |
+| `template_key` | 场景模板 key，可为空 |
+| `profile_schema_json` | 动态画像 Schema，包含 fields |
+| `profile_data_json` | 每个动态字段的值、claim_ids、evidence_ids、confidence |
+| `claim_ids_json` | 画像使用到的 Claim ID |
+| `evidence_ids_json` | 画像使用到的 Evidence ID |
+| `created_at / updated_at` | 北京时间 |
+
+唯一约束：
+
+```text
+task_id + competitor_name
+```
+
+### `comparison_matrix`
+
+动态对比矩阵表。矩阵列和行都来自动态画像，不写死字段。
+
+| 字段 | 含义 |
+| --- | --- |
+| `task_id` | 任务 ID |
+| `template_key` | 场景模板 key，可为空 |
+| `matrix_type` | 矩阵类型，目前为 `overall` |
+| `title` | 矩阵标题 |
+| `matrix_schema_json` | 矩阵 Schema，包含 columns / rows |
+| `matrix_data_json` | 矩阵数据，包含每个竞品在每个维度上的 summary / claim_ids / evidence_ids / confidence |
+| `claim_ids_json` | 矩阵使用到的 Claim ID |
+| `evidence_ids_json` | 矩阵使用到的 Evidence ID |
+| `created_at / updated_at` | 北京时间 |
 
 ### `qa_result`
 
@@ -1378,9 +1537,12 @@ QA 结果。
 | `GET` | `/api/v1/analysis-tasks/{task_id}/logs` | Agent 日志 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/evidence` | Evidence Chunk |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/claims` | Claim |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/report` | 报告、Claim、Evidence、QA payload |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/report/export?format=markdown` | 导出 Markdown 报告文件 |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/report/export?format=pdf` | 导出 PDF 报告文件 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/profiles` | 动态竞品画像 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/matrices` | 动态对比矩阵 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/metrics` | 运行指标，包含证据覆盖率、来源多样性、QA、RAG fallback 等 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/report` | 报告、Claim、Evidence、QA payload、动态画像和矩阵；前端报告页默认只展示矩阵 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/report/export?format=markdown` | 导出完整 Markdown 报告文件，包含报告正文、动态对比矩阵、QA 结果和结构化结论；动态对比矩阵使用标准 Markdown 表格 |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/report/export?format=pdf` | 导出完整 PDF 报告文件，包含报告正文、动态对比矩阵、QA 结果和结构化结论；PDF 会识别 Markdown 表格并渲染为真实表格，宽表会按列分块以避免页面溢出 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/qa` | QA 结果 |
 
 任务控制说明：
@@ -1389,8 +1551,39 @@ QA 结果。
 - 后端会在每个 Agent 节点开始前，以及采集、证据抽取、分析循环中检查控制状态。
 - 暂停后的任务状态为 `paused`，恢复时重新入队，已经 `success` 的节点会跳过，`paused` 节点会继续执行。
 - 取消后的任务状态为 `canceled`，不会自动清理已经写入的中间数据。
-- 重试会清理该任务旧的 `source_document / evidence_chunk / claim / claim_evidence / report / qa_result`，并将所有节点重置为 `pending` 后重新执行。
+- 重试会清理该任务旧的 `source_document / evidence_chunk / claim / claim_evidence / competitor_profile / comparison_matrix / report / qa_result`，并将所有节点重置为 `pending` 后重新执行。
 - Celery 任务的自动业务 retry 已关闭，失败后不会自己反复重跑；需要用户在前端手动点击“重试”。
+
+Metrics API 说明：
+
+```http
+GET /api/v1/analysis-tasks/{task_id}/metrics
+```
+
+该接口只查询 MySQL，不调用 Firecrawl、DeepSeek、DashScope 或 Milvus。当前返回：
+
+- `source_document_count`
+- `evidence_chunk_count`
+- `embedded_chunk_count`
+- `embedding_failed_count`
+- `claim_count`
+- `claim_with_evidence_count`
+- `evidence_coverage`
+- `used_evidence_count`
+- `evidence_usage_rate`
+- `profile_count`
+- `matrix_count`
+- `qa_score`
+- `qa_passed`
+- `revision_count`
+- `source_diversity`
+- `competitor_coverage`
+- `rag_query_count`
+- `rag_fallback_count`
+- `external_error_count`
+- `node_durations`
+
+前端 `TaskMetricsPanel.vue` 已接入任务详情页。任务详情页轮询任务状态时会同步刷新 Metrics，因此运行中可以看到来源数、Claim 数、画像/矩阵数量、证据覆盖率、Evidence 使用率、QA 分数和节点耗时变化。
 
 ## 配置
 

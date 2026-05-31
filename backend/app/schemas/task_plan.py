@@ -11,11 +11,13 @@ class TaskPlan(BaseModel):
     output_language: str = "zh-CN"
     auto_discover_competitors: bool = False
     data_sources: list[str] = Field(default_factory=list)
+    template_key: str | None = None
 
 
 class TaskPlanParseRequest(BaseModel):
     user_input: str
     auto_discover_competitors: bool = True
+    auto_add_analysis_dimensions: bool = True
 
 
 class TaskPlanParseResponse(BaseModel):

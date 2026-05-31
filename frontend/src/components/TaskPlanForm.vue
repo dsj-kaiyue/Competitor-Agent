@@ -2,9 +2,6 @@
 import type { TaskPlan } from '@/types/taskPlan'
 
 const model = defineModel<TaskPlan>({ required: true })
-const emit = defineEmits<{
-  requestDiscover: []
-}>()
 
 function addCompetitor() {
   model.value.competitors.push('')
@@ -38,22 +35,14 @@ function removeDimension(index: number) {
       </el-col>
     </el-row>
     <el-row :gutter="16">
-      <el-col :span="8">
+      <el-col :span="12">
         <el-form-item label="报告深度">
           <el-segmented v-model="model.report_depth" :options="['simple', 'standard', 'deep']" />
         </el-form-item>
       </el-col>
-      <el-col :span="8">
+      <el-col :span="12">
         <el-form-item label="输出语言">
           <el-input v-model="model.output_language" />
-        </el-form-item>
-      </el-col>
-      <el-col :span="8">
-        <el-form-item label="自动发现竞品">
-          <el-switch
-            v-model="model.auto_discover_competitors"
-            @change="(enabled: boolean) => enabled && emit('requestDiscover')"
-          />
         </el-form-item>
       </el-col>
     </el-row>

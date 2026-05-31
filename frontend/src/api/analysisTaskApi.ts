@@ -6,6 +6,7 @@ import type { EvidenceItem } from '@/types/evidence'
 import type { QAResult } from '@/types/qa'
 import type { ReportItem, ReportResponse } from '@/types/report'
 import type { TaskPlan } from '@/types/taskPlan'
+import type { TaskMetrics } from '@/types/metrics'
 
 export async function createAnalysisTask(user_input: string, task_plan: TaskPlan) {
   const { data } = await http.post<{ task_id: number; status: string }>('/analysis-tasks', {
@@ -112,4 +113,9 @@ export async function downloadTaskReport(taskId: number, format: 'markdown' | 'p
 export async function getTaskQa(taskId: number) {
   const { data } = await http.get<{ qa_result: QAResult | null }>(`/analysis-tasks/${taskId}/qa`)
   return data.qa_result
+}
+
+export async function getTaskMetrics(taskId: number) {
+  const { data } = await http.get<TaskMetrics>(`/analysis-tasks/${taskId}/metrics`)
+  return data
 }

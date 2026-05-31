@@ -8,6 +8,8 @@ from app.models.agent_node import AgentNode
 from app.models.analysis_task import AnalysisTask
 from app.models.claim import Claim
 from app.models.claim_evidence import ClaimEvidence
+from app.models.comparison_matrix import ComparisonMatrix
+from app.models.competitor_profile import CompetitorProfile
 from app.models.evidence_chunk import EvidenceChunk
 from app.models.qa_result import QAResult
 from app.models.report import Report
@@ -153,6 +155,8 @@ def reset_task_for_retry(db: Session, task_id: int) -> AnalysisTask | None:
     db.execute(delete(ClaimEvidence).where(ClaimEvidence.evidence_chunk_id.in_(evidence_ids)).execution_options(synchronize_session=False))
     db.execute(delete(QAResult).where(QAResult.task_id == task_id).execution_options(synchronize_session=False))
     db.execute(delete(Report).where(Report.task_id == task_id).execution_options(synchronize_session=False))
+    db.execute(delete(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).execution_options(synchronize_session=False))
+    db.execute(delete(CompetitorProfile).where(CompetitorProfile.task_id == task_id).execution_options(synchronize_session=False))
     db.execute(delete(Claim).where(Claim.task_id == task_id).execution_options(synchronize_session=False))
     db.execute(delete(EvidenceChunk).where(EvidenceChunk.task_id == task_id).execution_options(synchronize_session=False))
     db.execute(delete(SourceDocument).where(SourceDocument.task_id == task_id).execution_options(synchronize_session=False))

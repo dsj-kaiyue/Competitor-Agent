@@ -126,13 +126,20 @@ Firecrawl -> SourceDocument -> EvidenceChunk -> Milvus
 
 ## DeepSeek 调用链、请求体与返回取值
 
-当前系统所有 DeepSeek Chat 请求都统一经过：
+这一节说明两件事：
+
+1. 后端如何向 DeepSeek OpenAI 兼容 API 发送请求、接收返回、取出最终回答。
+2. 当前系统中所有会调用 DeepSeek Chat API 的 Agent 分别使用什么 system prompt、user prompt、输入数据和输出数据。
+
+### 统一调用入口
+
+所有 DeepSeek Chat 请求都经过：
 
 ```text
 backend/app/tools/llm_client.py
 ```
 
-核心代码：
+核心逻辑：
 
 ```python
 model = ChatOpenAI(
@@ -141,8 +148,7 @@ model = ChatOpenAI(
     base_url=settings.llm_base_url,
     timeout=90,
     temperature=0.2 if not settings.llm_thinking_enabled else None,
-    extra_body={"thinking": {"type": "enabled/disabled"}},
-    reasoning_effort="high",  # 仅在 LLM_THINKING_ENABLED=true 时传入
+    **self._deepseek_thinking_kwargs(model_name),
 )
 
 messages = []
@@ -153,9 +159,11 @@ messages.append(("human", prompt))
 return str(model.invoke(messages).content)
 ```
 
+系统不会在各个 Agent 中手写 HTTP 请求体，而是使用 `langchain_openai.ChatOpenAI` 调用 DeepSeek 的 OpenAI 兼容接口。也就是说，所有 Agent 最终都走同一套 `LLMClient.complete(prompt, system=...)`。
+
 ### 请求地址
 
-`.env` 中配置：
+`.env` 中的关键配置：
 
 ```env
 LLM_BASE_URL=https://api.deepseek.com/v1
@@ -164,23 +172,22 @@ LLM_THINKING_ENABLED=false
 LLM_REASONING_EFFORT=high
 ```
 
-因为使用的是 OpenAI 兼容 Chat Completions 协议，所以实际请求地址等价于：
+因为 DeepSeek 使用 OpenAI 兼容 Chat Completions 协议，实际请求地址等价于：
 
 ```http
 POST https://api.deepseek.com/v1/chat/completions
 ```
 
+`LLM_BASE_URL` 只配置到 `/v1`，SDK 会自动拼接 `/chat/completions`。
+
 ### 统一请求体结构
 
-代码没有手写 HTTP body，而是由 `langchain_openai.ChatOpenAI` 生成。等价请求体如下：
+关闭思考模式时，请求体等价于：
 
 ```json
 {
   "model": "deepseek-v4-pro",
   "temperature": 0.2,
-  "thinking": {
-    "type": "disabled"
-  },
   "messages": [
     {
       "role": "system",
@@ -190,109 +197,163 @@ POST https://api.deepseek.com/v1/chat/completions
       "role": "user",
       "content": "用户提示词"
     }
-  ]
-}
-```
-
-`timeout=90` 是客户端超时配置，不是请求体字段。
-
-### DeepSeek 思考模式开关
-
-DeepSeek 官方文档说明，OpenAI 兼容请求可通过 `extra_body` 中的 `thinking` 参数控制思考模式：
-
-```json
-{
-  "thinking": {
-    "type": "enabled"
-  }
-}
-```
-
-本项目提供两个 `.env` 配置：
-
-```env
-LLM_THINKING_ENABLED=false
-LLM_REASONING_EFFORT=high
-```
-
-含义：
-
-- `LLM_THINKING_ENABLED=false`：所有 DeepSeek Chat 请求都会携带 `thinking.type=disabled`，关闭思考模式。
-- `LLM_THINKING_ENABLED=true`：所有 DeepSeek Chat 请求都会携带 `thinking.type=enabled`，并传入 `reasoning_effort=LLM_REASONING_EFFORT`。
-- `LLM_REASONING_EFFORT` 建议使用 `high` 或 `max`。
-
-关闭思考模式时等价请求体：
-
-```json
-{
-  "model": "deepseek-v4-pro",
-  "messages": [],
+  ],
   "thinking": {
     "type": "disabled"
   }
 }
 ```
 
-开启思考模式时等价请求体：
+开启思考模式时，请求体等价于：
 
 ```json
 {
   "model": "deepseek-v4-pro",
-  "messages": [],
-  "reasoning_effort": "high",
+  "messages": [
+    {
+      "role": "system",
+      "content": "系统提示词"
+    },
+    {
+      "role": "user",
+      "content": "用户提示词"
+    }
+  ],
   "thinking": {
     "type": "enabled"
+  },
+  "reasoning_effort": "high"
+}
+```
+
+说明：
+
+- `timeout=90` 是 SDK 客户端超时配置，不是请求体字段。
+- `temperature=0.2` 只在 `LLM_THINKING_ENABLED=false` 时传入。
+- `thinking` 来自 `ChatOpenAI(..., extra_body={"thinking": {"type": "..."} })`，最终作为 DeepSeek 扩展字段传给 API。
+- `reasoning_effort` 只在 `LLM_THINKING_ENABLED=true` 且 `LLM_REASONING_EFFORT` 有值时传入。
+
+### 返回数据结构与系统实际取值
+
+DeepSeek Chat Completions 返回结构等价于：
+
+```json
+{
+  "id": "chatcmpl_xxx",
+  "object": "chat.completion",
+  "created": 1770000000,
+  "model": "deepseek-v4-pro",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"passed\":true,\"score\":0.91,\"issues\":[]}",
+        "reasoning_content": "这里可能是思考内容，仅开启思考模式时存在"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 200,
+    "total_tokens": 1200
   }
 }
 ```
 
-### 返回取值与思考内容
-
-DeepSeek 思考模式会把思考内容放在：
-
-```text
-response.choices[0].message.reasoning_content
-```
-
-当前系统不会读取这个字段。系统只通过 LangChain 取：
-
-```python
-model.invoke(messages).content
-```
-
-等价于只使用：
+当前系统只读取：
 
 ```text
 response.choices[0].message.content
 ```
 
-因此当前系统不会保存、解析或使用 DeepSeek 的思考内容。后续 JSON 解析也只针对 `content` 字段中的最终回答。
+在代码里对应：
 
-### JSON 解析方式
+```python
+model.invoke(messages).content
+```
 
-多数 Agent 都要求 DeepSeek 只输出 JSON。后端统一用 `_json_from_text()` 解析：
+系统不会读取、保存、解析或使用：
 
 ```text
-1. 如果 content 中有 ```json fenced block，先取 fenced block 内文本。
+response.choices[0].message.reasoning_content
+```
+
+因此，即使开启 DeepSeek 思考模式，业务逻辑也只会处理最终回答 `content`，不会把思考内容写入 MySQL、报告、Agent 日志或 Claim。
+
+### JSON 解析规则
+
+多数 Agent 都要求 DeepSeek 只输出 JSON。后端统一通过 `_json_from_text()` 解析：
+
+~~~text
+1. 如果 content 中存在 ```json fenced block，先取 fenced block 内文本。
 2. 优先直接 json.loads(content)。
-3. 如果直接解析失败，再用正则从 content 中提取最外层 JSON 对象。
-```
+3. 如果直接解析失败，再用正则提取最外层 JSON 对象或数组。
+~~~
 
-因此，后端使用的是最终回答里的 JSON，不使用 `reasoning_content`。
+动态维度 Analyst 还额外使用 `_parse_llm_json_with_repair()`。如果第一次返回不是合法 JSON，系统会再调用一次 DeepSeek，让模型把上一次输出修正为合法 JSON。
 
-### 1. 需求解析 Planner Agent
-
-触发时机：
+JSON 修正请求的 system prompt：
 
 ```text
-前端点击“解析需求”
-POST /api/v1/task-plans/parse
+你只输出合法 JSON。
 ```
+
+JSON 修正请求的 user prompt：
+
+```text
+上一次模型输出不是合法 JSON，解析失败：{first_exc}
+
+请把下面内容修正为合法 JSON。
+要求：
+1. 只输出合法 JSON，不要 Markdown，不要解释。
+2. 期望 JSON 类型：{expected}
+3. 如果原内容为空或无法修复，请基于原始任务 prompt 输出一个空 JSON 数组 []。
+
+原始任务 prompt：
+{original_prompt[-5000:]}
+
+上一次模型输出：
+{raw[:5000]}
+```
+
+修正请求的输出仍然只取 `content` 并执行 JSON 解析。
+
+### 调用 DeepSeek 的 Agent 总览
+
+| Agent / 步骤 | 触发时机 | 输入 | 输出 | 是否写库 |
+| --- | --- | --- | --- | --- |
+| Planner Agent | 前端点击“解析需求” | 用户原始需求、自动发现开关、自动添加维度开关 | `TaskPlan` | 不直接写任务表，接口返回前端 |
+| Dimension Suggestion Agent | 解析需求阶段，且自动添加分析维度开启 | 用户需求、当前 `TaskPlan`、已有维度 | 新增分析维度数组 | 合并到返回前端的 `TaskPlan` |
+| Competitor Discovery Agent | 解析需求阶段自动发现竞品；正式执行阶段只做兜底 | `TaskPlan`、Firecrawl search 结果 | 新增竞品数组 | 解析阶段返回前端；正式执行阶段更新 `task_plan_json` |
+| Dimension Prompt Planner Agent | 正式执行阶段，Planner 节点确认后 | `TaskPlan`、动态画像字段 schema | 每个维度的 prompt spec | 写入对应 `agent_node.input_summary/output_summary` 和运行态 spec |
+| Dynamic Dimension Analyst Agent | 证据抽取完成后 | 某个维度的 prompt spec、某个竞品、RAG evidence | Claim JSON 数组 | 写入 `claim`、`claim_evidence` |
+| ReportWriter Agent | 动态维度 Analyst 完成且至少有 Claim | 画像、矩阵、Claim | 报告 JSON | 写入 `report` |
+| QA Agent | ReportWriter 完成后 | 报告 Markdown、本地规则检查问题 | QA 结果 JSON | 写入 `qa_result` |
+
+### 1. Planner Agent：需求解析
 
 代码位置：
 
 ```text
 backend/app/agents/planner_agent.py
+```
+
+触发接口：
+
+```http
+POST /api/v1/task-plans/parse
+```
+
+前端请求示例：
+
+```json
+{
+  "user_input": "请分析 Firecrawl 在 AI 数据采集领域的竞品情况，重点关注网页抓取能力、结构化抽取能力和开发者生态。",
+  "auto_discover_competitors": true,
+  "auto_add_analysis_dimensions": true
+}
 ```
 
 System prompt：
@@ -305,6 +366,7 @@ User prompt 模板：
 
 ```text
 你是竞品分析 Planner Agent。请把用户输入解析成通用竞品分析 TaskPlan。
+你需要根据用户输入判断本次竞品分析场景，并推荐适合该场景的分析维度。
 
 用户输入：
 {user_input}
@@ -319,38 +381,59 @@ User prompt 模板：
   "report_depth": "simple|standard|deep",
   "output_language": "zh-CN",
   "auto_discover_competitors": true,
-  "data_sources": ["official_website","pricing_page","docs","blog","news","reviews"]
+  "data_sources": ["official_website","pricing_page","docs","blog","news","reviews"],
+  "template_key": "string or null"
 }
 
 规则：
 - 如果用户只给了目标产品和行业，没有明确列出竞品，competitors 输出空数组，并把 auto_discover_competitors 设为 true。
 - 不要使用示例产品或默认竞品填充结果。
 - topic、industry、target_product 必须忠实来自用户输入。
+- analysis_dimensions 必须根据行业和用户场景动态生成，不能固定返回 AI 编程助手维度。
+- 如果用户明确写了“重点关注 xxx”，必须优先保留这些维度。
+- 如果用户没有指定维度，根据行业自动推荐 5 到 8 个中文短语维度，适合直接展示给用户编辑。
+- AI 数据采集场景可包含“数据采集能力”“网页抓取能力”“结构化抽取能力”“开发者生态”等；AI 搜索场景可包含“搜索能力”“引用质量”“研究报告能力”等；新能源汽车场景可包含“车型定位”“续航能力”“智能驾驶”等。
 ```
 
-期望返回：
+发送给 DeepSeek 的 messages 示例：
+
+```json
+[
+  {
+    "role": "system",
+    "content": "你只输出合法 JSON。"
+  },
+  {
+    "role": "user",
+    "content": "你是竞品分析 Planner Agent。请把用户输入解析成通用竞品分析 TaskPlan。\n你需要根据用户输入判断本次竞品分析场景，并推荐适合该场景的分析维度。\n\n用户输入：\n请分析 Firecrawl 在 AI 数据采集领域的竞品情况，重点关注网页抓取能力、结构化抽取能力和开发者生态。\n\n只输出 JSON，不要输出解释。格式：..."
+  }
+]
+```
+
+DeepSeek `content` 期望示例：
 
 ```json
 {
-  "topic": "Firecrawl 竞品分析",
+  "topic": "Firecrawl 在 AI 数据采集领域的竞品分析",
   "industry": "AI 数据采集",
   "target_product": "Firecrawl",
   "competitors": [],
-  "analysis_dimensions": ["产品定位", "核心功能", "价格策略", "安全合规"],
+  "analysis_dimensions": ["网页抓取能力", "结构化抽取能力", "开发者生态", "价格策略", "安全合规", "性能与延迟表现"],
   "report_depth": "standard",
   "output_language": "zh-CN",
   "auto_discover_competitors": true,
-  "data_sources": ["official_website", "pricing_page", "docs", "blog", "news", "reviews"]
+  "data_sources": ["official_website", "pricing_page", "docs", "blog", "news", "reviews"],
+  "template_key": null
 }
 ```
 
-系统取出的数据：
+系统取值：
 
 ```text
-content -> JSON -> TaskPlan
+content -> JSON object -> TaskPlan(**data)
 ```
 
-然后写入或返回：
+使用字段：
 
 ```text
 topic
@@ -362,19 +445,136 @@ report_depth
 output_language
 auto_discover_competitors
 data_sources
+template_key
 ```
 
-注意：
+输出给前端的结构：
 
-- 如果 DeepSeek 解析失败，会进入本地 fallback `_infer_task_plan()`。
-- 解析接口请求体包含 `auto_discover_competitors`。
-- 如果 `auto_discover_competitors=true`，后端会在 Planner 解析后继续执行竞品发现，不管 Planner 是否已经解析出竞品。
-- 自动发现出的竞品会与 Planner 返回的 `competitors` 合并去重，再立刻返回前端展示。
-- 如果用户在高级配置中重新打开自动发现，前端会再次调用解析接口并只合并新竞品，不覆盖其它已编辑配置。
-- 用户可以在前端继续增加或删除竞品，正式分析只使用用户最终确认的列表。
-- 点击“开始分析”后的 `planner` 节点不再二次调用 LLM，只确认前端最终 TaskPlan。
+```json
+{
+  "task_plan": {
+    "topic": "Firecrawl 在 AI 数据采集领域的竞品分析",
+    "industry": "AI 数据采集",
+    "target_product": "Firecrawl",
+    "competitors": ["Apify", "Bright Data", "Diffbot"],
+    "analysis_dimensions": ["网页抓取能力", "结构化抽取能力", "开发者生态", "价格策略", "安全合规", "性能与延迟表现"],
+    "report_depth": "standard",
+    "output_language": "zh-CN",
+    "auto_discover_competitors": true,
+    "data_sources": ["official_website", "pricing_page", "docs", "blog", "news", "reviews"],
+    "template_key": null
+  }
+}
+```
 
-### 2. Collector 自动发现竞品
+补充规则：
+
+- 如果 DeepSeek 调用失败或 JSON 解析失败，后端会使用 `_infer_task_plan()` 做本地兜底。
+- 如果 `auto_discover_competitors=true`，Planner 解析后会继续执行 Competitor Discovery Agent，并把新增竞品合并进 `competitors`。
+- 如果 `auto_add_analysis_dimensions=true`，Planner 解析后会继续执行 Dimension Suggestion Agent，并把新增维度合并进 `analysis_dimensions`。
+- 点击“开始分析”后的正式 `planner` 节点不再调用 DeepSeek，只确认前端最终编辑后的 TaskPlan。
+
+### 2. Dimension Suggestion Agent：自动添加分析维度
+
+代码位置：
+
+```text
+backend/app/agents/planner_agent.py
+```
+
+触发时机：
+
+```text
+POST /api/v1/task-plans/parse
+且请求体 auto_add_analysis_dimensions=true
+```
+
+输入示例：
+
+```json
+{
+  "user_input": "请分析 Firecrawl 在 AI 数据采集领域的竞品情况。",
+  "current_plan": {
+    "topic": "Firecrawl 竞品分析",
+    "industry": "AI 数据采集",
+    "target_product": "Firecrawl",
+    "analysis_dimensions": ["价格策略", "安全合规"]
+  }
+}
+```
+
+System prompt：
+
+```text
+你只输出合法 JSON。
+```
+
+User prompt 模板：
+
+```text
+请根据用户输入和当前 TaskPlan，补充推荐一些更适合本次竞品分析的分析维度。
+
+用户输入：
+{user_input}
+
+当前主题：{plan.topic}
+行业：{plan.industry}
+目标产品：{plan.target_product}
+已有分析维度：{json.dumps(existing, ensure_ascii=False)}
+
+要求：
+- 只输出 JSON 数组，最多 {max_dimensions} 个中文短语。
+- 不要重复已有分析维度。
+- 不要固定套用 AI 编程助手维度。
+- 如果场景是 AI 数据采集，可以补充“网页抓取能力”“结构化抽取能力”“开发者生态”等。
+- 如果场景是 AI 搜索，可以补充“搜索能力”“引用质量”“研究报告能力”等。
+- 如果用户输入中有“重点关注”，优先围绕这些重点补充。
+```
+
+DeepSeek `content` 期望示例：
+
+```json
+["网页抓取能力", "结构化抽取能力", "开发者生态", "反爬与稳定性"]
+```
+
+也兼容对象格式：
+
+```json
+{
+  "analysis_dimensions": ["网页抓取能力", "结构化抽取能力", "开发者生态"]
+}
+```
+
+系统取值：
+
+```text
+content -> JSON array
+```
+
+如果返回对象，则取：
+
+```text
+analysis_dimensions
+```
+
+合并规则：
+
+```text
+1. 保留用户已有维度。
+2. 过滤空字符串。
+3. 按名称去重。
+4. 最多追加 max_dimensions 个新维度。
+5. 返回前端后允许用户继续增加或删除。
+```
+
+### 3. Competitor Discovery Agent：自动发现竞品
+
+代码位置：
+
+```text
+backend/app/agents/planner_agent.py
+backend/app/graph/workflow.py
+```
 
 触发时机：
 
@@ -387,10 +587,25 @@ POST /api/v1/task-plans/parse
 仅作为兜底逻辑，当 TaskPlan.auto_discover_competitors=true 且 competitors 仍为空时触发
 ```
 
-代码位置：
+输入由两部分组成：
 
-```text
-backend/app/graph/workflow.py
+```json
+{
+  "target": "Firecrawl",
+  "industry": "AI 数据采集",
+  "firecrawl_search_results": [
+    {
+      "title": "Apify - Web Scraping and Automation Platform",
+      "url": "https://apify.com/",
+      "description": "Cloud platform for web scraping, crawling and browser automation."
+    },
+    {
+      "title": "Bright Data Web Scraper APIs",
+      "url": "https://brightdata.com/",
+      "description": "Data collection infrastructure and web scraping APIs."
+    }
+  ]
+}
 ```
 
 System prompt：
@@ -403,28 +618,28 @@ User prompt 模板：
 
 ```text
 请从搜索结果中识别与目标产品最相关的直接竞品或替代产品。
-目标产品：{plan.target_product or plan.topic}
+目标产品：{target}
 行业：{plan.industry}
 搜索结果：
 {discovery_context}
 
-只输出 JSON 数组，最多 6 个产品名。不要包含目标产品本身，不要输出解释。
+只输出 JSON 数组，最多 {max_competitors} 个产品名。不要包含目标产品本身，不要输出解释。
 ```
 
-其中 `discovery_context` 来自 Firecrawl search，形如：
+其中 `discovery_context` 形如：
 
 ```text
-- title=...; url=...; description=...
-- title=...; url=...; description=...
+- title=Apify - Web Scraping and Automation Platform; url=https://apify.com/; description=Cloud platform for web scraping, crawling and browser automation.
+- title=Bright Data Web Scraper APIs; url=https://brightdata.com/; description=Data collection infrastructure and web scraping APIs.
 ```
 
-期望返回：
+DeepSeek `content` 期望示例：
 
 ```json
 ["Apify", "Bright Data", "Diffbot", "Browse AI"]
 ```
 
-兼容返回：
+也兼容对象格式：
 
 ```json
 {
@@ -432,47 +647,35 @@ User prompt 模板：
 }
 ```
 
-系统取出的数据：
+系统取值：
 
 ```text
-content -> JSON
+content -> JSON array
 ```
 
-如果是数组，直接作为 `plan.competitors`；如果是对象，取：
+如果返回对象，则取：
 
 ```text
 competitors
 ```
 
-然后过滤空值和目标产品自身，最多保留 6 个竞品。
-
-合并策略：
+合并规则：
 
 ```text
-1. 保留 Planner 或用户输入中已有的 competitors。
-2. 自动发现结果按名称去重。
-3. 不加入目标产品自身。
-4. 将新增竞品追加到 competitors 后面。
-5. 返回前端后由用户最终增删确认。
+1. 保留用户已有 competitors。
+2. 过滤空字符串。
+3. 过滤目标产品自身。
+4. 按名称去重。
+5. 最多保留 6 个自动发现竞品。
+6. 返回前端后允许用户继续增加或删除。
 ```
 
-### 3. 动态维度 Analyst Agent
+正式执行阶段的兜底规则：
 
-触发时机：
+- 如果正式任务开始时 `competitors` 仍为空，且 `auto_discover_competitors=true`，Collector 会再次调用该能力。
+- 如果仍然没有发现任何竞品，任务会失败并提示 `Auto competitor discovery did not produce competitors`。
 
-```text
-dimension_planner 完成 prompt spec 规划，evidence_extractor 完成证据抽取后
-```
-
-系统不固定执行 `feature_analysis / pricing_analysis / market_analysis / security_analysis` 四个 Analyst，而是按用户确认的分析维度动态生成 Analyst。执行方式是：
-
-```text
-TaskPlan.analysis_dimensions
-  -> Dimension Prompt Planner Agent
-  -> 为每个维度生成一个 prompt spec
-  -> 并行启动 N 个 dimension_analysis_* Agent
-  -> 每个 Agent 只负责一个分析维度
-```
+### 4. Dimension Prompt Planner Agent：为每个维度生成专属 prompt spec
 
 代码位置：
 
@@ -481,140 +684,33 @@ backend/app/graph/workflow.py
 backend/app/services/task_service.py
 ```
 
-Dimension Prompt Planner 的 system prompt：
-
-```text
-你只输出合法 JSON。
-```
-
-Dimension Prompt Planner 的 user prompt 核心要求：
-
-```text
-你是 Dimension Prompt Planner Agent。请为每一个分析维度生成专属 prompt spec，供后续独立维度分析 Agent 使用。
-
-要求：
-1. 必须为每个字段输出一条 spec，不能新增或删除维度。
-2. dimension_key 必须等于字段 key，dimension_label 必须等于字段 label。
-3. analysis_goal、must_answer、evidence_focus、comparison_criteria 必须适配该维度和行业。
-4. 不要输出完整报告，不要执行分析。
-5. 只输出合法 JSON 数组。
-```
-
-Prompt spec 返回示例：
-
-```json
-[
-  {
-    "dimension_key": "structured_extraction_capabilities",
-    "dimension_label": "结构化抽取能力",
-    "analysis_goal": "比较各竞品在网页内容结构化抽取、字段还原和输出稳定性上的能力。",
-    "evidence_focus": ["official_website", "docs", "blog"],
-    "must_answer": ["支持哪些结构化输出", "是否有 API 或 SDK 支撑", "证据是否来自官方文档"],
-    "comparison_criteria": ["输出格式", "抽取稳定性", "开发者易用性"]
-  }
-]
-```
-
-每个动态 Dimension Analyst 的 system prompt：
-
-```text
-你只输出合法 JSON，不编造证据。
-```
-
-每个动态 Dimension Analyst 的 user prompt 会注入对应维度的 prompt spec，并要求只分析当前维度：
-
-```text
-你是一个动态维度竞品分析 Agent。你只负责一个分析维度，不要分析其它维度。
-当前维度 key：{dimension_key}
-当前维度名称：{dimension_label}
-分析目标：{analysis_goal}
-比较标准：{comparison_criteria}
-必须回答：
-{must_answer}
-
-竞品：{competitor}
-分析主题：{plan.topic}
-证据：
-{_evidence_context(evidence, limit=12)}
-
-输出 JSON 数组，最多 3 条。
-```
-
-期望返回：
-
-```json
-[
-  {
-    "competitor_name": "Firecrawl",
-    "dimension_key": "structured_extraction_capabilities",
-    "dimension_label": "结构化抽取能力",
-    "claim_text": "Firecrawl 强调将网页转换为 LLM 友好的 Markdown 和结构化数据，适合 AI 应用的数据准备。",
-    "evidence_ids": [101, 104],
-    "confidence": 0.86,
-    "risk_level": "low"
-  },
-  {
-    "claim_text": "其价格策略通常围绕平台用量和执行资源展开，团队使用场景需要结合套餐限制评估。",
-    "evidence_ids": [109],
-    "confidence": 0.74,
-    "risk_level": "medium"
-  }
-]
-```
-
-系统取出的数据：
-
-```text
-content -> JSON array
-```
-
-每条数据取：
-
-```text
-claim_text
-evidence_ids
-confidence
-risk_level
-```
-
-写入：
-
-```text
-claim.claim_text
-claim.claim_type
-claim.competitor_name
-claim.confidence
-claim.risk_level
-claim_evidence.claim_id
-claim_evidence.evidence_chunk_id
-```
-
-约束：
-
-- `evidence_ids` 只允许引用本次传给 LLM 的 evidence。
-- 如果 LLM 没返回有效 `evidence_ids`，但本次 RAG 有 evidence，系统默认绑定第一条 evidence。
-- 每个竞品每个动态维度 Analyst 最多取 3 条 Claim。
-
-容错策略：
-
-- 如果 DeepSeek 第一次返回空内容、解释性文字或非 JSON，后端会自动发起一次 JSON 修正请求。
-- 如果修正后仍不能解析、DeepSeek 返回 402/余额不足、请求超时、返回非数组 JSON、或在已有 evidence 的情况下返回空 Claim，该动态维度 Analyst 会失败，整个 workflow 会停在分析阶段，不会继续生成空报告。
-- 只有一种情况允许跳过：该动态维度 Analyst 对所有竞品都没有检索到任何可用 evidence。此时节点会记录 warning 和 `output_summary`，表示该维度因 evidence 缺失被跳过。
-- 如果所有动态维度 Analyst 都没有生成 Claim，workflow 会在 ReportWriter 之前失败，避免生成空报告。
-- QA 只处理已经进入报告阶段的结果；分析阶段真实失败不会被 QA 吞掉。
-
-### 4. ReportWriter Agent
-
 触发时机：
 
 ```text
-动态维度 Analyst 全部完成，且至少生成了 1 条 Claim 后
+正式分析任务开始后，planner 节点确认 TaskPlan 之后
 ```
 
-代码位置：
+输入示例：
 
-```text
-backend/app/graph/workflow.py
+```json
+{
+  "topic": "Firecrawl 在 AI 数据采集领域的竞品分析",
+  "industry": "AI 数据采集",
+  "target_product": "Firecrawl",
+  "competitors": ["Apify", "Bright Data", "Diffbot"],
+  "fields": [
+    {
+      "key": "web_crawling_capability",
+      "label": "网页抓取能力",
+      "value_type": "text"
+    },
+    {
+      "key": "structured_extraction_capability",
+      "label": "结构化抽取能力",
+      "value_type": "text"
+    }
+  ]
+}
 ```
 
 System prompt：
@@ -626,7 +722,340 @@ System prompt：
 User prompt 模板：
 
 ```text
-请基于以下结构化 Claim 生成中文竞品分析报告 JSON。
+你是 Dimension Prompt Planner Agent。请为每一个分析维度生成专属 prompt spec，供后续独立维度分析 Agent 使用。
+
+任务主题：{plan.topic}
+行业：{plan.industry}
+目标产品：{plan.target_product}
+竞品：{', '.join(plan.competitors)}
+动态维度字段：
+{json.dumps(fields, ensure_ascii=False)}
+
+要求：
+1. 必须为每个字段输出一条 spec，不能新增或删除维度。
+2. dimension_key 必须等于字段 key，dimension_label 必须等于字段 label。
+3. analysis_goal、must_answer、evidence_focus、comparison_criteria 必须适配该维度和行业。
+4. 不要输出完整报告，不要执行分析。
+5. 只输出合法 JSON 数组。
+
+格式：
+[
+  {"dimension_key":"...","dimension_label":"...","analysis_goal":"...","evidence_focus":["official docs"],"must_answer":["..."],"comparison_criteria":["..."]}
+]
+```
+
+DeepSeek `content` 期望示例：
+
+```json
+[
+  {
+    "dimension_key": "web_crawling_capability",
+    "dimension_label": "网页抓取能力",
+    "analysis_goal": "比较各竞品在网页抓取、爬取深度、动态页面处理和抓取稳定性上的能力。",
+    "evidence_focus": ["official_website", "docs", "blog"],
+    "must_answer": ["是否支持动态页面抓取", "是否提供 API/SDK", "是否说明并发、限流或失败重试能力"],
+    "comparison_criteria": ["抓取范围", "动态页面支持", "开发者集成", "稳定性"]
+  },
+  {
+    "dimension_key": "structured_extraction_capability",
+    "dimension_label": "结构化抽取能力",
+    "analysis_goal": "比较各竞品将网页内容转化为结构化数据、Markdown 或 LLM 可用数据的能力。",
+    "evidence_focus": ["docs", "official_website"],
+    "must_answer": ["支持哪些输出格式", "是否支持 schema 或字段级抽取", "是否有官方示例"],
+    "comparison_criteria": ["输出格式", "schema 支持", "抽取准确性", "LLM 适配"]
+  }
+]
+```
+
+系统取值：
+
+```text
+content -> JSON array
+```
+
+如果返回对象，则取：
+
+```text
+dimensions
+```
+
+每条 spec 使用字段：
+
+```text
+dimension_key
+dimension_label
+analysis_goal
+evidence_focus
+must_answer
+comparison_criteria
+```
+
+容错规则：
+
+- 系统会先为每个维度生成本地 fallback spec。
+- 如果 DeepSeek 返回合法 spec，则用 DeepSeek spec 覆盖对应维度的 fallback spec。
+- 如果 DeepSeek 调用失败或返回不合法，系统使用 fallback spec，不会阻塞整个任务。
+
+### 5. Dynamic Dimension Analyst Agent：每个分析维度一个动态 Agent
+
+代码位置：
+
+```text
+backend/app/graph/workflow.py
+```
+
+触发时机：
+
+```text
+资料采集完成
+-> 证据抽取完成
+-> Dimension Prompt Planner 已经生成 prompt spec
+-> 并行执行 N 个 dimension_analysis_* Agent
+```
+
+执行模型：
+
+```text
+TaskPlan.analysis_dimensions
+  -> Dimension Prompt Planner Agent
+  -> N 个 prompt spec
+  -> N 个 Dynamic Dimension Analyst Agent
+  -> 每个 Agent 只分析一个维度
+  -> 每个 Agent 内部会遍历所有竞品
+```
+
+输入示例：
+
+```json
+{
+  "dimension_prompt_spec": {
+    "dimension_key": "structured_extraction_capability",
+    "dimension_label": "结构化抽取能力",
+    "analysis_goal": "比较各竞品将网页内容转化为结构化数据、Markdown 或 LLM 可用数据的能力。",
+    "must_answer": ["支持哪些输出格式", "是否支持 schema 或字段级抽取", "是否有官方示例"],
+    "comparison_criteria": ["输出格式", "schema 支持", "抽取准确性", "LLM 适配"]
+  },
+  "competitor": "Apify",
+  "topic": "Firecrawl 在 AI 数据采集领域的竞品分析",
+  "evidence": [
+    {
+      "evidence_id": 101,
+      "competitor": "Apify",
+      "source_type": "docs",
+      "title": "Apify Documentation",
+      "url": "https://docs.apify.com/",
+      "text": "Apify Actors can crawl websites and extract structured data..."
+    }
+  ]
+}
+```
+
+System prompt：
+
+```text
+你只输出合法 JSON，不编造证据。
+```
+
+User prompt 模板：
+
+```text
+你是一个动态维度竞品分析 Agent。你只负责一个分析维度，不要分析其它维度。
+当前维度 key：{dimension_key}
+当前维度名称：{dimension_label}
+分析目标：{analysis_goal}
+比较标准：{criteria}
+必须回答：
+{must_answer}
+
+竞品：{competitor}
+分析主题：{plan.topic}
+证据：
+{_evidence_context(evidence, limit=12)}
+
+输出 JSON 数组，最多 3 条。每条格式：
+{"competitor_name":"{competitor}","dimension_key":"{dimension_key}","dimension_label":"{dimension_label}","claim_text":"中文结论，必须具体且可被证据支撑","evidence_ids":[数字ID],"confidence":0.0到1.0,"risk_level":"low|medium|high"}
+不要输出 JSON 之外的内容。
+```
+
+其中 evidence context 形如：
+
+```text
+[evidence_id=101] competitor=Apify; source_type=docs; title=Apify Documentation; url=https://docs.apify.com/; text=Apify Actors can crawl websites and extract structured data...
+[evidence_id=102] competitor=Apify; source_type=official_website; title=Apify Web Scraping; url=https://apify.com/web-scraping; text=...
+```
+
+DeepSeek `content` 期望示例：
+
+```json
+[
+  {
+    "competitor_name": "Apify",
+    "dimension_key": "structured_extraction_capability",
+    "dimension_label": "结构化抽取能力",
+    "claim_text": "Apify 通过 Actors 和数据集机制支持从网页抓取流程中产出结构化数据，适合需要自定义抓取逻辑的开发者场景。",
+    "evidence_ids": [101, 102],
+    "confidence": 0.86,
+    "risk_level": "low"
+  },
+  {
+    "competitor_name": "Apify",
+    "dimension_key": "structured_extraction_capability",
+    "dimension_label": "结构化抽取能力",
+    "claim_text": "Apify 的结构化抽取能力更偏工作流和 Actor 编排，是否开箱即用地输出 LLM 友好 Markdown 需要结合具体 Actor 或模板判断。",
+    "evidence_ids": [101],
+    "confidence": 0.72,
+    "risk_level": "medium"
+  }
+]
+```
+
+也兼容对象格式：
+
+```json
+{
+  "claims": [
+    {
+      "claim_text": "Apify 支持通过 Actors 抓取网页并输出结构化数据。",
+      "evidence_ids": [101],
+      "confidence": 0.8,
+      "risk_level": "low"
+    }
+  ]
+}
+```
+
+系统取值：
+
+```text
+content -> JSON array
+```
+
+如果返回对象，则取：
+
+```text
+claims
+```
+
+每条 Claim 使用字段：
+
+```text
+competitor_name
+claim_text
+evidence_ids
+confidence
+risk_level
+```
+
+写入 MySQL：
+
+```text
+claim.task_id
+claim.agent_node_id
+claim.competitor_name
+claim.claim_type = "dimension"
+claim.dimension_key
+claim.dimension_label
+claim.dimension_prompt_json
+claim.claim_text
+claim.confidence
+claim.risk_level
+claim_evidence.claim_id
+claim_evidence.evidence_chunk_id
+```
+
+系统会强制使用当前 Agent 的维度：
+
+```text
+dimension_key = 当前 prompt spec 的 dimension_key
+dimension_label = 当前 prompt spec 的 dimension_label
+```
+
+即使模型返回了错误维度，写库时也以当前 Agent 上下文为准。
+
+证据绑定规则：
+
+```text
+1. evidence_ids 只能引用本次传给 DeepSeek 的 evidence_id。
+2. 如果模型返回了不存在的 evidence_id，会被过滤。
+3. 如果模型没有返回有效 evidence_ids，但本次 RAG 有 evidence，系统默认绑定第一条 evidence。
+4. 每条 Claim 最多绑定 4 条 evidence。
+5. 每个竞品在每个维度下最多保留 3 条 Claim。
+```
+
+失败与跳过规则：
+
+- 如果某个竞品没有检索到任何 evidence，该竞品会被跳过并记录 warning。
+- 只有当某个维度对所有竞品都没有 evidence 时，该维度 Agent 才允许跳过。
+- 如果已有 evidence，但 DeepSeek 返回非 JSON、非数组、空数组、空 `claim_text`、请求失败、余额不足或超时，该维度 Agent 会失败。
+- 只要有一个维度 Agent 因真实异常失败，整个 workflow 会停在分析阶段，不会继续生成空报告。
+- 如果所有动态维度 Agent 都没有生成 Claim，ReportWriter 之前会失败。
+
+### 6. ReportWriter Agent：生成报告 JSON
+
+代码位置：
+
+```text
+backend/app/graph/workflow.py
+```
+
+触发时机：
+
+```text
+所有动态维度 Analyst 完成
+且至少生成 1 条 Claim
+```
+
+输入示例：
+
+```json
+{
+  "topic": "Firecrawl 在 AI 数据采集领域的竞品分析",
+  "industry": "AI 数据采集",
+  "competitors": ["Apify", "Bright Data", "Diffbot"],
+  "analysis_dimensions": ["网页抓取能力", "结构化抽取能力", "开发者生态"],
+  "competitor_profiles": [
+    {
+      "competitor_name": "Apify",
+      "dynamic_profile_json": {
+        "structured_extraction_capability": "通过 Actors 和数据集产出结构化数据"
+      }
+    }
+  ],
+  "comparison_matrices": [
+    {
+      "dimension_key": "structured_extraction_capability",
+      "matrix_json": {
+        "rows": [
+          {
+            "competitor_name": "Apify",
+            "value": "支持自定义抓取和结构化输出"
+          }
+        ]
+      }
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": 1,
+      "competitor": "Apify",
+      "dimension": "结构化抽取能力",
+      "evidence_ids": [101, 102],
+      "text": "Apify 通过 Actors 和数据集机制支持结构化数据产出。"
+    }
+  ]
+}
+```
+
+System prompt：
+
+```text
+你只输出合法 JSON。
+```
+
+User prompt 模板：
+
+```text
+请基于动态竞品画像、对比矩阵和结构化 Claim 生成中文竞品分析报告 JSON。
 主题：{plan.topic}
 行业：{plan.industry}
 竞品：{', '.join(plan.competitors)}
@@ -640,22 +1069,29 @@ User prompt 模板：
 4. claim_ids 只能引用下方已有 claim_id，不要编造。
 5. 不要输出 evidence_ids，后端会自动补齐。
 6. 必须覆盖所有分析维度。
+7. 优先基于 CompetitorProfiles 和 ComparisonMatrices 组织内容，但关键段落仍要引用 claim_ids。
 
 JSON 格式：
 {"title":"...","sections":[{"section_id":"executive_summary","title":"执行摘要","paragraphs":[{"paragraph_id":"executive_summary_p1","text":"...","claim_ids":[1,2]}]}]}
+
+CompetitorProfiles:
+{profile_context}
+
+ComparisonMatrices:
+{matrix_context}
 
 Claims:
 {claim_context}
 ```
 
-`claim_context` 形如：
+`claim_context` 示例：
 
 ```text
-[claim_id=1] competitor=Apify; type=feature; evidence_ids=[101, 102]; text=...
-[claim_id=2] competitor=Bright Data; type=pricing; evidence_ids=[120]; text=...
+[claim_id=1] competitor=Apify; dimension=结构化抽取能力; evidence_ids=[101, 102]; text=Apify 通过 Actors 和数据集机制支持结构化数据产出。
+[claim_id=2] competitor=Bright Data; dimension=网页抓取能力; evidence_ids=[120]; text=Bright Data 提供面向企业的数据采集基础设施和代理网络。
 ```
 
-期望返回：
+DeepSeek `content` 期望示例：
 
 ```json
 {
@@ -667,8 +1103,19 @@ Claims:
       "paragraphs": [
         {
           "paragraph_id": "executive_summary_p1",
-          "text": "Firecrawl 的主要竞品覆盖通用网页采集、企业数据平台和开发者自动化工具三类。",
-          "claim_ids": [1, 3, 7]
+          "text": "Firecrawl 的主要竞品覆盖开发者抓取平台、企业级数据采集基础设施和网页结构化抽取服务三类。",
+          "claim_ids": [1, 2]
+        }
+      ]
+    },
+    {
+      "section_id": "structured_extraction_capability",
+      "title": "结构化抽取能力",
+      "paragraphs": [
+        {
+          "paragraph_id": "structured_extraction_capability_p1",
+          "text": "Apify 更强调通过 Actors 构建抓取流程并输出结构化数据，适合需要高度自定义的场景。",
+          "claim_ids": [1]
         }
       ]
     }
@@ -676,13 +1123,13 @@ Claims:
 }
 ```
 
-系统取出的数据：
+系统取值：
 
 ```text
 content -> JSON object
 ```
 
-重点字段：
+使用字段：
 
 ```text
 title
@@ -695,14 +1142,14 @@ paragraphs[].text
 paragraphs[].claim_ids
 ```
 
-后端会自动补充：
+后端自动补充：
 
 ```text
 paragraphs[].evidence_ids
 report_json.mode = "firecrawl_llm_milvus_rag"
 ```
 
-然后生成并保存：
+写入 MySQL：
 
 ```text
 report.title
@@ -711,15 +1158,12 @@ report.content_markdown
 report.content_html
 ```
 
-如果 DeepSeek 返回 JSON 不合法或缺少 `sections`，后端会使用 `_fallback_report_json()` 基于 Claim 生成基础报告。
+容错规则：
 
-### 5. QA Agent
+- 如果没有任何 Claim，ReportWriter 不会调用 DeepSeek，会直接失败，避免生成空报告。
+- 如果有 Claim，但 DeepSeek 报告 JSON 不合法或缺少 `sections`，后端会使用 `_fallback_report_json()` 基于 Claim 生成基础报告。
 
-触发时机：
-
-```text
-ReportWriter 完成后
-```
+### 7. QA Agent：报告复核
 
 代码位置：
 
@@ -727,7 +1171,35 @@ ReportWriter 完成后
 backend/app/graph/workflow.py
 ```
 
-QA 先做本地规则检查，再把报告和规则问题交给 DeepSeek 复核。
+触发时机：
+
+```text
+ReportWriter 完成后
+```
+
+QA 分两步：
+
+```text
+1. 后端先做本地规则检查，例如是否有报告、是否有 Claim、段落是否绑定 claim_ids 等。
+2. 再把报告 Markdown 和本地规则问题交给 DeepSeek 复核。
+```
+
+输入示例：
+
+```json
+{
+  "report_markdown": "# Firecrawl 在 AI 数据采集领域的竞品分析报告\n\n## 执行摘要\n...",
+  "local_rule_issues": [
+    {
+      "type": "weak_evidence",
+      "severity": "medium",
+      "message": "部分段落引用的 Claim 数量较少",
+      "related_claim_id": null,
+      "suggested_action": "rewrite"
+    }
+  ]
+}
+```
 
 System prompt：
 
@@ -740,7 +1212,7 @@ User prompt 模板：
 ```text
 请复核这份竞品分析报告是否存在明显逻辑或证据问题。
 仅基于报告和问题列表输出 JSON：
-{"passed":true/false,"score":0.0到1.0,"issues":[{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"feature|pricing|market|security","suggested_action":"recollect|reanalyze|rewrite|ignore"}]}
+{"passed":true/false,"score":0.0到1.0,"issues":[{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null}]}
 
 报告：
 {report.content_markdown[:6000]}
@@ -749,7 +1221,7 @@ User prompt 模板：
 {json.dumps(issues, ensure_ascii=False)}
 ```
 
-期望返回：
+DeepSeek `content` 期望示例：
 
 ```json
 {
@@ -759,22 +1231,23 @@ User prompt 模板：
     {
       "type": "weak_evidence",
       "severity": "medium",
-      "message": "价格结论缺少官方价格页证据，建议补采价格页后重跑价格分析。",
+      "message": "价格策略部分缺少官方价格页证据，建议补采价格页后重跑相关维度分析。",
       "related_claim_id": 12,
-      "related_dimension": "pricing",
-      "suggested_action": "recollect"
+      "related_dimension": "价格策略",
+      "suggested_action": "recollect",
+      "target_node": "collector"
     }
   ]
 }
 ```
 
-系统取出的数据：
+系统取值：
 
 ```text
 content -> JSON object
 ```
 
-重点字段：
+使用字段：
 
 ```text
 passed
@@ -782,7 +1255,7 @@ score
 issues
 ```
 
-随后系统会把本地规则问题和 LLM 返回问题合并，生成：
+写入 MySQL：
 
 ```text
 qa_result.passed
@@ -799,20 +1272,29 @@ qa_result.issues_json
   "issues": [],
   "next_action": "recollect",
   "target_nodes": ["collector"],
-  "revision_reason": "...",
-  "followup_queries": ["Example pricing plans official"],
+  "revision_reason": "价格策略证据较弱，需要补采官方价格页。",
+  "followup_queries": ["Apify pricing official", "Bright Data pricing official"],
   "revision_round": 0
 }
 ```
 
-### 不调用 DeepSeek 的 Agent 或步骤
+容错规则：
+
+- 如果 QA LLM 调用失败，后端会使用本地规则检查结果兜底。
+- QA 只处理已经进入报告阶段的结果。
+- 如果动态维度 Analyst 阶段因为 DeepSeek 失败、余额不足、超时或 JSON 不合法而失败，workflow 会停在分析阶段，不会交给 QA 吞掉。
+
+### 不调用 DeepSeek Chat API 的 Agent 或步骤
 
 以下步骤不向 DeepSeek Chat API 发送请求：
 
-- 正式执行中的 `planner` 节点：只确认前端已编辑 TaskPlan。
-- `collector` 的 Firecrawl search/scrape：调用 Firecrawl，不调用 DeepSeek；只有自动发现竞品时会调用 DeepSeek。
-- `evidence_extractor`：调用 DashScope embedding 和 Milvus，不调用 DeepSeek Chat。
-- `EvidenceRetriever.search()`：调用 DashScope embedding 生成 query vector，再查 Milvus，不调用 DeepSeek Chat。
+- 正式执行中的 `planner` 节点：只确认前端最终编辑的 TaskPlan，不再二次解析。
+- `collector` 的普通资料采集：调用 Firecrawl search/scrape，不调用 DeepSeek；只有自动发现竞品时才调用 DeepSeek。
+- `collector_worker_*`：并行执行 Firecrawl 采集，不调用 DeepSeek。
+- `evidence_extractor`：做文本切块、批量 embedding、批量写 Milvus，不调用 DeepSeek Chat。
+- `evidence_worker_*`：并行处理证据抽取，不调用 DeepSeek Chat。
+- `EvidenceRetriever.search()`：调用 DashScope embedding 生成 query vector，然后查 Milvus，不调用 DeepSeek Chat。
+- 报告导出：从 MySQL 读取报告、矩阵、QA、Claim 和证据链，生成 Markdown 或 PDF，不调用 DeepSeek。
 
 DashScope embedding 请求地址来自：
 
@@ -826,6 +1308,14 @@ EMBEDDING_MODEL=text-embedding-v4
 ```http
 POST https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
 ```
+
+embedding 返回只取：
+
+```text
+response.data[].embedding
+```
+
+这些向量用于写入 Milvus 或做 RAG 检索，不会进入 DeepSeek 的 `reasoning_content`。
 
 ## 项目结构
 

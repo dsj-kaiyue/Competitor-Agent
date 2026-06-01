@@ -242,6 +242,7 @@ def _dimension_analysis_query(competitor: str, prompt_spec: dict, topic: str) ->
 def _fallback_dimension_prompt_spec(task_plan: dict, field: dict) -> dict:
     label = str(field.get("label") or field.get("key") or "").strip()
     key = str(field.get("key") or label).strip()
+    topic = str(task_plan.get("industry") or task_plan.get("topic") or "").strip()
     return {
         "dimension_key": key,
         "dimension_label": label,
@@ -253,10 +254,48 @@ def _fallback_dimension_prompt_spec(task_plan: dict, field: dict) -> dict:
             "是否存在缺失、限制或不确定信息",
         ],
         "comparison_criteria": [label, "证据强度", "差异化", "风险或限制"],
+        "search_query_template": f"{{competitor}} {topic} {label} official docs".strip(),
         "output_schema": "claims[] with competitor_name, dimension_key, dimension_label, claim_text, evidence_ids, confidence, risk_level",
         "industry": task_plan.get("industry"),
         "topic": task_plan.get("topic"),
     }
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(str(value).strip())
+    return result
+
+
+def _format_dimension_search_query(plan, competitor: str, prompt_spec: dict) -> str:
+    dimension_label = str(prompt_spec.get("dimension_label") or prompt_spec.get("label") or "").strip()
+    template = str(prompt_spec.get("search_query_template") or "").strip()
+    if not template:
+        template = "{competitor} {industry_or_topic} {dimension_label} official docs"
+    template = template.replace("{{competitor}}", "{competitor}")
+    values = {
+        "competitor": competitor,
+        "industry": plan.industry or "",
+        "topic": plan.topic or "",
+        "industry_or_topic": plan.industry or plan.topic or "",
+        "target_product": plan.target_product or "",
+        "dimension_key": prompt_spec.get("dimension_key") or "",
+        "dimension_label": dimension_label,
+    }
+    try:
+        query = template.format(**values)
+    except Exception:
+        query = f"{competitor} {plan.industry or plan.topic} {dimension_label} official docs"
+    query = re.sub(r"\s+", " ", query).strip()
+    if competitor.casefold() not in query.casefold():
+        query = f"{competitor} {query}".strip()
+    return query
 
 
 def _target_nodes_from_issue(issue: dict) -> list[str]:
@@ -623,13 +662,18 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
 要求：
 1. 必须为每个字段输出一条 spec，不能新增或删除维度。
 2. dimension_key 必须等于字段 key，dimension_label 必须等于字段 label。
-3. analysis_goal、must_answer、evidence_focus、comparison_criteria 必须适配该维度和行业。
-4. 不要输出完整报告，不要执行分析。
-5. 只输出合法 JSON 数组。
+3. analysis_goal、must_answer、evidence_focus、comparison_criteria、search_query_template 必须适配该维度和行业。
+4. search_query_template 用于 Firecrawl 搜索证据，必须包含 {{competitor}} 占位符，并且只为当前维度生成 1 条主 query。
+5. 如果竞品或行业是全球技术产品、SaaS、API、开发者工具、云服务、数据库、AI 工具，search_query_template 使用英文。
+6. 如果目标市场是中国本土，或用户输入明显是中文消费场景、本土品牌、中文媒体语境，search_query_template 使用中文。
+7. search_query_template 不要太长，控制在 6 到 12 个关键词。
+8. 不要输出固定功能、价格、安全三类通用 query，必须围绕当前维度。
+9. 不要输出完整报告，不要执行分析。
+10. 只输出合法 JSON 数组。
 
 格式：
 [
-  {{"dimension_key":"...","dimension_label":"...","analysis_goal":"...","evidence_focus":["official docs"],"must_answer":["..."],"comparison_criteria":["..."]}}
+  {{"dimension_key":"...","dimension_label":"...","analysis_goal":"...","evidence_focus":["official docs"],"must_answer":["..."],"comparison_criteria":["..."],"search_query_template":"{{competitor}} ... official docs"}}
 ]
 """
         specs_by_key = dict(fallback_specs)
@@ -709,30 +753,76 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
             _console("competitor discovery completed", {"task_id": task_id, "competitors": plan.competitors})
 
         saved_ids: list[int] = []
-        seen_urls: set[str] = set()
+        existing_urls = {
+            str(url)
+            for url in db.scalars(select(SourceDocument.source_url).where(SourceDocument.task_id == task_id))
+            if url
+        }
+        seen_urls: set[str] = set(existing_urls)
+        collector_mode = str(state.get("collector_mode") or "normal")
+        dimension_specs = state.get("dimension_prompt_specs") or {}
+        max_results_per_query = max(1, int(settings.firecrawl_search_results_per_query))
+        max_urls_per_competitor = int(settings.firecrawl_max_urls_per_competitor)
         for competitor in plan.competitors:
             _check_task_control(db, task_id, node)
-            _console("collector competitor started", {"task_id": task_id, "competitor": competitor})
-            queries = [
-                f"{competitor} {plan.industry or plan.topic} official product features",
-                f"{competitor} pricing plans official",
-                f"{competitor} docs enterprise security compliance privacy official",
-            ]
-            queries.extend(query for query in state.get("qa_followup_queries", []) if competitor.lower() in query.lower())
+            _console("collector competitor started", {"task_id": task_id, "competitor": competitor, "mode": collector_mode})
+            if collector_mode == "recollect":
+                queries = [
+                    str(query).strip()
+                    for query in state.get("qa_followup_queries", [])
+                    if str(query).strip() and competitor.casefold() in str(query).casefold()
+                ]
+            else:
+                queries = [
+                    _format_dimension_search_query(plan, competitor, prompt_spec)
+                    for prompt_spec in dimension_specs.values()
+                    if isinstance(prompt_spec, dict)
+                ]
+            queries = _dedupe_preserve_order(queries)
+            if not queries:
+                add_log(
+                    db,
+                    task_id,
+                    node.id,
+                    "Collector skipped competitor because no search queries were available",
+                    {"competitor": competitor, "mode": collector_mode},
+                    log_type="warning",
+                )
+                db.commit()
+                continue
             max_workers = max(1, min(settings.collector_max_workers, len(queries)))
-            _console("parallel firecrawl search started", {"task_id": task_id, "competitor": competitor, "query_count": len(queries), "max_workers": max_workers})
+            _console(
+                "parallel firecrawl search started",
+                {
+                    "task_id": task_id,
+                    "competitor": competitor,
+                    "mode": collector_mode,
+                    "query_count": len(queries),
+                    "max_workers": max_workers,
+                    "max_results_per_query": max_results_per_query,
+                    "max_urls_per_competitor": max_urls_per_competitor,
+                },
+            )
             add_log(
                 db,
                 task_id,
                 node.id,
                 "Parallel Firecrawl search started",
-                {"competitor": competitor, "query_count": len(queries), "max_workers": max_workers},
+                {
+                    "competitor": competitor,
+                    "mode": collector_mode,
+                    "queries": queries,
+                    "query_count": len(queries),
+                    "max_workers": max_workers,
+                    "max_results_per_query": max_results_per_query,
+                    "max_urls_per_competitor": max_urls_per_competitor,
+                },
             )
             db.commit()
 
             search_payloads: list[dict] = []
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"collector-search-{task_id}") as executor:
-                futures = {executor.submit(_search_firecrawl_query, query, 3): query for query in queries}
+                futures = {executor.submit(_search_firecrawl_query, query, max_results_per_query): query for query in queries}
                 for future in as_completed(futures):
                     _check_task_control(db, task_id, node)
                     query = futures[future]
@@ -751,17 +841,34 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
                             continue
                         seen_urls.add(url)
                         search_payloads.append({"query": returned_query, "item": item, "url": url, "competitor": competitor})
-                        if len(search_payloads) >= 5:
+                        if max_urls_per_competitor > 0 and len(search_payloads) >= max_urls_per_competitor:
                             break
-                    if len(search_payloads) >= 5:
+                    if max_urls_per_competitor > 0 and len(search_payloads) >= max_urls_per_competitor:
                         break
                     db.commit()
             db.commit()
 
+            if not search_payloads:
+                add_log(
+                    db,
+                    task_id,
+                    node.id,
+                    "Collector found no new URLs for competitor",
+                    {"competitor": competitor, "mode": collector_mode},
+                    log_type="warning",
+                )
+                db.commit()
+                continue
             scrape_workers = max(1, min(settings.collector_max_workers, len(search_payloads)))
             _console(
                 "parallel firecrawl scrape started",
-                {"task_id": task_id, "competitor": competitor, "url_count": len(search_payloads), "max_workers": scrape_workers},
+                {
+                    "task_id": task_id,
+                    "competitor": competitor,
+                    "mode": collector_mode,
+                    "url_count": len(search_payloads),
+                    "max_workers": scrape_workers,
+                },
             )
             with ThreadPoolExecutor(max_workers=scrape_workers, thread_name_prefix=f"collector-scrape-{task_id}") as executor:
                 futures = {executor.submit(_scrape_firecrawl_url, payload): payload for payload in search_payloads}
@@ -798,17 +905,32 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
                     db.add(doc)
                     db.flush()
                     saved_ids.append(doc.id)
+                    existing_urls.add(url)
                     _console("firecrawl scrape saved", {"task_id": task_id, "source_document_id": doc.id, "url": url})
                     add_log(db, task_id, node.id, "Firecrawl scrape saved", {"url": url, "source_document_id": doc.id})
                     db.commit()
         if not saved_ids:
             raise RuntimeError("Firecrawl did not return any usable source documents")
-        node.output_summary = f"真实采集并保存 {len(saved_ids)} 份 source_document"
+        node.output_summary = f"{collector_mode} 模式真实采集并保存 {len(saved_ids)} 份新增 source_document"
         state["source_document_ids"] = saved_ids
 
     def evidence_extractor(node: AgentNode) -> None:
         stage_started = perf_counter()
-        docs = list(db.scalars(select(SourceDocument).where(SourceDocument.task_id == task_id).order_by(SourceDocument.id)))
+        source_document_ids = [int(doc_id) for doc_id in state.get("source_document_ids", []) if str(doc_id).isdigit()]
+        if source_document_ids:
+            docs = list(
+                db.scalars(
+                    select(SourceDocument)
+                    .where(SourceDocument.task_id == task_id, SourceDocument.id.in_(source_document_ids))
+                    .order_by(SourceDocument.id)
+                )
+            )
+        else:
+            docs = list(db.scalars(select(SourceDocument).where(SourceDocument.task_id == task_id).order_by(SourceDocument.id)))
+        _console(
+            "evidence extractor document scope selected",
+            {"task_id": task_id, "document_count": len(docs), "incremental": bool(source_document_ids)},
+        )
         ids: list[int] = []
         pending_specs: list[dict] = []
         chunk_objects: list[EvidenceChunk] = []
@@ -1270,7 +1392,9 @@ Claims:
         qa_prompt = f"""
 请复核这份竞品分析报告是否存在明显逻辑或证据问题。
 仅基于报告和问题列表输出 JSON：
-{{"passed":true/false,"score":0.0到1.0,"issues":[{{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null}}]}}
+{{"passed":true/false,"score":0.0到1.0,"issues":[{{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null,"search_query":null}}]}}
+
+如果 suggested_action 是 recollect，必须提供一条具体 search_query，且 search_query 必须包含相关竞品名称。
 
 报告：
 {(report.content_markdown if report else '')[:6000]}
@@ -1359,8 +1483,10 @@ Claims:
             {"task_id": task_id, "next_action": action, "target_nodes": target_nodes, "revision_round": state["revision_round"]},
         )
         if action == "recollect":
+            state["collector_mode"] = "recollect"
             _run_node(db, task_id, "collector", "collecting", collector, force=True)
             _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor, force=True)
+            state["collector_mode"] = "normal"
             targets = [node_key for node_key in target_nodes if node_key.startswith("dimension_analysis_")]
             run_parallel_dimension_analysts(targets or None, force=True)
             build_dynamic_knowledge()

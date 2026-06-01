@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     embedding_api_key: str | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
+    firecrawl_search_results_per_query: int = 3
+    firecrawl_max_urls_per_competitor: int = 20
     collector_max_workers: int = 4
     evidence_extractor_max_workers: int = 4
     evidence_embedding_batch_size: int = 8

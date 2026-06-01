@@ -734,13 +734,18 @@ User prompt 模板：
 要求：
 1. 必须为每个字段输出一条 spec，不能新增或删除维度。
 2. dimension_key 必须等于字段 key，dimension_label 必须等于字段 label。
-3. analysis_goal、must_answer、evidence_focus、comparison_criteria 必须适配该维度和行业。
-4. 不要输出完整报告，不要执行分析。
-5. 只输出合法 JSON 数组。
+3. analysis_goal、must_answer、evidence_focus、comparison_criteria、search_query_template 必须适配该维度和行业。
+4. search_query_template 用于 Firecrawl 搜索证据，必须包含 {competitor} 占位符，并且只为当前维度生成 1 条主 query。
+5. 如果竞品或行业是全球技术产品、SaaS、API、开发者工具、云服务、数据库、AI 工具，search_query_template 使用英文。
+6. 如果目标市场是中国本土，或用户输入明显是中文消费场景、本土品牌、中文媒体语境，search_query_template 使用中文。
+7. search_query_template 不要太长，控制在 6 到 12 个关键词。
+8. 不要输出固定功能、价格、安全三类通用 query，必须围绕当前维度。
+9. 不要输出完整报告，不要执行分析。
+10. 只输出合法 JSON 数组。
 
 格式：
 [
-  {"dimension_key":"...","dimension_label":"...","analysis_goal":"...","evidence_focus":["official docs"],"must_answer":["..."],"comparison_criteria":["..."]}
+  {"dimension_key":"...","dimension_label":"...","analysis_goal":"...","evidence_focus":["official docs"],"must_answer":["..."],"comparison_criteria":["..."],"search_query_template":"{competitor} ... official docs"}
 ]
 ```
 
@@ -754,7 +759,8 @@ DeepSeek `content` 期望示例：
     "analysis_goal": "比较各竞品在网页抓取、爬取深度、动态页面处理和抓取稳定性上的能力。",
     "evidence_focus": ["official_website", "docs", "blog"],
     "must_answer": ["是否支持动态页面抓取", "是否提供 API/SDK", "是否说明并发、限流或失败重试能力"],
-    "comparison_criteria": ["抓取范围", "动态页面支持", "开发者集成", "稳定性"]
+    "comparison_criteria": ["抓取范围", "动态页面支持", "开发者集成", "稳定性"],
+    "search_query_template": "{competitor} web crawling dynamic pages API docs official"
   },
   {
     "dimension_key": "structured_extraction_capability",
@@ -762,7 +768,8 @@ DeepSeek `content` 期望示例：
     "analysis_goal": "比较各竞品将网页内容转化为结构化数据、Markdown 或 LLM 可用数据的能力。",
     "evidence_focus": ["docs", "official_website"],
     "must_answer": ["支持哪些输出格式", "是否支持 schema 或字段级抽取", "是否有官方示例"],
-    "comparison_criteria": ["输出格式", "schema 支持", "抽取准确性", "LLM 适配"]
+    "comparison_criteria": ["输出格式", "schema 支持", "抽取准确性", "LLM 适配"],
+    "search_query_template": "{competitor} structured extraction schema markdown API docs official"
   }
 ]
 ```
@@ -788,6 +795,7 @@ analysis_goal
 evidence_focus
 must_answer
 comparison_criteria
+search_query_template
 ```
 
 容错规则：
@@ -795,6 +803,7 @@ comparison_criteria
 - 系统会先为每个维度生成本地 fallback spec。
 - 如果 DeepSeek 返回合法 spec，则用 DeepSeek spec 覆盖对应维度的 fallback spec。
 - 如果 DeepSeek 调用失败或返回不合法，系统使用 fallback spec，不会阻塞整个任务。
+- 如果某个 spec 缺少 `search_query_template`，Collector 会使用 `{competitor} {industry/topic} {dimension_label} official docs` 作为 fallback query。
 
 ### 5. Dynamic Dimension Analyst Agent：每个分析维度一个动态 Agent
 
@@ -1212,7 +1221,9 @@ User prompt 模板：
 ```text
 请复核这份竞品分析报告是否存在明显逻辑或证据问题。
 仅基于报告和问题列表输出 JSON：
-{"passed":true/false,"score":0.0到1.0,"issues":[{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null}]}
+{"passed":true/false,"score":0.0到1.0,"issues":[{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null,"search_query":null}]}
+
+如果 suggested_action 是 recollect，必须提供一条具体 search_query，且 search_query 必须包含相关竞品名称。
 
 报告：
 {report.content_markdown[:6000]}
@@ -1235,7 +1246,8 @@ DeepSeek `content` 期望示例：
       "related_claim_id": 12,
       "related_dimension": "价格策略",
       "suggested_action": "recollect",
-      "target_node": "collector"
+      "target_node": "collector",
+      "search_query": "Apify pricing plans official"
     }
   ]
 }
@@ -1254,6 +1266,8 @@ passed
 score
 issues
 ```
+
+其中 `issues[].search_query` 会被收集为 `qa_followup_queries`，用于 QA 返工时的增量补采。
 
 写入 MySQL：
 
@@ -1475,25 +1489,34 @@ POST /api/v1/analysis-tasks
 
 ### 3. 资料采集
 
-Collector 对每个竞品生成 query：
+Collector 不再使用固定的功能、价格、安全三条 query。当前系统由 Dimension Prompt Planner 为每个分析维度生成 `search_query_template`，Collector 对每个竞品、每个分析维度生成 1 条 Firecrawl query：
 
 ```text
-{competitor} {industry/topic} official product features
-{competitor} pricing plans official
-{competitor} docs enterprise security compliance privacy official
+{competitor} web crawling dynamic pages API docs official
+{competitor} structured extraction schema markdown API docs official
+{competitor} developer ecosystem SDK API docs official
 ```
 
-若 QA 返工要求补采，还会追加 QA 生成的 follow-up query。
+如果 prompt spec 缺少 `search_query_template`，Collector 使用 fallback query：
+
+```text
+{competitor} {industry/topic} {dimension_label} official docs
+```
+
+QA 返工要求补采时，Collector 进入 `recollect` 模式，只执行 QA 生成的 follow-up query，不重复执行首次采集时的维度 query。
 
 分析阶段采用并行执行：
 
 1. 每个竞品内部并发执行多个 Firecrawl search。
-2. URL 去重。
-3. 每个竞品最多抓取 5 个 URL。
-4. 并发 scrape URL。
-5. 主线程统一写入 `source_document`。
+2. URL 会与当前任务已保存的 `source_document.source_url` 以及本轮 URL 一起去重。
+3. 每条 query 最多返回 `FIRECRAWL_SEARCH_RESULTS_PER_QUERY` 条结果。
+4. 每个竞品每轮最多抓取 `FIRECRAWL_MAX_URLS_PER_COMPETITOR` 个新 URL。
+5. 并发 scrape URL。
+6. 主线程统一写入 `source_document`。
 
 这样避免跨线程共享 SQLAlchemy Session。
+
+QA 增量补采后，`state["source_document_ids"]` 只保存本轮新增文档 ID，Evidence Extractor 会优先只处理这些新增文档，避免重复切块、重复 embedding 和重复写 Milvus。
 
 ### 4. 证据抽取与向量化
 
@@ -2196,6 +2219,8 @@ CELERY_BROKER_URL=redis://:password@host:6379/0
 CELERY_RESULT_BACKEND=redis://:password@host:6379/1
 
 FIRECRAWL_API_KEY=your_firecrawl_key
+FIRECRAWL_SEARCH_RESULTS_PER_QUERY=3
+FIRECRAWL_MAX_URLS_PER_COMPETITOR=20
 
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_API_KEY=your_deepseek_key
@@ -2229,6 +2254,8 @@ EVIDENCE_EMBEDDING_BATCH_SIZE=8
 并发配置建议：
 
 - `COLLECTOR_MAX_WORKERS=2~4`：Firecrawl 慢或限流时调小。
+- `FIRECRAWL_SEARCH_RESULTS_PER_QUERY=1~3`：每条动态维度 query 返回多少条搜索结果，默认 3。
+- `FIRECRAWL_MAX_URLS_PER_COMPETITOR=10~20`：每个竞品每轮最多 scrape 多少个新 URL，默认 20；设置为 0 表示不限制。
 - `EVIDENCE_EXTRACTOR_MAX_WORKERS=4~8`：embedding 服务稳定时可调大；并发过高会触发限流。
 - `EVIDENCE_EMBEDDING_BATCH_SIZE=1~10`：DashScope `text-embedding-v4` 单次请求最多 10 条 input，建议 8。
 - 并发越高，越可能触发 Firecrawl / embedding / Milvus 限流。
@@ -2402,6 +2429,82 @@ python -c "from app.core.config import settings; from pymilvus import MilvusClie
 9. 进入报告页展开段落依据，查看 Claim 和 Evidence。
 10. 进入历史记录页查看历史任务。
 
+## 不同场景输入示例
+
+下面这些示例都可以直接粘贴到首页需求输入框。系统会先解析 `TaskPlan`，再由你确认或编辑竞品、分析维度、输出语言和自动发现开关。
+
+### 1. AI 数据采集 / 开发者工具
+
+```text
+请分析 Firecrawl 在 AI 数据采集领域的竞品情况。目标是判断它和 Apify、Bright Data、Diffbot、Browse AI 相比，更适合哪些 AI 应用团队。重点关注网页抓取能力、结构化抽取能力、开发者生态、反爬与稳定性、价格策略、安全合规和企业适配能力。
+```
+
+预期特点：
+
+- Planner 会识别目标产品为 `Firecrawl`，行业为 `AI 数据采集`。
+- 如果开启自动发现竞品，系统会补充同类采集、爬虫、数据基础设施产品。
+- Collector 会按每个动态分析维度生成 query，而不是固定采功能、价格、安全三类资料。
+
+### 2. AI 搜索 / 研究助手
+
+```text
+请分析 Perplexity 在 AI 搜索和研究助手领域的竞品情况。竞品可以包含 ChatGPT Search、Google AI Overviews、You.com、Consensus。请重点关注搜索结果质量、引用可信度、实时性、多轮研究能力、企业可用性、价格策略和内容版权风险。
+```
+
+预期特点：
+
+- 适合验证系统是否能从“AI 数据采集”切换到“AI 搜索”场景。
+- 动态维度可能包括 `搜索结果质量`、`引用可信度`、`实时性`、`多轮研究能力`、`版权风险`。
+- QA 如果发现某个结论缺少来源，会追加 follow-up query，并只补采新增 query。
+
+### 3. SaaS CRM / 销售管理
+
+```text
+请分析 HubSpot CRM 在中小企业 CRM 市场的竞品情况。竞品包括 Salesforce、Zoho CRM、Pipedrive、Monday Sales CRM。请重点比较客户管理能力、销售自动化、营销自动化、生态集成、易用性、价格和适合的企业规模。
+```
+
+预期特点：
+
+- 适合验证传统 SaaS 产品，不依赖 AI 工具假设。
+- 分析维度会偏业务功能、销售流程、集成生态、组织规模和价格。
+- 报告里的动态对比矩阵会按这些业务维度聚合 Claim。
+
+### 4. 新能源汽车 / 消费硬件
+
+```text
+请分析小米 SU7 在 25 到 35 万元新能源轿车市场的竞品情况。竞品包括 Tesla Model 3、小鹏 P7、极氪 007、蔚来 ET5。请重点关注车型定位、续航能力、智能驾驶、座舱体验、补能体系、价格权益、品牌认知和交付能力。
+```
+
+预期特点：
+
+- 适合验证非软件产品场景。
+- Firecrawl query 会围绕 `车型定位`、`续航能力`、`智能驾驶`、`交付能力` 等维度生成。
+- 证据来源可能更多来自官网、新闻、评测和用户评论。
+
+### 5. 云数据库 / 基础设施
+
+```text
+请分析 Neon 在 Serverless PostgreSQL 数据库领域的竞品情况。竞品包括 Supabase、PlanetScale、Railway、Amazon Aurora Serverless。重点关注 serverless 架构、冷启动和延迟、分支能力、备份恢复、开发者体验、价格模型、企业安全和迁移成本。
+```
+
+预期特点：
+
+- 适合验证技术基础设施类产品。
+- 动态维度会更偏架构、性能、开发者体验、安全和迁移成本。
+- Analyst 会基于 Milvus 检索到的 docs、pricing page、blog 等 evidence 生成 Claim。
+
+### 6. 跨境电商工具 / 运营软件
+
+```text
+请分析 Shopify Magic 在跨境电商 AI 运营工具领域的竞品情况。竞品包括 Wix AI、BigCommerce AI、Klaviyo AI、Jasper。请重点关注商品文案生成、营销自动化、多语言能力、店铺运营流程、生态插件、价格策略和适用商家类型。
+```
+
+预期特点：
+
+- 适合验证“产品能力 + 运营流程 + 商业化”混合型分析。
+- 如果用户没有手动输入完整竞品，自动发现竞品可以补充相邻产品。
+- 输出报告会把 Claim、动态矩阵、QA 结果和证据链一起用于导出。
+
 ## 已验证
 
 代码层面已做过：
@@ -2425,7 +2528,7 @@ npm run build
 - 任务恢复和幂等能力仍偏 MVP，生产环境还需要加强。
 - Firecrawl、DeepSeek、DashScope、Milvus 任一外部服务不稳定都会影响任务耗时。
 - ReportWriter 的结构化 JSON 依赖 LLM 输出质量，已有 fallback，但报告质量仍可进一步增强。
-- Milvus RAG 检索已接入，但 query 策略还比较固定，可继续优化。
+- 资料采集 query 已跟随动态分析维度生成；Milvus RAG 检索的召回策略仍可继续增强。
 
 ## 下一步可讨论方向
 
@@ -2437,7 +2540,7 @@ npm run build
 4. 增加每个 worker 的真实进度，而不是只跟随父节点状态。
 5. 增加 Firecrawl / LLM / Embedding / Milvus 的限流和重试策略。
 6. 增加死信队列和失败任务恢复。
-7. 优化 RAG query，根据用户选择的维度动态生成检索 query。
+7. 优化 Milvus RAG 召回策略，例如多 query 检索、来源权重、时间新鲜度和跨维度重排。
 8. 增加 Evidence 去重、来源权重、时间新鲜度评分。
 9. 增加更严格的 Claim schema 和报告评分 rubric。
 10. 扩展导出能力：Word、HTML、带证据附录的审计版 PDF。

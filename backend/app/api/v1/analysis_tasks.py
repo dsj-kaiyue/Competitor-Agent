@@ -151,10 +151,15 @@ def _virtual_worker_status(parent_status: str) -> str:
 
 
 def _with_parallel_worker_nodes(task_id: int, nodes: list, edges: list[dict]) -> tuple[list, list[dict]]:
-    node_by_key = {node.node_key: node for node in nodes}
+    def node_value(node, key: str, default=None):
+        if isinstance(node, dict):
+            return node.get(key, default)
+        return getattr(node, key, default)
+
+    node_by_key = {node_value(node, "node_key"): node for node in nodes}
     next_nodes = list(nodes)
     next_edges = [dict(edge) for edge in edges if edge.get("source") not in {"collector", "evidence_extractor"} or edge.get("type") == "revision"]
-    dimension_targets = [node.node_key for node in nodes if getattr(node, "node_type", None) == "dimension_analyst"]
+    dimension_targets = [node_value(node, "node_key") for node in nodes if node_value(node, "node_type") == "dimension_analyst"]
     if not dimension_targets:
         dimension_targets = ["report_writer"]
 
@@ -162,7 +167,7 @@ def _with_parallel_worker_nodes(task_id: int, nodes: list, edges: list[dict]) ->
         parent = node_by_key.get(parent_key)
         if parent is None:
             return
-        parent_status = _virtual_worker_status(parent.status)
+        parent_status = _virtual_worker_status(node_value(parent, "status"))
         base_id = 10_000_000 if worker_prefix == "collector_worker" else 20_000_000
         for index in range(1, max(1, worker_count) + 1):
             worker_key = f"{worker_prefix}_{index}"
@@ -176,11 +181,13 @@ def _with_parallel_worker_nodes(task_id: int, nodes: list, edges: list[dict]) ->
                     "status": parent_status,
                     "input_summary": f"parallel worker of {parent_key}",
                     "output_summary": None,
-                    "started_at": parent.started_at,
-                    "ended_at": parent.ended_at,
-                    "duration_ms": parent.duration_ms,
-                    "retry_count": parent.retry_count,
-                    "error_message": parent.error_message,
+                    "started_at": node_value(parent, "started_at"),
+                    "ended_at": node_value(parent, "ended_at"),
+                    "duration_ms": node_value(parent, "duration_ms"),
+                    "retry_count": node_value(parent, "retry_count"),
+                    "error_message": node_value(parent, "error_message"),
+                    "revision_highlight": node_value(parent, "revision_highlight", False),
+                    "revision_label": node_value(parent, "revision_label"),
                 }
             )
             next_edges.append({"source": parent_key, "target": worker_key, "type": "parallel", "label": "parallel"})

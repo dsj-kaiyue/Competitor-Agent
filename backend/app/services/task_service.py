@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.agents.planner_agent import parse_task_plan
 from app.core.timezone import now_bj
 from app.models.agent_node import AgentNode
+from app.models.agent_run_log import AgentRunLog
 from app.models.analysis_task import AnalysisTask
 from app.models.claim import Claim
 from app.models.claim_evidence import ClaimEvidence
@@ -28,6 +29,7 @@ NODE_DEFINITIONS = [
     ("evidence_extractor", "证据抽取 Agent", "evidence_extractor"),
     ("report_writer", "报告撰写 Agent", "writer"),
     ("qa", "质量检查 Agent", "qa"),
+    ("report_finalizer", "报告总结 Agent", "report_finalizer"),
 ]
 
 DAG_EDGES = [
@@ -35,6 +37,7 @@ DAG_EDGES = [
     {"source": "dimension_planner", "target": "collector", "type": "normal"},
     {"source": "collector", "target": "evidence_extractor", "type": "normal"},
     {"source": "report_writer", "target": "qa", "type": "normal"},
+    {"source": "qa", "target": "report_finalizer", "type": "normal"},
 ]
 
 
@@ -236,8 +239,78 @@ def get_task_plan(task: AnalysisTask) -> TaskPlan:
     return parse_task_plan(task.user_input)
 
 
-def list_nodes(db: Session, task_id: int) -> list[AgentNode]:
-    return list(db.scalars(select(AgentNode).where(AgentNode.task_id == task_id).order_by(AgentNode.id)))
+def _revision_route(next_action: str | None, target_nodes: list[str]) -> list[str]:
+    targets = [str(node_key) for node_key in target_nodes if str(node_key).startswith("dimension_analysis_")]
+    if next_action == "recollect":
+        return ["collector", "evidence_extractor", *targets, "report_writer", "qa"]
+    if next_action == "reanalyze":
+        return [*targets, "report_writer", "qa"]
+    if next_action == "rewrite":
+        return ["report_writer", "qa"]
+    return []
+
+
+def _latest_revision_marker(db: Session, task_id: int) -> tuple[dict | None, object | None]:
+    log = db.scalar(
+        select(AgentRunLog)
+        .where(AgentRunLog.task_id == task_id, AgentRunLog.message == "QA requested revision")
+        .order_by(AgentRunLog.id.desc())
+    )
+    if log is None or not isinstance(log.payload_json, dict):
+        return None, None
+    return log.payload_json, log.created_at
+
+
+def list_nodes(db: Session, task_id: int) -> list[dict]:
+    nodes = list(db.scalars(select(AgentNode).where(AgentNode.task_id == task_id).order_by(AgentNode.id)))
+    task = db.get(AnalysisTask, task_id)
+    payload, revision_started_at = _latest_revision_marker(db, task_id)
+    latest_qa = db.scalar(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id.desc()))
+    active_statuses = {
+        "running",
+        "collecting",
+        "extracting",
+        "analyzing",
+        "writing",
+        "qa_checking",
+        "finalizing",
+        "pause_requested",
+        "paused",
+    }
+    route: list[str] = []
+    revision_label = None
+    if task is not None and payload and latest_qa is not None and not latest_qa.passed and task.status in active_statuses:
+        route = _revision_route(payload.get("next_action"), payload.get("target_nodes") or [])
+        revision_label = f"Revision {payload.get('revision_round') or ''}".strip()
+    result = []
+    for node in nodes:
+        node_payload = {
+            "id": node.id,
+            "task_id": node.task_id,
+            "node_key": node.node_key,
+            "node_name": node.node_name,
+            "node_type": node.node_type,
+            "status": node.status,
+            "input_summary": node.input_summary,
+            "output_summary": node.output_summary,
+            "started_at": node.started_at,
+            "ended_at": node.ended_at,
+            "duration_ms": node.duration_ms,
+            "retry_count": node.retry_count,
+            "error_message": node.error_message,
+            "revision_highlight": False,
+            "revision_label": None,
+        }
+        if node.node_key in route and revision_started_at is not None:
+            completed_this_revision = (
+                node.status == "success"
+                and node.started_at is not None
+                and node.started_at >= revision_started_at
+            )
+            node_payload["revision_highlight"] = not completed_this_revision
+            node_payload["revision_label"] = revision_label if not completed_this_revision else None
+        result.append(node_payload)
+    return result
 
 
 def list_edges(db: Session, task_id: int) -> list[dict]:
@@ -264,16 +337,4 @@ def list_edges(db: Session, task_id: int) -> list[dict]:
     for node_key in sorted(existing_keys):
         edges.append({"source": "evidence_extractor", "target": node_key, "type": "normal"})
         edges.append({"source": node_key, "target": "report_writer", "type": "normal"})
-    qa_results = list(db.scalars(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id.desc())))
-    for qa_result in qa_results:
-        payload = qa_result.issues_json
-        if not isinstance(payload, dict):
-            continue
-        next_action = payload.get("next_action")
-        target_nodes = payload.get("target_nodes") or []
-        if next_action in {"recollect", "reanalyze", "rewrite"}:
-            targets = target_nodes or (["collector"] if next_action == "recollect" else ["report_writer"])
-            for target in targets:
-                edges.append({"source": "qa", "target": target, "type": "revision", "label": "QA Revision"})
-            break
     return edges

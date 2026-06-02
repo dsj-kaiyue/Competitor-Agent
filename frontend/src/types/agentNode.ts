@@ -12,9 +12,12 @@ export interface AgentNode {
   duration_ms?: number | null
   retry_count: number
   error_message?: string | null
+  revision_highlight?: boolean
+  revision_label?: string | null
 }
 
 export interface DagEdge {
+  id?: string | null
   source: string
   target: string
   type?: string

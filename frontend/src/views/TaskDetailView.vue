@@ -39,7 +39,7 @@ interface AgentLogGroup {
 }
 
 const baseNodeOrder = ['planner', 'dimension_planner', 'collector', 'evidence_extractor']
-const tailNodeOrder = ['report_writer', 'qa']
+const tailNodeOrder = ['report_writer', 'qa', 'report_finalizer']
 const orderedNodes = computed(() => {
   const byKey = new Map(nodes.value.map((node) => [node.node_key, node]))
   const head = baseNodeOrder.map((key) => byKey.get(key)).filter((node): node is AgentNode => Boolean(node))
@@ -53,13 +53,13 @@ const orderedNodes = computed(() => {
 const currentNode = computed(() => nodes.value.find((node) => node.status === 'running'))
 const completedCount = computed(() => nodes.value.filter((node) => node.status === 'success').length)
 const canPause = computed(() =>
-  ['queued', 'running', 'planned', 'planning_dimensions', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking'].includes(
+  ['queued', 'running', 'planned', 'planning_dimensions', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking', 'finalizing'].includes(
     task.value?.status || '',
   ),
 )
 const canResume = computed(() => ['paused', 'pause_requested'].includes(task.value?.status || ''))
 const canCancel = computed(() =>
-  ['queued', 'running', 'planned', 'planning_dimensions', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking', 'pause_requested', 'paused'].includes(
+  ['queued', 'running', 'planned', 'planning_dimensions', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking', 'finalizing', 'pause_requested', 'paused'].includes(
     task.value?.status || '',
   ),
 )
@@ -231,7 +231,7 @@ onBeforeUnmount(() => {
         v-for="node in orderedNodes"
         :key="node.node_key"
         class="node-card"
-        :class="node.status || 'pending'"
+        :class="[node.status || 'pending', { 'revision-highlight': node.revision_highlight }]"
       >
         <strong>{{ node.node_name }}</strong>
         <span>{{ node.status || 'pending' }}</span>
@@ -352,6 +352,13 @@ onBeforeUnmount(() => {
 .node-card.paused,
 .node-card.pause_requested {
   border-left-color: #e6a23c;
+}
+
+.node-card.revision-highlight {
+  border-color: #e6a23c;
+  border-left-color: #e6a23c;
+  background: #fff8e8;
+  box-shadow: 0 0 0 3px rgba(230, 162, 60, 0.14);
 }
 
 .log-collapse {

@@ -12,6 +12,7 @@ class CompetitiveAnalysisState(TypedDict, total=False):
     evidence_chunk_ids: list[int]
     claim_ids: list[int]
     report_id: int
+    report_writer_mode: str
     qa_result_id: int
     revision_round: int
     max_revision_rounds: int

@@ -19,9 +19,12 @@ class AgentNodeResponse(BaseModel):
     duration_ms: int | None = None
     retry_count: int
     error_message: str | None = None
+    revision_highlight: bool = False
+    revision_label: str | None = None
 
 
 class DagEdge(BaseModel):
+    id: str | None = None
     source: str
     target: str
     type: str = "normal"

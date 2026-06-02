@@ -31,6 +31,7 @@ const nodePositions: Record<string, { x: number; y: number }> = {
   evidence_extractor: { x: 1160, y: centerY },
   report_writer: { x: 2060, y: centerY },
   qa: { x: 2380, y: centerY },
+  report_finalizer: { x: 2700, y: centerY },
 }
 
 const workerCounts = computed(() => ({
@@ -84,20 +85,25 @@ const flowNodes = computed(() =>
     targetPosition: Position.Left,
     data: { label: `${node.node_name}\n${node.status}` },
     style: {
-      border: `2px solid ${statusColor[node.status] ?? '#c0c4cc'}`,
+      border: node.revision_highlight
+        ? '3px solid #e6a23c'
+        : `2px solid ${statusColor[node.status] ?? '#c0c4cc'}`,
       borderRadius: '8px',
       width: node.node_type === 'virtual_worker' ? '160px' : node.node_type === 'dimension_analyst' ? '190px' : '210px',
       padding: node.node_type === 'virtual_worker' ? '9px' : '12px',
       whiteSpace: 'pre-line',
       fontSize: node.node_type === 'virtual_worker' ? '12px' : '13px',
-      background: node.node_type === 'virtual_worker' ? '#fffaf0' : node.node_type === 'dimension_analyst' ? '#f5f9ff' : '#fff',
+      background: node.revision_highlight
+        ? '#fff8e8'
+        : node.node_type === 'virtual_worker' ? '#fffaf0' : node.node_type === 'dimension_analyst' ? '#f5f9ff' : '#fff',
+      boxShadow: node.revision_highlight ? '0 0 0 4px rgba(230, 162, 60, 0.16)' : undefined,
     },
   })),
 )
 
 const flowEdges = computed(() =>
-  props.edges.map((edge) => ({
-    id: `${edge.source}-${edge.target}-${edge.type || 'normal'}`,
+  props.edges.map((edge, index) => ({
+    id: edge.id || `${edge.source}-${edge.target}-${edge.type || 'normal'}-${index}`,
     source: edge.source,
     target: edge.target,
     label: edge.label || undefined,

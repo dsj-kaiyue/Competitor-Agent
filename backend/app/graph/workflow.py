@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from decimal import Decimal
 import json
 import logging
@@ -7,7 +8,7 @@ import re
 from time import perf_counter
 
 import markdown
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -309,7 +310,10 @@ def _decide_next_action(issues: list[dict]) -> tuple[str, list[str]]:
     high_issues = [issue for issue in issues if issue.get("severity") == "high"]
     candidates = high_issues or issues
     if any(issue.get("suggested_action") == "recollect" for issue in candidates):
-        return "recollect", ["collector"]
+        target_nodes: list[str] = []
+        for issue in candidates:
+            target_nodes.extend(_target_nodes_from_issue(issue))
+        return "recollect", sorted(set(target_nodes))
     if any(issue.get("suggested_action") == "reanalyze" for issue in candidates):
         target_nodes: list[str] = []
         for issue in candidates:
@@ -382,6 +386,94 @@ def _fallback_report_json(task: AnalysisTask, claims: list[Claim], evidence_by_c
             }
         )
     return _fill_paragraph_evidence({"title": f"{task.topic}报告", "sections": sections}, evidence_by_claim)
+
+
+def _section_claim_ids(section: dict) -> set[int]:
+    claim_ids: set[int] = set()
+    for paragraph in section.get("paragraphs", []) if isinstance(section, dict) else []:
+        for claim_id in paragraph.get("claim_ids", []) if isinstance(paragraph, dict) else []:
+            try:
+                claim_ids.add(int(claim_id))
+            except (TypeError, ValueError):
+                continue
+    return claim_ids
+
+
+def _normalized_token(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _section_matches_alias(section: dict, aliases: set[str]) -> bool:
+    text = _normalized_token(f"{section.get('section_id') or ''} {section.get('title') or ''}")
+    return any(alias and len(alias) >= 2 and alias in text for alias in aliases)
+
+
+def _is_global_report_section(section: dict) -> bool:
+    text = _normalized_token(f"{section.get('section_id') or ''} {section.get('title') or ''}")
+    keywords = (
+        "executive",
+        "summary",
+        "overview",
+        "conclusion",
+        "recommend",
+        "ranking",
+        "takeaway",
+        "摘要",
+        "执行摘要",
+        "总览",
+        "概览",
+        "总体",
+        "总结",
+        "结论",
+        "建议",
+        "推荐",
+        "排名",
+    )
+    return any(keyword in text for keyword in keywords)
+
+
+def _sanitize_report_sections(report_json: dict, valid_claim_ids: set[int]) -> dict:
+    sections = []
+    seen_section_ids: set[str] = set()
+    for section_index, raw_section in enumerate(report_json.get("sections", []), start=1):
+        if not isinstance(raw_section, dict):
+            continue
+        section = dict(raw_section)
+        section_id = str(section.get("section_id") or f"section_{section_index}").strip() or f"section_{section_index}"
+        original_section_id = section_id
+        suffix = 2
+        while section_id in seen_section_ids:
+            section_id = f"{original_section_id}_{suffix}"
+            suffix += 1
+        seen_section_ids.add(section_id)
+        section["section_id"] = section_id
+        section["title"] = str(section.get("title") or section_id).strip() or section_id
+        paragraphs = []
+        for paragraph_index, raw_paragraph in enumerate(section.get("paragraphs", []), start=1):
+            if not isinstance(raw_paragraph, dict):
+                continue
+            text = str(raw_paragraph.get("text") or "").strip()
+            if not text:
+                continue
+            claim_ids = []
+            for claim_id in raw_paragraph.get("claim_ids") or []:
+                try:
+                    numeric_id = int(claim_id)
+                except (TypeError, ValueError):
+                    continue
+                if numeric_id in valid_claim_ids and numeric_id not in claim_ids:
+                    claim_ids.append(numeric_id)
+            paragraphs.append(
+                {
+                    "paragraph_id": str(raw_paragraph.get("paragraph_id") or f"{section_id}_p{paragraph_index}"),
+                    "text": text,
+                    "claim_ids": claim_ids,
+                }
+            )
+        section["paragraphs"] = paragraphs
+        if paragraphs:
+            sections.append(section)
+    return {**report_json, "sections": sections}
 
 
 def _search_firecrawl_query(query: str, max_results: int = 3) -> tuple[str, list[dict]]:
@@ -542,7 +634,7 @@ def _run_dimension_analyst_logic(db: Session, task_id: int, node: AgentNode, pro
                 task_id=task_id,
                 agent_node_id=node.id,
                 competitor_name=str(item.get("competitor_name") or competitor),
-                claim_type="dimension",
+                claim_type=dimension_key,
                 dimension_key=dimension_key,
                 dimension_label=dimension_label,
                 dimension_prompt_json=prompt_spec,
@@ -608,7 +700,7 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         "task_id": task_id,
         "errors": [],
         "revision_round": 0,
-        "max_revision_rounds": 1,
+        "max_revision_rounds": max(0, settings.qa_max_revision_rounds),
         "qa_passed": None,
         "qa_next_action": None,
         "qa_target_nodes": [],
@@ -620,6 +712,17 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
     task = db.get(AnalysisTask, task_id)
     if task is None:
         raise RuntimeError(f"Task {task_id} not found")
+    if db.scalar(select(AgentNode).where(AgentNode.task_id == task_id, AgentNode.node_key == "report_finalizer")) is None:
+        db.add(
+            AgentNode(
+                task_id=task_id,
+                node_key="report_finalizer",
+                node_name="报告总结 Agent",
+                node_type="report_finalizer",
+                status="pending",
+            )
+        )
+        db.commit()
     _console("analysis workflow started", {"task_id": task_id})
 
     llm = LLMClient()
@@ -1119,11 +1222,92 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         state["dimension_prompt_specs"] = fallback_by_key
         return fallback_by_key
 
+    def _dimension_targets_from_issues(issues: list[dict]) -> list[str]:
+        specs_by_node = _dimension_specs_from_state()
+        if not specs_by_node:
+            return []
+        node_by_id = {
+            node.id: node.node_key
+            for node in db.scalars(
+                select(AgentNode).where(
+                    AgentNode.task_id == task_id,
+                    AgentNode.node_key.in_(list(specs_by_node)),
+                )
+            )
+        }
+        aliases_by_node: dict[str, set[str]] = {}
+        for node_key, spec in specs_by_node.items():
+            aliases = {node_key}
+            for value in (
+                spec.get("dimension_key"),
+                spec.get("dimension_label"),
+                spec.get("label"),
+                spec.get("analysis_goal"),
+            ):
+                if value:
+                    aliases.add(str(value).strip().casefold())
+            aliases_by_node[node_key] = {alias for alias in aliases if alias}
+
+        targets: set[str] = set()
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            target_node = issue.get("target_node")
+            if target_node in specs_by_node:
+                targets.add(str(target_node))
+                continue
+            related_claim_id = issue.get("related_claim_id")
+            if related_claim_id:
+                try:
+                    claim = db.get(Claim, int(related_claim_id))
+                except (TypeError, ValueError):
+                    claim = None
+                if claim and claim.agent_node_id in node_by_id:
+                    targets.add(node_by_id[claim.agent_node_id])
+                    continue
+            exact_values = [
+                issue.get("related_dimension"),
+                issue.get("dimension_key"),
+                issue.get("dimension_label"),
+                issue.get("claim_type"),
+            ]
+            exact_tokens = {str(value).strip().casefold() for value in exact_values if value}
+            matched = False
+            for node_key, aliases in aliases_by_node.items():
+                if exact_tokens & aliases:
+                    targets.add(node_key)
+                    issue["target_node"] = node_key
+                    matched = True
+                    break
+            if matched:
+                continue
+            free_text = " ".join(
+                str(issue.get(key) or "")
+                for key in ("message", "search_query", "related_dimension")
+            ).casefold()
+            for node_key, aliases in aliases_by_node.items():
+                if any(alias and len(alias) >= 3 and alias in free_text for alias in aliases):
+                    targets.add(node_key)
+                    issue["target_node"] = node_key
+                    break
+        return sorted(targets)
+
+    def _clear_claims_for_dimension_node(local_db: Session, node_key: str) -> None:
+        node = local_db.scalar(select(AgentNode).where(AgentNode.task_id == task_id, AgentNode.node_key == node_key))
+        if node is None:
+            return
+        claim_ids = select(Claim.id).where(Claim.task_id == task_id, Claim.agent_node_id == node.id)
+        local_db.execute(delete(ClaimEvidence).where(ClaimEvidence.claim_id.in_(claim_ids)).execution_options(synchronize_session=False))
+        local_db.execute(delete(Claim).where(Claim.task_id == task_id, Claim.agent_node_id == node.id).execution_options(synchronize_session=False))
+        local_db.flush()
+
     def _run_one_dimension_analyst_thread(node_key: str, prompt_spec: dict, force: bool = False) -> tuple[str, list[int]]:
         local_db = SessionLocal()
         local_claim_ids: list[int] = []
         try:
             def run_logic(node: AgentNode) -> None:
+                if force:
+                    _clear_claims_for_dimension_node(local_db, node_key)
                 local_claim_ids.extend(_run_dimension_analyst_logic(local_db, task_id, node, prompt_spec))
 
             _run_node(local_db, task_id, node_key, "analyzing", run_logic, force=force)
@@ -1162,6 +1346,11 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
                     )
                     db.commit()
                     raise RuntimeError(f"动态分析 Agent 执行失败，已停止生成报告：{node_key} - {exc}") from exc
+                state["dimension_failures"] = [
+                    failure
+                    for failure in state.get("dimension_failures", [])
+                    if failure.get("node_key") != completed_node_key
+                ]
                 state.setdefault("claim_ids", []).extend(claim_ids)
                 _console(
                     "parallel dimension analyst completed",
@@ -1212,8 +1401,13 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
             ensure_ascii=False,
         )[:9000]
         revision_instruction = state.get("revision_reason") or ""
-        prompt = f"""
-请基于动态竞品画像、对比矩阵和结构化 Claim 生成中文竞品分析报告 JSON。
+        valid_claim_ids = {claim.id for claim in claims}
+        latest_report = db.scalar(select(Report).where(Report.task_id == task_id).order_by(Report.id.desc()))
+        writer_mode = str(state.get("report_writer_mode") or "full_write")
+
+        def generate_full_report() -> dict:
+            prompt = f"""
+请基于动态竞品画像、对比矩阵和结构化 Claim 生成中文竞品分析报告正文 JSON。
 主题：{plan.topic}
 行业：{plan.industry}
 竞品：{', '.join(plan.competitors)}
@@ -1222,15 +1416,15 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
 
 要求：
 1. 只输出合法 JSON，不要 Markdown。
-2. 每个 section 至少包含 section_id、title、paragraphs。
+2. 只生成具体分析维度 section，不要生成执行摘要、总体结论、总体建议、排名、推荐等全文总结 section。
 3. 每个关键 paragraph 必须包含 paragraph_id、text、claim_ids。
 4. claim_ids 只能引用下方已有 claim_id，不要编造。
 5. 不要输出 evidence_ids，后端会自动补齐。
 6. 必须覆盖所有分析维度。
-7. 优先基于 CompetitorProfiles 和 ComparisonMatrices 组织内容，但关键段落仍要引用 claim_ids。
+7. 优先基于 CompetitorProfiles 和 ComparisonMatrices 组织维度正文，但关键段落仍要引用 claim_ids。
 
 JSON 格式：
-{{"title":"...","sections":[{{"section_id":"executive_summary","title":"执行摘要","paragraphs":[{{"paragraph_id":"executive_summary_p1","text":"...","claim_ids":[1,2]}}]}}]}}
+{{"title":"...","sections":[{{"section_id":"pricing_strategy","title":"价格策略","paragraphs":[{{"paragraph_id":"pricing_strategy_p1","text":"...","claim_ids":[1,2]}}]}}]}}
 
 CompetitorProfiles:
 {profile_context}
@@ -1241,16 +1435,198 @@ ComparisonMatrices:
 Claims:
 {claim_context}
 """
-        _console("llm report writer started", {"task_id": task_id, "claim_count": len(claims)})
-        try:
-            report_json = _json_from_text(llm.complete(prompt, system="你只输出合法 JSON。"))
-            if not isinstance(report_json, dict) or not report_json.get("sections"):
+            _console("llm report writer full_write started", {"task_id": task_id, "claim_count": len(claims)})
+            parsed = _json_from_text(llm.complete(prompt, system="你只输出合法 JSON。"))
+            if not isinstance(parsed, dict) or not parsed.get("sections"):
                 raise ValueError("report_json.sections missing")
-            report_json.setdefault("title", f"{plan.topic}报告")
+            parsed.setdefault("title", f"{plan.topic}报告")
+            return parsed
+
+        def target_revision_context() -> tuple[list[str], list[Claim], list[dict], set[str]]:
+            target_nodes = [
+                str(node_key)
+                for node_key in state.get("qa_target_nodes", [])
+                if str(node_key).startswith("dimension_analysis_")
+            ]
+            if not target_nodes:
+                return [], [], [], set()
+            nodes_by_key = {
+                item.node_key: item
+                for item in db.scalars(
+                    select(AgentNode).where(AgentNode.task_id == task_id, AgentNode.node_key.in_(target_nodes))
+                )
+            }
+            target_node_ids = {node.id for node in nodes_by_key.values()}
+            target_claims = [claim for claim in claims if claim.agent_node_id in target_node_ids]
+            specs = _dimension_specs_from_state()
+            dimension_specs = []
+            aliases: set[str] = set(target_nodes)
+            for node_key in target_nodes:
+                spec = specs.get(node_key) or {}
+                node = nodes_by_key.get(node_key)
+                dimension_spec = {
+                    "target_node": node_key,
+                    "node_name": node.node_name if node else node_key,
+                    "dimension_key": spec.get("dimension_key"),
+                    "dimension_label": spec.get("dimension_label") or spec.get("label") or (node.node_name if node else node_key),
+                }
+                dimension_specs.append(dimension_spec)
+                for value in dimension_spec.values():
+                    if value:
+                        aliases.add(_normalized_token(value))
+            for claim in target_claims:
+                aliases.add(_normalized_token(claim.dimension_key))
+                aliases.add(_normalized_token(claim.dimension_label))
+                aliases.add(_normalized_token(claim.claim_type))
+            return target_nodes, target_claims, dimension_specs, {alias for alias in aliases if alias}
+
+        def generate_partial_report() -> dict:
+            if latest_report is None or not isinstance(latest_report.report_json, dict):
+                raise ValueError("partial_revision requires an existing report_json")
+            previous_report_json = deepcopy(latest_report.report_json)
+            previous_sections = [
+                section
+                for section in previous_report_json.get("sections", [])
+                if isinstance(section, dict)
+            ]
+            target_nodes, target_claims, dimension_specs, target_aliases = target_revision_context()
+            if not target_nodes or not target_claims:
+                raise ValueError("partial_revision missing target dimension claims")
+            target_claim_ids = {claim.id for claim in target_claims}
+            target_claim_context = "\n".join(
+                f"[claim_id={claim.id}] competitor={claim.competitor_name}; type={claim.claim_type}; "
+                f"dimension_key={claim.dimension_key}; dimension_label={claim.dimension_label}; "
+                f"evidence_ids={evidence_by_claim.get(claim.id, [])}; text={claim.claim_text}"
+                for claim in target_claims
+            )
+            existing_target_sections = [
+                section
+                for section in previous_sections
+                if (_section_claim_ids(section) & target_claim_ids) or _section_matches_alias(section, target_aliases)
+            ]
+            partial_prompt = f"""
+请对已有中文竞品分析报告正文做局部修订，只输出合法 JSON。
+
+任务主题：{plan.topic}
+行业：{plan.industry}
+竞品：{', '.join(plan.competitors)}
+本轮返工要求：{revision_instruction}
+
+本轮只允许修订这些动态维度：
+{json.dumps(dimension_specs, ensure_ascii=False)}
+
+要求：
+1. 只输出 JSON，不要 Markdown。
+2. 只输出上述目标维度的 dimension_sections，不要改写其它维度。
+3. 不要生成执行摘要、总体结论、总体建议、排名、推荐等全文总结 section。
+4. 每个 section 必须包含 section_id、title、paragraphs；每个 paragraph 必须包含 paragraph_id、text、claim_ids。
+5. claim_ids 只能引用“目标维度 Claims”或“全部 Claims”中存在的 claim_id，不要编造。
+6. 不要输出 evidence_ids，后端会自动补齐。
+
+JSON 格式：
+{{"title":"...","dimension_sections":[{{"section_id":"pricing_strategy","title":"价格策略","paragraphs":[{{"paragraph_id":"pricing_strategy_p1","text":"...","claim_ids":[12,13]}}]}}]}}
+
+上一版目标维度 section：
+{json.dumps(existing_target_sections, ensure_ascii=False)[:5000]}
+
+CompetitorProfiles:
+{profile_context}
+
+ComparisonMatrices:
+{matrix_context}
+
+目标维度 Claims：
+{target_claim_context}
+
+全部 Claims：
+{claim_context}
+"""
+            _console(
+                "llm report writer partial_revision started",
+                {"task_id": task_id, "target_nodes": target_nodes, "target_claim_count": len(target_claims)},
+            )
+            parsed = _json_from_text(llm.complete(partial_prompt, system="你只输出合法 JSON。"))
+            if not isinstance(parsed, dict):
+                raise ValueError("partial report payload must be an object")
+            dimension_sections = parsed.get("dimension_sections") or parsed.get("sections") or []
+            replacement_json = _sanitize_report_sections(
+                {
+                    "title": parsed.get("title") or previous_report_json.get("title") or f"{plan.topic}报告",
+                    "sections": dimension_sections,
+                },
+                valid_claim_ids,
+            )
+            target_replacements = replacement_json.get("sections", [])
+            if not target_replacements:
+                raise ValueError("partial report sections missing")
+
+            merged_sections: list[dict] = []
+            inserted_targets = False
+            for section in previous_sections:
+                is_global = _is_global_report_section(section)
+                is_target = (_section_claim_ids(section) & target_claim_ids) or _section_matches_alias(section, target_aliases)
+                if is_global:
+                    continue
+                if is_target:
+                    if not inserted_targets:
+                        merged_sections.extend(target_replacements)
+                        inserted_targets = True
+                    continue
+                merged_sections.append(section)
+            if not inserted_targets:
+                merged_sections.extend(target_replacements)
+            return {
+                **previous_report_json,
+                "title": parsed.get("title") or previous_report_json.get("title") or f"{plan.topic}报告",
+                "sections": merged_sections,
+                "revision_mode": "partial_revision",
+                "partial_revision_target_nodes": target_nodes,
+            }
+
+        try:
+            if writer_mode == "partial_revision":
+                report_json = generate_partial_report()
+            else:
+                report_json = generate_full_report()
+            report_json = _sanitize_report_sections(report_json, valid_claim_ids)
+            report_json["sections"] = [
+                section for section in report_json.get("sections", []) if not _is_global_report_section(section)
+            ]
+            if not report_json.get("sections"):
+                raise ValueError("report_json.sections missing after sanitize")
             report_json = _fill_paragraph_evidence(report_json, evidence_by_claim)
         except Exception as exc:
-            add_log(db, task_id, node.id, "Report JSON generation fallback used", {"error": str(exc)}, log_type="warning")
-            report_json = _fallback_report_json(task, claims, evidence_by_claim)
+            add_log(
+                db,
+                task_id,
+                node.id,
+                "Report JSON generation fallback used",
+                {"error": str(exc), "mode": writer_mode},
+                log_type="warning",
+            )
+            if writer_mode == "partial_revision":
+                _, target_claims, _, _ = target_revision_context()
+                fallback_claims = target_claims or claims
+                if latest_report is not None and isinstance(latest_report.report_json, dict) and target_claims:
+                    fallback_partial = _fallback_report_json(task, fallback_claims, evidence_by_claim)
+                    previous_report_json = deepcopy(latest_report.report_json)
+                    target_claim_ids = {claim.id for claim in fallback_claims}
+                    merged_sections = [
+                        section
+                        for section in previous_report_json.get("sections", [])
+                        if not (_section_claim_ids(section) & target_claim_ids)
+                    ]
+                    merged_sections.extend(fallback_partial.get("sections", []))
+                    report_json = {**previous_report_json, "sections": merged_sections, "revision_mode": "partial_revision_fallback"}
+                else:
+                    report_json = _fallback_report_json(task, fallback_claims, evidence_by_claim)
+            else:
+                report_json = _fallback_report_json(task, claims, evidence_by_claim)
+            report_json = _sanitize_report_sections(report_json, valid_claim_ids)
+            report_json["sections"] = [
+                section for section in report_json.get("sections", []) if not _is_global_report_section(section)
+            ]
+            report_json = _fill_paragraph_evidence(report_json, evidence_by_claim)
         content = _render_report_markdown(report_json)
         report = Report(
             task_id=task_id,
@@ -1260,14 +1636,167 @@ Claims:
             report_json={
                 **report_json,
                 "mode": "firecrawl_llm_milvus_rag",
+                "report_writer_mode": writer_mode,
                 "profile_ids": [profile.id for profile in profiles],
                 "matrix_ids": [matrix.id for matrix in matrices],
             },
         )
         db.add(report)
         db.flush()
-        node.output_summary = f"使用 LLM 生成报告 #{report.id}"
-        _console("llm report writer completed", {"task_id": task_id, "report_id": report.id})
+        node.output_summary = f"使用 {writer_mode} 模式生成报告 #{report.id}"
+        _console("llm report writer completed", {"task_id": task_id, "report_id": report.id, "mode": writer_mode})
+        state["report_id"] = report.id
+
+    def report_finalizer(node: AgentNode) -> None:
+        plan = get_task_plan(task)
+        latest_report = db.scalar(select(Report).where(Report.task_id == task_id).order_by(Report.id.desc()))
+        if latest_report is None or not isinstance(latest_report.report_json, dict):
+            raise RuntimeError("没有可用于生成最终摘要的报告正文")
+        claims = list(db.scalars(select(Claim).where(Claim.task_id == task_id).order_by(Claim.id)))
+        if not claims:
+            raise RuntimeError("没有可用于生成最终摘要的 Claim")
+        profiles = list(db.scalars(select(CompetitorProfile).where(CompetitorProfile.task_id == task_id).order_by(CompetitorProfile.id)))
+        matrices = list(db.scalars(select(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).order_by(ComparisonMatrix.id)))
+        evidence_by_claim = _claim_evidence_map(db, [claim.id for claim in claims])
+        valid_claim_ids = {claim.id for claim in claims}
+        body_report_json = deepcopy(latest_report.report_json)
+        body_sections = [
+            section
+            for section in body_report_json.get("sections", [])
+            if isinstance(section, dict) and not _is_global_report_section(section)
+        ]
+        if not body_sections:
+            raise RuntimeError("报告正文缺少可总结的维度 section")
+        claim_context = "\n".join(
+            f"[claim_id={claim.id}] competitor={claim.competitor_name}; type={claim.claim_type}; "
+            f"dimension_key={claim.dimension_key}; dimension_label={claim.dimension_label}; "
+            f"evidence_ids={evidence_by_claim.get(claim.id, [])}; text={claim.claim_text}"
+            for claim in claims
+        )
+        profile_context = json.dumps(
+            [
+                {
+                    "profile_id": profile.id,
+                    "competitor_name": profile.competitor_name,
+                    "profile_data": profile.profile_data_json,
+                }
+                for profile in profiles
+            ],
+            ensure_ascii=False,
+        )[:9000]
+        matrix_context = json.dumps(
+            [
+                {
+                    "matrix_id": matrix.id,
+                    "title": matrix.title,
+                    "matrix_data": matrix.matrix_data_json,
+                }
+                for matrix in matrices
+            ],
+            ensure_ascii=False,
+        )[:9000]
+        finalizer_prompt = f"""
+请基于当前最终竞品分析正文，生成最终报告的全文总结 section，只输出合法 JSON。
+
+主题：{plan.topic}
+行业：{plan.industry}
+竞品：{', '.join(plan.competitors)}
+分析维度：{', '.join(plan.analysis_dimensions)}
+维度正文 QA 是否通过：{state.get("qa_passed")}
+维度正文 QA 残留问题：
+{json.dumps(state.get("qa_issues", []), ensure_ascii=False)[:5000]}
+
+要求：
+1. 只输出 JSON，不要 Markdown。
+2. 只生成 global_sections，不要改写具体分析维度 section。
+3. global_sections 应包含执行摘要、总体结论、关键建议或风险提示；如需排名或推荐，必须能被正文 Claim 支撑。
+4. 每个 paragraph 必须包含 paragraph_id、text、claim_ids。
+5. claim_ids 只能引用下方已有 claim_id，不要编造。
+6. 不要输出 evidence_ids，后端会自动补齐。
+7. 不要引入正文和 Claim 中没有的新事实。
+8. 如果 QA 未通过，必须在风险提示或结论中明确说明仍存在的证据、覆盖或写作问题，不要把未通过内容包装成完全可靠结论。
+
+JSON 格式：
+{{"title":"...","global_sections":[{{"section_id":"executive_summary","title":"执行摘要","paragraphs":[{{"paragraph_id":"executive_summary_p1","text":"...","claim_ids":[1,2]}}]}}]}}
+
+当前最终正文 sections：
+{json.dumps(body_sections, ensure_ascii=False)[:9000]}
+
+CompetitorProfiles:
+{profile_context}
+
+ComparisonMatrices:
+{matrix_context}
+
+Claims:
+{claim_context}
+"""
+        _console("llm report finalizer started", {"task_id": task_id, "body_section_count": len(body_sections)})
+        try:
+            parsed = _json_from_text(llm.complete(finalizer_prompt, system="你只输出合法 JSON。"))
+            if not isinstance(parsed, dict):
+                raise ValueError("finalizer payload must be an object")
+            finalizer_json = _sanitize_report_sections(
+                {
+                    "title": parsed.get("title") or body_report_json.get("title") or f"{plan.topic}报告",
+                    "sections": parsed.get("global_sections") or parsed.get("sections") or [],
+                },
+                valid_claim_ids,
+            )
+            global_sections = [
+                section for section in finalizer_json.get("sections", []) if _is_global_report_section(section)
+            ] or finalizer_json.get("sections", [])
+            if not global_sections:
+                raise ValueError("global_sections missing")
+        except Exception as exc:
+            add_log(db, task_id, node.id, "Report finalizer fallback used", {"error": str(exc)}, log_type="warning")
+            top_claims = claims[: min(6, len(claims))]
+            if state.get("qa_passed"):
+                fallback_text = "本报告基于已通过 QA 的维度分析正文、结构化 Claim 和证据链生成。核心结论请以各维度正文及其 Claim/Evidence 绑定为准。"
+            else:
+                fallback_text = "本报告在达到当前返工限制后生成，仍存在未通过 QA 的残留问题。请优先查看风险提示、低置信度 Claim 和证据绑定情况，核心结论需结合各维度正文及其 Claim/Evidence 绑定谨慎使用。"
+            global_sections = [
+                {
+                    "section_id": "executive_summary",
+                    "title": "执行摘要",
+                    "paragraphs": [
+                        {
+                            "paragraph_id": "executive_summary_p1",
+                            "text": fallback_text,
+                            "claim_ids": [claim.id for claim in top_claims],
+                        }
+                    ],
+                }
+            ]
+        final_report_json = {
+            **body_report_json,
+            "title": body_report_json.get("title") or f"{plan.topic}报告",
+            "sections": [*global_sections, *body_sections],
+            "report_finalized": True,
+            "qa_passed": state.get("qa_passed"),
+            "qa_issues": state.get("qa_issues", []),
+        }
+        final_report_json = _sanitize_report_sections(final_report_json, valid_claim_ids)
+        final_report_json = _fill_paragraph_evidence(final_report_json, evidence_by_claim)
+        content = _render_report_markdown(final_report_json)
+        report = Report(
+            task_id=task_id,
+            title=final_report_json.get("title") or f"{plan.topic}报告",
+            content_markdown=content,
+            content_html=markdown.markdown(content, extensions=["tables"]),
+            report_json={
+                **final_report_json,
+                "mode": "firecrawl_llm_milvus_rag",
+                "report_writer_mode": "finalized",
+                "source_report_id": latest_report.id,
+                "profile_ids": [profile.id for profile in profiles],
+                "matrix_ids": [matrix.id for matrix in matrices],
+            },
+        )
+        db.add(report)
+        db.flush()
+        node.output_summary = f"基于报告正文 #{latest_report.id} 生成最终摘要报告 #{report.id}"
+        _console("llm report finalizer completed", {"task_id": task_id, "source_report_id": latest_report.id, "report_id": report.id})
         state["report_id"] = report.id
 
     def build_dynamic_knowledge() -> None:
@@ -1301,10 +1830,6 @@ Claims:
         evidence_ids_by_claim: dict[int, list[int]] = {}
         for item in linked:
             evidence_ids_by_claim.setdefault(item.claim_id, []).append(item.evidence_chunk_id)
-        evidence_by_id = {
-            chunk.id: chunk
-            for chunk in db.scalars(select(EvidenceChunk).where(EvidenceChunk.id.in_([item.evidence_chunk_id for item in linked])))
-        } if linked else {}
         node_key_by_id = {node.id: node.node_key for node in db.scalars(select(AgentNode).where(AgentNode.task_id == task_id))}
         issues = []
         for failure in state.get("dimension_failures", []):
@@ -1351,36 +1876,6 @@ Claims:
                         "target_node": node_key_by_id.get(claim.agent_node_id) if claim.agent_node_id else None,
                     }
                 )
-            if claim.claim_type == "pricing":
-                evidence_types = {evidence_by_id[eid].source_type for eid in evidence_ids_by_claim.get(claim.id, []) if eid in evidence_by_id}
-                if evidence_types and not (evidence_types & {"official_website", "pricing_page"}):
-                    issues.append(
-                        {
-                            "type": "weak_evidence",
-                            "severity": "medium",
-                            "message": f"价格 Claim {claim.id} 缺少官方或价格页证据",
-                            "related_claim_id": claim.id,
-                            "related_competitor": claim.competitor_name,
-                            "related_dimension": "pricing",
-                            "suggested_action": "recollect",
-                            "search_query": f"{claim.competitor_name} pricing plans official",
-                        }
-                    )
-            if claim.claim_type == "security":
-                evidence_types = {evidence_by_id[eid].source_type for eid in evidence_ids_by_claim.get(claim.id, []) if eid in evidence_by_id}
-                if evidence_types and not (evidence_types & {"official_website", "docs", "security", "enterprise"}):
-                    issues.append(
-                        {
-                            "type": "weak_evidence",
-                            "severity": "medium",
-                            "message": f"安全 Claim {claim.id} 缺少 docs/security/enterprise 来源",
-                            "related_claim_id": claim.id,
-                            "related_competitor": claim.competitor_name,
-                            "related_dimension": "security",
-                            "suggested_action": "recollect",
-                            "search_query": f"{claim.competitor_name} security privacy compliance official docs",
-                        }
-                    )
         if report:
             missing_dimensions = [dim for dim in plan.analysis_dimensions if dim not in report.content_markdown]
             if missing_dimensions:
@@ -1389,12 +1884,24 @@ Claims:
                 issues.append({"type": "writing_issue", "severity": "high", "message": "报告为空、过短或缺少结构化章节", "suggested_action": "rewrite"})
         if not claims:
             issues.append({"type": "schema_incomplete", "severity": "high", "message": "所有动态维度 Agent 都未生成 Claim", "related_claim_id": None, "suggested_action": "reanalyze"})
+        dimension_targets = [
+            {
+                "target_node": node_key,
+                "dimension_key": spec.get("dimension_key"),
+                "dimension_label": spec.get("dimension_label"),
+            }
+            for node_key, spec in _dimension_specs_from_state().items()
+        ]
         qa_prompt = f"""
 请复核这份竞品分析报告是否存在明显逻辑或证据问题。
 仅基于报告和问题列表输出 JSON：
 {{"passed":true/false,"score":0.0到1.0,"issues":[{{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null,"search_query":null}}]}}
 
 如果 suggested_action 是 recollect，必须提供一条具体 search_query，且 search_query 必须包含相关竞品名称。
+如果 suggested_action 是 recollect 或 reanalyze，并且问题能定位到某个动态维度，target_node 必须填写下面可用动态维度节点中的 target_node，不要填写 collector。
+
+可用动态维度节点：
+{json.dumps(dimension_targets, ensure_ascii=False)}
 
 报告：
 {(report.content_markdown if report else '')[:6000]}
@@ -1413,7 +1920,19 @@ Claims:
             score = Decimal("0.80")
             passed = True
         passed = passed and not any(item.get("severity") == "high" for item in issues)
+        inferred_target_nodes = _dimension_targets_from_issues(issues)
+        for issue in issues:
+            if issue.get("target_node") in {"collector", "report_writer"}:
+                issue["target_node"] = None
+        if inferred_target_nodes:
+            for issue in issues:
+                if not issue.get("target_node"):
+                    targets_for_issue = _dimension_targets_from_issues([issue])
+                    if len(targets_for_issue) == 1:
+                        issue["target_node"] = targets_for_issue[0]
         next_action, target_nodes = _decide_next_action(issues)
+        if next_action in {"recollect", "reanalyze"} and not target_nodes:
+            target_nodes = inferred_target_nodes
         if passed:
             next_action, target_nodes = "end", []
         followup_queries = [str(issue.get("search_query")) for issue in issues if issue.get("search_query")]
@@ -1457,12 +1976,19 @@ Claims:
     _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor)
     run_parallel_dimension_analysts()
     build_dynamic_knowledge()
+    state["report_writer_mode"] = "full_write"
     _run_node(db, task_id, "report_writer", "writing", report_writer)
     _run_node(db, task_id, "qa", "qa_checking", qa)
-    if not state.get("qa_passed") and state.get("revision_round", 0) < state.get("max_revision_rounds", 1):
-        state["revision_round"] = int(state.get("revision_round", 0)) + 1
+    while not state.get("qa_passed") and state.get("revision_round", 0) < state.get("max_revision_rounds", 1):
         action = state.get("qa_next_action") or "end"
         target_nodes = state.get("qa_target_nodes", [])
+        if action == "end":
+            _console(
+                "qa revision stopped because no actionable revision was requested",
+                {"task_id": task_id, "revision_round": state.get("revision_round", 0)},
+            )
+            break
+        state["revision_round"] = int(state.get("revision_round", 0)) + 1
         qa_node = _node(db, task_id, "qa")
         add_log(
             db,
@@ -1483,24 +2009,50 @@ Claims:
             {"task_id": task_id, "next_action": action, "target_nodes": target_nodes, "revision_round": state["revision_round"]},
         )
         if action == "recollect":
-            state["collector_mode"] = "recollect"
-            _run_node(db, task_id, "collector", "collecting", collector, force=True)
-            _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor, force=True)
-            state["collector_mode"] = "normal"
             targets = [node_key for node_key in target_nodes if node_key.startswith("dimension_analysis_")]
-            run_parallel_dimension_analysts(targets or None, force=True)
+            if not targets:
+                raise RuntimeError("QA 要求补采资料，但没有定位到需要重跑的动态维度 Agent")
+            try:
+                state["collector_mode"] = "recollect"
+                _run_node(db, task_id, "collector", "collecting", collector, force=True)
+                _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor, force=True)
+            finally:
+                state["collector_mode"] = "normal"
+            run_parallel_dimension_analysts(targets, force=True)
             build_dynamic_knowledge()
+            state["report_writer_mode"] = "partial_revision"
             _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
             _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
         elif action == "reanalyze":
             targets = [node_key for node_key in target_nodes if node_key.startswith("dimension_analysis_")]
-            run_parallel_dimension_analysts(targets or None, force=True)
+            if not targets:
+                raise RuntimeError("QA 要求重新分析，但没有定位到需要重跑的动态维度 Agent")
+            run_parallel_dimension_analysts(targets, force=True)
             build_dynamic_knowledge()
+            state["report_writer_mode"] = "partial_revision"
             _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
             _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
         elif action == "rewrite":
+            state["report_writer_mode"] = "full_write"
             _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
             _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
+    if not state.get("qa_passed"):
+        finalizer_node = _node(db, task_id, "report_finalizer")
+        add_log(
+            db,
+            task_id,
+            finalizer_node.id,
+            "Report finalizer running with unresolved QA issues",
+            {
+                "revision_round": state.get("revision_round", 0),
+                "max_revision_rounds": state.get("max_revision_rounds", 0),
+                "qa_next_action": state.get("qa_next_action"),
+                "issue_count": len(state.get("qa_issues", [])),
+            },
+            log_type="warning",
+        )
+        db.commit()
+    _run_node(db, task_id, "report_finalizer", "finalizing", report_finalizer, force=True)
     _check_task_control(db, task_id)
     update_task_status(db, task_id, "success")
     _console("analysis workflow completed", {"task_id": task_id})

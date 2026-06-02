@@ -23,9 +23,9 @@ AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话�
 - 证据抽取阶段记录切块、MySQL、Embedding、Milvus 的阶段耗时。
 - Analyst 执行层采用动态维度 Agent：`Dimension Prompt Planner Agent` 为每个分析维度生成 prompt spec，后端并行启动一个 `dimension_analysis_*` Agent 只分析该维度。
 - 每个动态维度 Analyst 使用独立 DB Session、独立 EvidenceRetriever、独立 LLMClient 和独立 Milvus 查询上下文。
-- DAG 页面可视化展示并行采集 worker、并行证据 worker、动态维度 Analyst 和 QA 回流边。
+- DAG 页面可视化展示并行采集 worker、并行证据 worker、动态维度 Analyst，并在 QA 返工时高亮本轮需要重跑的 Agent 路线。
 - Analyst Agent 使用 Milvus RAG 检索 evidence，Milvus 未命中时 fallback 到 MySQL evidence。
-- ReportWriter 输出结构化 `report_json.sections`，报告段落可展开 Claim 和 Evidence。
+- ReportWriter 输出具体分析维度正文 `report_json.sections`，QA 通过后由 Report Finalizer 生成执行摘要、总体结论和建议等全文总结 section。
 - 报告页支持导出 Markdown 文件和 PDF 文件，并导出动态对比矩阵、QA 结果、结构化 Claim 和证据链。
 - 任务控制支持暂停、恢复、取消和手动重试；Celery 不对业务失败自动反复 retry。
 - 任务规划 Agent 在正式执行时只确认用户修改后的 TaskPlan，不二次 LLM 解析覆盖前端修改。
@@ -34,12 +34,12 @@ AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话�
 - 创建页顶部提供“自动添加分析维度”开关；只要打开，不管用户是否已输入分析维度，解析阶段都会补充推荐维度并立即回填到前端供用户增删。
 - Planner Agent 根据用户输入场景动态推荐 `analysis_dimensions`，用户最终确认后的维度会生成动态画像 Schema。
 - 系统生成动态竞品画像 `competitor_profile` 和动态对比矩阵 `comparison_matrix`，画像字段全部存储在 JSON 中，不增加行业固定列。
-- ReportWriter 优先基于动态画像和动态矩阵组织报告，同时保留 Claim/Evidence 溯源。
+- ReportWriter 优先基于动态画像和动态矩阵组织维度正文，同时保留 Claim/Evidence 溯源；Report Finalizer 只基于已通过 QA 的正文和 Claim 生成最终总结。
 - 报告接口返回动态画像和动态矩阵；报告页只展示“竞品动态对比矩阵”，避免把同一批画像信息重复显示两次。
 - `/api/v1/analysis-tasks/{task_id}/metrics` 提供任务运行指标，任务详情页提供运行指标面板。
 - 数据库新写入时间统一使用北京时间。
 - QA 结果使用带 `next_action / target_nodes / revision_round` 的结构化 payload。
-- QA 不通过时最多返工 1 轮，可回流到 collector、analyst 或 report_writer。
+- QA 不通过时按 `.env` 中的 `QA_MAX_REVISION_ROUNDS` 循环返工，可回流到 collector、受影响的动态维度 analyst 或 report_writer；前端会高亮本轮尚未完成的返工路线节点。
 - 首页提供历史分析记录入口，历史页可查看以往任务、节点状态、报告和证据链。
 - Planner fallback 根据用户输入推断目标产品、行业和竞品，不使用固定 AI 编程助手 demo 数据。
 
@@ -330,7 +330,8 @@ JSON 修正请求的 user prompt：
 | Dimension Prompt Planner Agent | 正式执行阶段，Planner 节点确认后 | `TaskPlan`、动态画像字段 schema | 每个维度的 prompt spec | 写入对应 `agent_node.input_summary/output_summary` 和运行态 spec |
 | Dynamic Dimension Analyst Agent | 证据抽取完成后 | 某个维度的 prompt spec、某个竞品、RAG evidence | Claim JSON 数组 | 写入 `claim`、`claim_evidence` |
 | ReportWriter Agent | 动态维度 Analyst 完成且至少有 Claim | 画像、矩阵、Claim | 报告 JSON | 写入 `report` |
-| QA Agent | ReportWriter 完成后 | 报告 Markdown、本地规则检查问题 | QA 结果 JSON | 写入 `qa_result` |
+| QA Agent | ReportWriter 完成后 | 维度正文 Markdown、本地规则检查问题 | QA 结果 JSON | 写入 `qa_result` |
+| Report Finalizer Agent | QA 通过后 | 已通过 QA 的维度正文、动态画像、矩阵、Claim | 最终执行摘要、总体结论、建议等全局 section | 写入最终 `report` |
 
 ### 1. Planner Agent：需求解析
 
@@ -961,7 +962,7 @@ risk_level
 claim.task_id
 claim.agent_node_id
 claim.competitor_name
-claim.claim_type = "dimension"
+claim.claim_type = 内部分类字段；动态维度任务中通常等于 dimension_key，不直接展示给用户
 claim.dimension_key
 claim.dimension_label
 claim.dimension_prompt_json
@@ -1224,6 +1225,10 @@ User prompt 模板：
 {"passed":true/false,"score":0.0到1.0,"issues":[{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null,"search_query":null}]}
 
 如果 suggested_action 是 recollect，必须提供一条具体 search_query，且 search_query 必须包含相关竞品名称。
+如果 suggested_action 是 recollect 或 reanalyze，并且问题能定位到某个动态维度，target_node 必须填写可用动态维度节点中的 target_node，不要填写 collector。
+
+可用动态维度节点：
+{json.dumps(dimension_targets, ensure_ascii=False)}
 
 报告：
 {report.content_markdown[:6000]}
@@ -1242,12 +1247,12 @@ DeepSeek `content` 期望示例：
     {
       "type": "weak_evidence",
       "severity": "medium",
-      "message": "价格策略部分缺少官方价格页证据，建议补采价格页后重跑相关维度分析。",
+      "message": "核心能力部分证据强度不足，建议补采更直接的官方或一手资料后重跑相关维度分析。",
       "related_claim_id": 12,
-      "related_dimension": "价格策略",
+      "related_dimension": "核心能力",
       "suggested_action": "recollect",
-      "target_node": "collector",
-      "search_query": "Apify pricing plans official"
+      "target_node": "dimension_analysis_core_capabilities_1a2b3c4d",
+      "search_query": "Apify core capabilities official docs"
     }
   ]
 }
@@ -1285,9 +1290,9 @@ qa_result.issues_json
   "score": 0.72,
   "issues": [],
   "next_action": "recollect",
-  "target_nodes": ["collector"],
-  "revision_reason": "价格策略证据较弱，需要补采官方价格页。",
-  "followup_queries": ["Apify pricing official", "Bright Data pricing official"],
+  "target_nodes": ["dimension_analysis_core_capabilities_1a2b3c4d"],
+  "revision_reason": "核心能力证据较弱，需要补采更直接资料。",
+  "followup_queries": ["Apify core capabilities official docs", "Bright Data core capabilities official docs"],
   "revision_round": 0
 }
 ```
@@ -1297,6 +1302,7 @@ qa_result.issues_json
 - 如果 QA LLM 调用失败，后端会使用本地规则检查结果兜底。
 - QA 只处理已经进入报告阶段的结果。
 - 如果动态维度 Analyst 阶段因为 DeepSeek 失败、余额不足、超时或 JSON 不合法而失败，workflow 会停在分析阶段，不会交给 QA 吞掉。
+- `recollect` 和 `reanalyze` 必须能定位到至少一个 `dimension_analysis_*` 节点；如果无法定位，workflow 会报错停止，避免全量盲重跑。
 
 ### 不调用 DeepSeek Chat API 的 Agent 或步骤
 
@@ -1371,8 +1377,9 @@ response.data[].embedding
 | `collector` | 资料采集 Agent | 生成搜索 query，调用 Firecrawl search/scrape | `source_document` |
 | `evidence_extractor` | 证据抽取 Agent | 清洗网页、切 chunk、embedding、写 Milvus | `evidence_chunk` |
 | `dimension_analysis_*` | 动态维度分析 Agent | 每个节点只负责一个分析维度，基于 RAG evidence 生成带 `dimension_key / dimension_label` 的 Claim | `claim` |
-| `report_writer` | 报告撰写 Agent | 基于 Claim 生成结构化报告 JSON 和 Markdown | `report` |
-| `qa` | QA Agent | 规则检查 + LLM 复核，必要时触发一次返工 | `qa_result` |
+| `report_writer` | 报告正文撰写 Agent | 基于 Claim 只生成具体分析维度正文 section，不生成执行摘要等全文总结 | `report` |
+| `qa` | QA Agent | 规则检查 + LLM 复核，必要时按上限触发多轮返工 | `qa_result` |
+| `report_finalizer` | 报告总结 Agent | QA 通过后，或达到最大返工次数后生成执行摘要、总体结论、建议、风险提示等全局 section | 最终 `report` |
 
 ### 逻辑 DAG
 
@@ -1392,6 +1399,8 @@ evidence_extractor
                     report_writer
                            |
                           qa
+                           |
+                    report_finalizer
 ```
 
 前端会把动态维度 Analyst 显示为并行分支；后端也会使用独立线程并行执行这些维度 Analyst。每个维度 Analyst 都会创建独立 SQLAlchemy Session、独立 EvidenceRetriever 和独立 LLMClient，避免跨线程共享 DB Session。
@@ -1503,7 +1512,7 @@ Collector 不再使用固定的功能、价格、安全三条 query。当前系�
 {competitor} {industry/topic} {dimension_label} official docs
 ```
 
-QA 返工要求补采时，Collector 进入 `recollect` 模式，只执行 QA 生成的 follow-up query，不重复执行首次采集时的维度 query。
+QA 返工要求补采时，Collector 进入 `recollect` 模式，只执行 QA 生成的 follow-up query，不重复执行首次采集时的维度 query。补采完成后不会全量重跑所有动态维度 Agent，只会重跑 QA 定位到的受影响维度 Agent。
 
 分析阶段采用并行执行：
 
@@ -1516,7 +1525,7 @@ QA 返工要求补采时，Collector 进入 `recollect` 模式，只执行 QA �
 
 这样避免跨线程共享 SQLAlchemy Session。
 
-QA 增量补采后，`state["source_document_ids"]` 只保存本轮新增文档 ID，Evidence Extractor 会优先只处理这些新增文档，避免重复切块、重复 embedding 和重复写 Milvus。
+QA 增量补采后，`state["source_document_ids"]` 只保存本轮新增文档 ID，Evidence Extractor 会优先只处理这些新增文档，避免重复切块、重复 embedding 和重复写 Milvus。随后系统通过 `target_node`、`related_claim_id`、`related_dimension`、维度 key/label 等信息定位受影响的 `dimension_analysis_*` 节点，只重跑这些维度。
 
 ### 4. 证据抽取与向量化
 
@@ -1642,7 +1651,7 @@ Claim 现在由动态维度 Analyst 生成，而不是由四个固定 Analyst �
 - 主线程收集各维度 Analyst 生成的 claim id，并等待全部维度 Analyst 完成后再进入动态画像、矩阵和 `report_writer`。
 - 如果任一维度 Analyst 因 LLM 调用失败、JSON 无法修复、DB/Milvus 异常、或“已有 evidence 但没有生成 Claim”而失败，主 workflow 会立即停止，任务进入失败状态，避免继续生成空报告。
 - 只有当某个维度对所有竞品都没有检索到 evidence 时，该维度才允许被跳过；如果最终所有维度都没有 Claim，ReportWriter 不会执行。
-- QA 返工时，如果目标是多个维度 Analyst，也会并行重跑目标维度；如果 QA 没给出具体目标，会重跑全部动态维度 Analyst。
+- QA 返工时，如果目标是多个维度 Analyst，也会并行重跑目标维度；如果 QA 没给出具体目标，系统会根据 `related_claim_id / related_dimension / dimension_key / dimension_label / search_query` 推断受影响维度。仍然无法定位时会报错停止，避免把所有动态维度 Agent 都重跑一遍。
 
 LLM 输出 Claim JSON：
 
@@ -1663,6 +1672,31 @@ LLM 输出 Claim JSON：
 如果 LLM 没返回 `evidence_ids`，系统默认绑定本次 RAG 检索的 top evidence。
 
 Claim 只允许绑定本次传给 LLM 的 evidence，避免把全量 evidence 都挂上去。
+
+#### 证据可信度、结论置信度与风险等级
+
+系统里有三个容易混淆但含义不同的字段：
+
+| 字段 | 所属对象 | 含义 | 当前来源 |
+| --- | --- | --- | --- |
+| `evidence_chunk.reliability_score` | Evidence Chunk | 证据来源可信度，表示这段 evidence 的来源类型和内容作为证据是否可靠 | 后端按来源类型启发式赋值，例如官网/价格页通常高于普通网页 |
+| `claim.confidence` | Claim | 结论置信度，表示该 Claim 被当前绑定 evidence 支撑得有多充分 | Dynamic Dimension Analyst LLM 输出，后端按 0 到 1 保存 |
+| `claim.risk_level` | Claim | 结论使用风险，表示该 Claim 在解读、传播或用于决策时是否容易误导、过度概括或受限制条件影响 | Dynamic Dimension Analyst LLM 输出，取 `low / medium / high` |
+
+三者关系：
+
+- 证据可信度是 evidence 层面的属性，不等于结论置信度。
+- 结论置信度是 Claim 层面的属性，取决于 evidence 是否直接、充分、一致地支撑该结论。
+- 风险等级也是 Claim 层面的属性，但它关注的是结论使用风险，不是证据强弱本身。
+- 高可信 evidence 可以支撑高置信 Claim；但如果 evidence 只间接相关、覆盖不完整或互相矛盾，Claim 仍可能低置信。
+- 高置信 Claim 仍可能是高风险，例如结论本身涉及合规、强场景依赖、快速变化信息、争议判断或重要限制条件。
+- 当前系统没有用固定公式把 `reliability_score` 换算成 `confidence`，也没有用 `confidence` 自动换算 `risk_level`；`confidence` 和 `risk_level` 都由分析 Agent 根据 evidence 内容生成。
+
+QA 当前使用方式：
+
+- 如果 Claim 没有绑定 Evidence，会标记为 `missing_evidence`。
+- 如果 `claim.confidence < 0.60`，会标记为 `weak_evidence`，提示该结论证据支撑偏弱。
+- `risk_level` 当前主要用于展示、报告组织和后续人工判断，不直接触发固定返工规则。
 
 ### 7. 动态竞品画像与动态对比矩阵
 
@@ -1711,7 +1745,7 @@ backend/app/models/comparison_matrix.py
 - 未知维度不会丢弃；如果包含英文/数字，会生成稳定英文 key，例如 `MCP 支持 -> mcp_support`。
 - 纯中文未知维度会生成 `dimension_{index}_{hash}`，保证不同任务之间稳定可存储。
 
-`CompetitorProfileService` 会按竞品读取 Claim，并根据 `claim_type` 和关键词匹配到动态字段：
+`CompetitorProfileService` 会按竞品读取 Claim，并根据 `dimension_key / dimension_label` 优先匹配动态字段，`claim_type` 只作为内部兼容字段：
 
 - `pricing` 优先进入 `pricing_strategy`。
 - `security` 优先进入 `security_compliance / enterprise_capabilities`。
@@ -1815,8 +1849,6 @@ ReportWriter 现在会同时接收：
 QA Agent 至少检查：
 
 - 每个核心 Claim 是否绑定 Evidence。
-- `pricing` Claim 是否优先有 `official_website` / `pricing_page` 来源。
-- `security` Claim 是否优先有 `official_website` / `docs` / `security` / `enterprise` 来源。
 - 报告是否覆盖用户选择的分析维度。
 - Claim `confidence < 0.6` 是否标记 weak evidence。
 - 报告是否为空、过短或缺少结构。
@@ -1831,31 +1863,43 @@ QA Agent 至少检查：
     {
       "type": "weak_evidence",
       "severity": "medium",
-      "message": "价格 Claim 缺少官方价格页证据",
+      "message": "核心能力 Claim 置信度偏低，建议补采更直接的官方或一手资料后重跑相关维度分析。",
       "related_claim_id": 12,
       "related_competitor": "Example",
-      "related_dimension": "pricing",
+      "related_dimension": "核心能力",
       "suggested_action": "recollect",
-      "target_node": null,
-      "search_query": "Example pricing plans official"
+      "target_node": "dimension_analysis_core_capabilities_1a2b3c4d",
+      "search_query": "Example core capabilities official docs"
     }
   ],
   "next_action": "recollect",
-  "target_nodes": ["collector"],
-  "revision_reason": "价格 Claim 缺少官方价格页证据",
-  "followup_queries": ["Example pricing plans official"],
+  "target_nodes": ["dimension_analysis_core_capabilities_1a2b3c4d"],
+  "revision_reason": "核心能力 Claim 证据强度不足",
+  "followup_queries": ["Example core capabilities official docs"],
   "revision_round": 0
 }
 ```
 
 返工规则：
 
-- 最多返工 1 轮。
-- `recollect`：回流到 collector，再 evidence_extractor，再目标 analyst，再 report_writer，再 qa。
-- `reanalyze`：回流到目标 analyst，再 report_writer，再 qa。
-- `rewrite`：回流到 report_writer，再 qa。
-- 返工会追加日志，不删除第一次执行日志。
-- 前端 DAG 会展示 `qa -> target_node` 的橙色虚线回流边。
+- 最多返工 `QA_MAX_REVISION_ROUNDS` 轮，默认 1 轮；设置为 0 表示不自动返工。
+- 返工控制是循环判断：每次返工后都会重新执行 QA；如果 QA 仍不通过且 `revision_round < QA_MAX_REVISION_ROUNDS`，会继续下一轮，直到 QA 通过、没有可执行动作，或达到最大返工轮数。
+- `recollect`：进入增量补采流程，执行 `collector(recollect) -> evidence_extractor -> 目标 dimension_analysis_* -> build_dynamic_knowledge -> report_writer(partial_revision) -> qa`。
+- `reanalyze`：只重跑受影响的目标维度，执行 `目标 dimension_analysis_* -> build_dynamic_knowledge -> report_writer(partial_revision) -> qa`。
+- `rewrite`：整篇重写维度正文，执行 `report_writer(full_write) -> qa`。
+- ReportWriter 有两种模式：`full_write` 用于首次维度正文生成和 `rewrite` 返工；`partial_revision` 用于 `recollect/reanalyze` 后，只替换目标维度 section。
+- `report_finalizer` 在 QA 通过后执行；如果 QA 未通过但已达到最大返工轮数，也会继续执行，基于当前可用的维度正文生成最终报告，并在执行摘要、总体结论或风险提示中明确标注残留 QA 问题，避免把未通过内容包装成完全可靠结论。
+- `recollect` 和 `reanalyze` 都不会全量重跑所有动态维度 Agent，只重跑 QA 定位到的 `dimension_analysis_*` 节点；如果无法定位目标维度，系统会停止并暴露定位失败原因。
+- `recollect` 模式下 Collector 只使用 `followup_queries`，不会重复执行首次采集时所有维度 query；Evidence Extractor 优先只处理本轮新增 `source_document_ids`。
+- 返工会追加日志、追加新的 `qa_result`，不删除第一次执行日志。
+- `/nodes` 接口不再返回 QA 回流边；返工期间会在节点响应中标记 `revision_highlight`，前端 DAG 高亮本轮尚未完成的返工路线节点。节点完成本轮重跑后会恢复为普通完成状态颜色。
+
+目标节点定位依据：
+
+- QA issue 直接给出 `target_node`，且该节点存在于当前任务的动态维度节点中。
+- issue 关联 `related_claim_id`，后端通过 `claim.agent_node_id` 找到生成该 Claim 的 `dimension_analysis_*`。
+- issue 提供 `related_dimension / dimension_key / dimension_label / claim_type`，后端和维度 prompt spec 的 key、label、analysis_goal 做匹配。
+- 如果仍未定位，后端会从 `message / search_query / related_dimension` 中做文本匹配；仍然失败时不做全量兜底。
 
 ## 前端页面
 
@@ -1891,7 +1935,7 @@ frontend/src/components/DagFlow.vue
 - 展示 DAG。
 - 展示并行 collector worker 和 evidence worker。
 - 展示动态维度 Analyst 分支。
-- 展示 QA 回流虚线边。
+- 返工期间高亮本轮需要重跑且尚未完成的 Agent 路线。
 - 展示按 Agent 分组的日志。
 - 日志按时间倒序显示，最新动态在上方。
 - 同一 Agent 的日志可折叠。
@@ -2056,7 +2100,7 @@ Firecrawl 抓取网页。
 | `task_id` | 任务 ID |
 | `agent_node_id` | 生成 Agent |
 | `competitor_name` | 竞品 |
-| `claim_type` | 当前动态维度 Claim 使用 `dimension`；历史任务可能仍是 `feature / pricing / market / security` |
+| `claim_type` | 内部分类字段；动态维度任务中通常等于 `dimension_key`，前端和导出报告不展示该字段 |
 | `dimension_key` | 动态分析维度 key |
 | `dimension_label` | 动态分析维度名称 |
 | `dimension_prompt_json` | 生成该 Claim 使用的维度 prompt spec |
@@ -2147,7 +2191,7 @@ QA 结果。
 | `POST` | `/api/v1/analysis-tasks/{task_id}/resume` | 恢复已暂停任务，重新入队并跳过已成功节点 |
 | `POST` | `/api/v1/analysis-tasks/{task_id}/cancel` | 请求取消任务，队列中任务直接取消，运行中任务在最近检查点取消 |
 | `POST` | `/api/v1/analysis-tasks/{task_id}/retry` | 重试任务，清理旧采集数据、证据、结论、报告和 QA 后从头执行 |
-| `GET` | `/api/v1/analysis-tasks/{task_id}/nodes` | DAG 节点和边，包含虚拟并行 worker |
+| `GET` | `/api/v1/analysis-tasks/{task_id}/nodes` | DAG 节点和边，包含虚拟并行 worker；返工期间节点会包含 `revision_highlight` 高亮标记 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/logs` | Agent 日志 |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/evidence` | Evidence Chunk |
 | `GET` | `/api/v1/analysis-tasks/{task_id}/claims` | Claim |
@@ -2240,6 +2284,8 @@ MILVUS_COLLECTION=evidence_chunks
 RUN_TASKS_INLINE=false
 FALLBACK_TO_LOCAL_THREAD_ON_CELERY_ERROR=true
 FALLBACK_TO_LOCAL_THREAD_WHEN_WORKER_UNAVAILABLE=true
+# QA 不通过时最多自动返工/重跑轮数；0 表示不自动返工，1 表示最多返工 1 轮。
+QA_MAX_REVISION_ROUNDS=1
 
 CELERY_WORKER_HEARTBEAT_TTL_SECONDS=45
 CELERY_WORKER_HEARTBEAT_INTERVAL_SECONDS=10
@@ -2258,6 +2304,7 @@ EVIDENCE_EMBEDDING_BATCH_SIZE=8
 - `FIRECRAWL_MAX_URLS_PER_COMPETITOR=10~20`：每个竞品每轮最多 scrape 多少个新 URL，默认 20；设置为 0 表示不限制。
 - `EVIDENCE_EXTRACTOR_MAX_WORKERS=4~8`：embedding 服务稳定时可调大；并发过高会触发限流。
 - `EVIDENCE_EMBEDDING_BATCH_SIZE=1~10`：DashScope `text-embedding-v4` 单次请求最多 10 条 input，建议 8。
+- `QA_MAX_REVISION_ROUNDS=0~3`：QA 不通过时最多自动返工/重跑几轮，默认 1；设置为 0 表示不自动返工。
 - 并发越高，越可能触发 Firecrawl / embedding / Milvus 限流。
 
 前端配置：
@@ -2422,7 +2469,7 @@ python -c "from app.core.config import settings; from pymilvus import MilvusClie
    - 并行采集 worker。
    - 并行证据 worker。
    - 动态维度 Analyst 分支。
-   - QA 回流边。
+   - QA 返工路线节点高亮。
    - Agent 日志。
 7. 进入阶段耗时页查看证据抽取每轮耗时。
 8. 进入证据链页查看网页来源。
@@ -2524,7 +2571,7 @@ npm run build
 - 动态维度 Analyst 采用严格失败策略：除“该维度没有检索到 evidence”外，LLM/JSON/DB/Milvus 等真实失败都会中断任务，防止空报告。
 - Collector 和 Evidence Extractor 已经做了并发 worker。
 - 并行 worker 是虚拟可视化节点，不是独立 Celery task。
-- QA 返工最多 1 轮，避免无限循环。
+- QA 返工轮数由 `QA_MAX_REVISION_ROUNDS` 控制，建议保持 1 到 2 轮，避免无限循环。
 - 任务恢复和幂等能力仍偏 MVP，生产环境还需要加强。
 - Firecrawl、DeepSeek、DashScope、Milvus 任一外部服务不稳定都会影响任务耗时。
 - ReportWriter 的结构化 JSON 依赖 LLM 输出质量，已有 fallback，但报告质量仍可进一步增强。

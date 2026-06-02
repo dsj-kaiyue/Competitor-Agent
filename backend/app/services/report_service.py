@@ -40,6 +40,12 @@ def _format_confidence(value: object) -> str:
         return str(value)
 
 
+def _split_revision_reason(value: object) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in re.split(r"\s*(?:\r?\n|；|;)\s*", str(value)) if item.strip()]
+
+
 def _matrix_markdown(matrices: list[ComparisonMatrix]) -> str:
     if not matrices:
         return ""
@@ -75,43 +81,70 @@ def _qa_markdown(qa_payload: dict | None) -> str:
         return "\n".join(sections)
     passed = "通过" if qa_payload.get("passed") else "未通过"
     score = _format_confidence(qa_payload.get("score"))
-    next_action = qa_payload.get("next_action") or "end"
+    next_action = qa_payload.get("next_action_label") or qa_payload.get("next_action") or "无需返工"
     revision_round = qa_payload.get("revision_round") or 0
+    target_nodes = qa_payload.get("target_node_labels") or qa_payload.get("target_nodes") or []
+    target_node_text = "；".join(str(item) for item in target_nodes) if target_nodes else "无"
     sections.extend(
         [
             "",
-            f"- 结果：{passed}",
-            f"- 分数：{score}",
-            f"- 下一步动作：{next_action}",
-            f"- 返工轮次：{revision_round}",
+            "### 质检概览",
+            "",
+            "| 项目 | 结果 |",
+            "| --- | --- |",
+            f"| QA 结论 | {passed} |",
+            f"| QA 评分 | {score} |",
+            f"| 当前返工轮次 | 第 {revision_round} 轮 |",
+            f"| 建议处理方式 | {next_action} |",
+            f"| 涉及节点/维度 | {_markdown_cell(target_node_text)} |",
         ]
     )
-    target_nodes = qa_payload.get("target_nodes") or []
-    if target_nodes:
-        sections.append(f"- 目标节点：{', '.join(str(item) for item in target_nodes)}")
-    revision_reason = qa_payload.get("revision_reason")
-    if revision_reason:
-        sections.append(f"- 返工原因：{revision_reason}")
     issues = qa_payload.get("issues") or []
     if not issues:
-        sections.append("- 问题：无")
+        revision_reason = qa_payload.get("revision_reason")
+        if revision_reason:
+            sections.extend(["", "### 返工原因", ""])
+            sections.extend(f"{index}. {reason}" for index, reason in enumerate(_split_revision_reason(revision_reason), start=1))
+        sections.extend(["", "### QA 问题", "", "未发现需要处理的问题。"])
         return "\n".join(sections)
-    sections.extend(["", "### QA 问题"])
+    sections.extend(
+        [
+            "",
+            "### QA 问题",
+            "",
+            "| # | 风险级别 | 问题类型 | 相关维度 | 建议动作 | 问题说明 |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+    )
     for index, issue in enumerate(issues, start=1):
         if not isinstance(issue, dict):
-            sections.append(f"{index}. {issue}")
+            sections.append(f"| {index} | - | 其他问题 | - | - | {_markdown_cell(issue)} |")
             continue
-        details = [
-            f"严重级别：{issue.get('severity') or '-'}",
-            f"建议动作：{issue.get('suggested_action') or '-'}",
-        ]
+        dimension = issue.get("related_dimension") or issue.get("target_node_label") or "-"
+        context = []
         if issue.get("related_claim_id"):
-            details.append(f"Claim #{issue.get('related_claim_id')}")
+            context.append(f"Claim #{issue.get('related_claim_id')}")
         if issue.get("related_competitor"):
-            details.append(f"竞品：{issue.get('related_competitor')}")
-        if issue.get("target_node"):
-            details.append(f"节点：{issue.get('target_node')}")
-        sections.append(f"{index}. {issue.get('message') or issue.get('type') or '未命名问题'}（{'；'.join(details)}）")
+            context.append(f"竞品：{issue.get('related_competitor')}")
+        if issue.get("target_node_label") and issue.get("target_node_label") != dimension:
+            context.append(f"节点：{issue.get('target_node_label')}")
+        message = issue.get("message") or issue.get("type_label") or issue.get("type") or "未命名问题"
+        if context:
+            message = f"{message}（{'；'.join(context)}）"
+        sections.append(
+            "| "
+            + " | ".join(
+                [
+                    str(index),
+                    _markdown_cell(issue.get("severity_label") or issue.get("severity") or "-"),
+                    _markdown_cell(issue.get("type_label") or issue.get("type") or "-"),
+                    _markdown_cell(dimension),
+                    _markdown_cell(issue.get("suggested_action_label") or issue.get("suggested_action") or "-"),
+                    _markdown_cell(message),
+                ]
+            )
+            + " |"
+        )
     return "\n".join(sections)
 
 

@@ -25,6 +25,7 @@ from app.schemas.metrics import TaskMetricsResponse
 from app.schemas.profile import CompetitorProfileItem, CompetitorProfileListResponse
 from app.schemas.qa import QAResultItem, QAResultResponse
 from app.schemas.report import ReportClaimItem, ReportEvidenceItem, ReportItem, ReportResponse
+from app.models.agent_node import AgentNode
 from app.models.comparison_matrix import ComparisonMatrix
 from app.models.competitor_profile import CompetitorProfile
 from app.services.claim_service import list_claims_with_evidence
@@ -119,26 +120,104 @@ def _enqueue_or_run_task(db: Session, task_id: int) -> None:
     )
 
 
-def _normalize_qa_payload(qa_result) -> dict:
+QA_ACTION_LABELS = {
+    "end": "无需返工",
+    "recollect": "重新收集资料",
+    "reanalyze": "重新分析",
+    "rewrite": "重写报告",
+}
+
+QA_SEVERITY_LABELS = {
+    "high": "高风险",
+    "medium": "中等风险",
+    "low": "低风险",
+}
+
+QA_ISSUE_TYPE_LABELS = {
+    "missing_evidence": "缺少证据",
+    "weak_evidence": "证据较弱",
+    "unsupported_claim": "结论缺少支撑",
+    "contradiction": "结论矛盾",
+    "outdated_source": "来源过期",
+    "schema_incomplete": "结构不完整",
+    "logic_gap": "逻辑缺口",
+    "writing_issue": "写作问题",
+}
+
+SYSTEM_NODE_LABELS = {
+    "planner": "任务规划 Agent",
+    "dimension_planner": "维度 Prompt Planner Agent",
+    "collector": "资料采集 Agent",
+    "evidence_extractor": "证据抽取 Agent",
+    "report_writer": "报告撰写 Agent",
+    "qa": "质量检查 Agent",
+    "report_finalizer": "报告总结 Agent",
+}
+
+
+def _qa_node_labels(db: Session | None, task_id: int) -> dict[str, str]:
+    labels = dict(SYSTEM_NODE_LABELS)
+    if db is None:
+        return labels
+    nodes = db.scalars(select(AgentNode).where(AgentNode.task_id == task_id))
+    labels.update({node.node_key: node.node_name for node in nodes})
+    return labels
+
+
+def _qa_node_label(node_key: object, labels: dict[str, str]) -> str:
+    key = str(node_key or "").strip()
+    if not key:
+        return "-"
+    if key in labels:
+        return labels[key]
+    if key.startswith("dimension_analysis_"):
+        return "动态维度分析 Agent"
+    return key
+
+
+def _decorate_qa_issue(issue: object, labels: dict[str, str]) -> dict:
+    if not isinstance(issue, dict):
+        return {"message": str(issue), "type_label": "其他问题", "severity_label": "-"}
+    action = issue.get("suggested_action") or "ignore"
+    issue_type = issue.get("type") or ""
+    severity = issue.get("severity") or ""
+    target_node = issue.get("target_node")
+    return {
+        **issue,
+        "type_label": QA_ISSUE_TYPE_LABELS.get(str(issue_type), str(issue_type) or "其他问题"),
+        "severity_label": QA_SEVERITY_LABELS.get(str(severity), str(severity) or "-"),
+        "suggested_action_label": QA_ACTION_LABELS.get(str(action), str(action) or "-"),
+        "target_node_label": _qa_node_label(target_node, labels) if target_node else None,
+    }
+
+
+def _normalize_qa_payload(qa_result, db: Session | None = None) -> dict:
     payload = qa_result.issues_json or []
+    labels = _qa_node_labels(db, qa_result.task_id)
     base_payload = {
         "passed": qa_result.passed,
         "score": float(qa_result.score) if qa_result.score is not None else None,
     }
     if isinstance(payload, dict):
+        next_action = payload.get("next_action") or "end"
+        target_nodes = payload.get("target_nodes") or []
         return {
             **base_payload,
-            "issues": payload.get("issues") or [],
-            "next_action": payload.get("next_action") or "end",
-            "target_nodes": payload.get("target_nodes") or [],
+            "issues": [_decorate_qa_issue(issue, labels) for issue in payload.get("issues") or []],
+            "next_action": next_action,
+            "next_action_label": QA_ACTION_LABELS.get(str(next_action), str(next_action)),
+            "target_nodes": target_nodes,
+            "target_node_labels": [_qa_node_label(node_key, labels) for node_key in target_nodes],
             "revision_reason": payload.get("revision_reason"),
             "revision_round": payload.get("revision_round") or 0,
         }
     return {
         **base_payload,
-        "issues": payload if isinstance(payload, list) else [],
+        "issues": [_decorate_qa_issue(issue, labels) for issue in payload] if isinstance(payload, list) else [],
         "next_action": "end",
+        "next_action_label": QA_ACTION_LABELS["end"],
         "target_nodes": [],
+        "target_node_labels": [],
         "revision_reason": None,
         "revision_round": 0,
     }
@@ -406,7 +485,7 @@ def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportRespon
         ),
         claims=claim_items,
         evidence=evidence_items,
-        qa_result=_normalize_qa_payload(qa_result) if qa_result else None,
+        qa_result=_normalize_qa_payload(qa_result, db) if qa_result else None,
         profiles=[CompetitorProfileItem.model_validate(item) for item in profiles],
         matrices=[ComparisonMatrixItem.model_validate(item) for item in matrices],
     )
@@ -454,7 +533,7 @@ def export_task_report(
         body = build_markdown_export(
             report,
             matrices=matrices,
-            qa_payload=_normalize_qa_payload(qa_result) if qa_result else None,
+            qa_payload=_normalize_qa_payload(qa_result, db) if qa_result else None,
             claims_with_evidence=claims_with_evidence,
         ).encode("utf-8")
         media_type = "text/markdown; charset=utf-8"
@@ -467,7 +546,7 @@ def export_task_report(
             body = build_pdf_export(
                 report,
                 matrices=matrices,
-                qa_payload=_normalize_qa_payload(qa_result) if qa_result else None,
+                qa_payload=_normalize_qa_payload(qa_result, db) if qa_result else None,
                 claims_with_evidence=claims_with_evidence,
             )
         except RuntimeError as exc:
@@ -487,7 +566,7 @@ def get_task_qa(task_id: int, db: Session = Depends(get_db)) -> QAResultResponse
     qa_result = get_qa_result(db, task_id)
     if qa_result is None:
         return QAResultResponse(qa_result=None)
-    payload = _normalize_qa_payload(qa_result)
+    payload = _normalize_qa_payload(qa_result, db)
     return QAResultResponse(
         qa_result=QAResultItem(
             id=qa_result.id,
@@ -497,7 +576,9 @@ def get_task_qa(task_id: int, db: Session = Depends(get_db)) -> QAResultResponse
             score=qa_result.score,
             issues=payload["issues"],
             next_action=payload["next_action"],
+            next_action_label=payload["next_action_label"],
             target_nodes=payload["target_nodes"],
+            target_node_labels=payload["target_node_labels"],
             revision_reason=payload["revision_reason"],
             revision_round=payload["revision_round"],
             created_at=qa_result.created_at,

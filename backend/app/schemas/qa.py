@@ -47,7 +47,9 @@ class QAResultItem(BaseModel):
     score: Decimal | None
     issues: list[dict]
     next_action: str = "end"
+    next_action_label: str = "无需返工"
     target_nodes: list[str] = []
+    target_node_labels: list[str] = []
     revision_reason: str | None = None
     revision_round: int = 0
     created_at: datetime

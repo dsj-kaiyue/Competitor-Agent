@@ -159,16 +159,178 @@ def _strip_markdown(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _chunks(text: str, size: int = 1400, overlap: int = 180) -> list[str]:
+def _fixed_size_chunks(text: str, size: int = 1400, overlap: int = 180) -> list[str]:
     clean = _strip_markdown(text)
     if not clean:
         return []
     result = []
     start = 0
+    step = max(1, size - overlap)
     while start < len(clean):
         result.append(clean[start : start + size])
-        start += size - overlap
+        start += step
     return result
+
+
+def _looks_like_noise_line(line: str) -> bool:
+    compact = line.strip()
+    if not compact:
+        return False
+    lowered = compact.lower()
+    noise_markers = [
+        "window.",
+        "ytcfg",
+        "wiz_global_data",
+        "var ",
+        "function(",
+        "function ",
+        "data:image",
+        "<script",
+        "__next_data__",
+    ]
+    if any(marker in lowered for marker in noise_markers) and len(compact) > 160:
+        return True
+    if len(compact) > 1200 and compact.count("{") + compact.count("[") > 20:
+        return True
+    return False
+
+
+def _clean_markdown_for_chunking(markdown_text: str) -> str:
+    text = (markdown_text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    def clean_fence(match: re.Match) -> str:
+        body = match.group(1) or ""
+        lowered = body.lower()
+        if len(body) > 1200 or any(marker in lowered for marker in ("window.", "ytcfg", "function(", "<script")):
+            return "\n"
+        return f"\n{body.strip()}\n"
+
+    text = re.sub(r"```(?:[a-zA-Z0-9_-]+)?\s*(.*?)```", clean_fence, text, flags=re.S)
+    cleaned_lines = [line.rstrip() for line in text.splitlines() if not _looks_like_noise_line(line)]
+    text = "\n".join(cleaned_lines)
+    text = re.sub(r"!\[[^\]]*]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]+)]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _clean_markdown_block(text: str) -> str:
+    text = re.sub(r"^\s*[-*+]\s+", "- ", text, flags=re.M)
+    text = re.sub(r"^\s*(\d+)[.)]\s+", r"\1. ", text, flags=re.M)
+    text = re.sub(r"[>*_`|]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_low_value_chunk_unit(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return True
+    low_value_markers = [
+        "skip to main content",
+        "跳转到主要内容",
+        "documentation index",
+        "fetch the complete documentation index",
+        "use this file to discover all available pages",
+        "link to section",
+        "link to ",
+        "复制 markdown",
+        "打印",
+        "反馈",
+        "目录",
+    ]
+    if any(marker in lowered for marker in low_value_markers):
+        return True
+    if len(text) < 12 and not re.search(r"[\d$¥%]|[\u4e00-\u9fff]{2,}", text):
+        return True
+    return False
+
+
+def _split_long_text(text: str, size: int, overlap: int) -> list[str]:
+    if len(text) <= size:
+        return [text]
+    sentences = [item.strip() for item in re.split(r"(?<=[。！？.!?])\s+", text) if item.strip()]
+    if len(sentences) <= 1:
+        return _fixed_size_chunks(text, size=size, overlap=overlap)
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) + 1 > size:
+            chunks.append(current)
+            tail = current[-overlap:].strip() if overlap > 0 else ""
+            current = f"{tail} {sentence}".strip() if tail else sentence
+        else:
+            current = f"{current} {sentence}".strip() if current else sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _markdown_units(markdown_text: str) -> tuple[list[str], int]:
+    heading_stack: list[tuple[int, str]] = []
+    paragraph_lines: list[str] = []
+    units: list[str] = []
+    heading_count = 0
+
+    def heading_path() -> str:
+        return " > ".join(title for _, title in heading_stack if title)
+
+    def flush_paragraph() -> None:
+        if not paragraph_lines:
+            return
+        raw = "\n".join(paragraph_lines).strip()
+        paragraph_lines.clear()
+        plain = _clean_markdown_block(raw)
+        if not plain or _is_low_value_chunk_unit(plain):
+            return
+        path = heading_path()
+        units.append(f"{path}\n{plain}" if path else plain)
+
+    for raw_line in markdown_text.splitlines():
+        line = raw_line.rstrip()
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            flush_paragraph()
+            level = len(match.group(1))
+            title = _clean_markdown_block(match.group(2))
+            if title:
+                heading_count += 1
+                heading_stack = [(item_level, item_title) for item_level, item_title in heading_stack if item_level < level]
+                heading_stack.append((level, title))
+            continue
+        if not line.strip():
+            flush_paragraph()
+            continue
+        paragraph_lines.append(line)
+    flush_paragraph()
+    return units, heading_count
+
+
+def _chunks(text: str, size: int = 1400, overlap: int = 180) -> list[str]:
+    markdown_text = _clean_markdown_for_chunking(text)
+    if not markdown_text:
+        return []
+    units, heading_count = _markdown_units(markdown_text)
+    if heading_count == 0 and len(units) < 3:
+        return _fixed_size_chunks(markdown_text, size=size, overlap=overlap)
+    chunks: list[str] = []
+    current = ""
+    for unit in units:
+        if len(unit) > size:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_split_long_text(unit, size=size, overlap=overlap))
+            continue
+        if current and len(current) + len(unit) + 2 > size:
+            chunks.append(current)
+            current = unit
+        else:
+            current = f"{current}\n\n{unit}".strip() if current else unit
+    if current:
+        chunks.append(current)
+    return chunks or _fixed_size_chunks(markdown_text, size=size, overlap=overlap)
+
 
 
 def _source_type(query: str, url: str) -> str:
@@ -1041,7 +1203,7 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         for doc in docs:
             _check_task_control(db, task_id, node)
             _console("evidence document started", {"task_id": task_id, "source_document_id": doc.id, "competitor": doc.competitor_name})
-            for idx, text in enumerate(_chunks(doc.content_text or doc.content_markdown or "")[:4]):
+            for idx, text in enumerate(_chunks(doc.content_markdown or doc.content_text or "")[:4]):
                 _check_task_control(db, task_id, node)
                 chunk = EvidenceChunk(
                     task_id=task_id,

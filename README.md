@@ -1532,8 +1532,8 @@ QA 增量补采后，`state["source_document_ids"]` 只保存本轮新增文档 
 Evidence Extractor 执行：
 
 1. 读取 `source_document`。
-2. 清洗 Markdown / HTML 文本。
-3. 按约 1400 字符切片，overlap 约 180。
+2. 优先读取 `content_markdown`，保留 Firecrawl 返回的标题、段落、列表等 Markdown 结构；若 Markdown 缺失则退回 `content_text`。
+3. 正常网页/docs/pricing 按 Markdown 标题路径和段落切片，并在 chunk 中保留类似“页面标题 > 二级标题”的上下文；噪声页面、超长页面或脚本内容会先清洗，再切片；如果 Markdown 没有可用结构，则退回约 1400 字符、overlap 约 180 的固定滑窗切片。
 4. 批量创建 `evidence_chunk` 行。
 5. 按 `EVIDENCE_EMBEDDING_BATCH_SIZE` 分批调用 embedding。
 6. 使用 `EVIDENCE_EXTRACTOR_MAX_WORKERS` 并发处理 embedding batch。

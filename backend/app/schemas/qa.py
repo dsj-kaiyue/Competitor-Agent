@@ -32,6 +32,8 @@ class QAResultPayload(BaseModel):
     issues: list[QAIssue] = []
     next_action: Literal["end", "recollect", "reanalyze", "rewrite"] = "end"
     target_nodes: list[str] = []
+    qa_scope: Literal["full_report", "partial_revision"] = "full_report"
+    qa_scope_label: str = "完整报告"
     revision_reason: str | None = None
     followup_queries: list[str] = []
     revision_round: int = 0
@@ -50,6 +52,8 @@ class QAResultItem(BaseModel):
     next_action_label: str = "无需返工"
     target_nodes: list[str] = []
     target_node_labels: list[str] = []
+    qa_scope: str = "full_report"
+    qa_scope_label: str = "完整报告"
     revision_reason: str | None = None
     revision_round: int = 0
     created_at: datetime

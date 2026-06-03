@@ -1194,6 +1194,12 @@ QA 分两步：
 2. 再把报告 Markdown 和本地规则问题交给 DeepSeek 复核。
 ```
 
+检查范围：
+
+- 首次报告生成和 `rewrite` 返工后，QA scope 是 `full_report`，会检查完整维度正文和全部 Claim。
+- `recollect` / `reanalyze` 返工后，ReportWriter 使用 `partial_revision` 只替换目标维度 section，QA scope 也是 `partial_revision`，只检查本轮返工目标维度的 section 和目标 Claim，不重新评价其它维度。
+- 因此最新 `qa_result.score` 表示最新一次 QA 的检查范围得分；前端和导出报告会显示 `qa_scope_label`，避免把局部返工得分误解成全量重新评分。
+
 输入示例：
 
 ```json
@@ -1221,7 +1227,8 @@ User prompt 模板：
 
 ```text
 请复核这份竞品分析报告是否存在明显逻辑或证据问题。
-仅基于报告和问题列表输出 JSON：
+检查范围：完整报告 / 本轮返工目标维度。
+仅基于下方报告片段和规则检查问题输出 JSON：
 {"passed":true/false,"score":0.0到1.0,"issues":[{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null,"search_query":null}]}
 
 如果 suggested_action 是 recollect，必须提供一条具体 search_query，且 search_query 必须包含相关竞品名称。
@@ -1291,6 +1298,8 @@ qa_result.issues_json
   "issues": [],
   "next_action": "recollect",
   "target_nodes": ["dimension_analysis_core_capabilities_1a2b3c4d"],
+  "qa_scope": "partial_revision",
+  "qa_scope_label": "本轮返工维度",
   "revision_reason": "核心能力证据较弱，需要补采更直接资料。",
   "followup_queries": ["Apify core capabilities official docs", "Bright Data core capabilities official docs"],
   "revision_round": 0
@@ -1874,6 +1883,8 @@ QA Agent 至少检查：
   ],
   "next_action": "recollect",
   "target_nodes": ["dimension_analysis_core_capabilities_1a2b3c4d"],
+  "qa_scope": "partial_revision",
+  "qa_scope_label": "本轮返工维度",
   "revision_reason": "核心能力 Claim 证据强度不足",
   "followup_queries": ["Example core capabilities official docs"],
   "revision_round": 0
@@ -1888,6 +1899,7 @@ QA Agent 至少检查：
 - `reanalyze`：只重跑受影响的目标维度，执行 `目标 dimension_analysis_* -> build_dynamic_knowledge -> report_writer(partial_revision) -> qa`。
 - `rewrite`：整篇重写维度正文，执行 `report_writer(full_write) -> qa`。
 - ReportWriter 有两种模式：`full_write` 用于首次维度正文生成和 `rewrite` 返工；`partial_revision` 用于 `recollect/reanalyze` 后，只替换目标维度 section。
+- QA 也有对应检查范围：`full_report` 会检查完整报告正文和全部 Claim；`partial_revision` 只检查本轮返工目标维度的 section 与 Claim，分数代表本轮局部复核结果。
 - `report_finalizer` 在 QA 通过后执行；如果 QA 未通过但已达到最大返工轮数，也会继续执行，基于当前可用的维度正文生成最终报告，并在执行摘要、总体结论或风险提示中明确标注残留 QA 问题，避免把未通过内容包装成完全可靠结论。
 - `recollect` 和 `reanalyze` 都不会全量重跑所有动态维度 Agent，只重跑 QA 定位到的 `dimension_analysis_*` 节点；如果无法定位目标维度，系统会停止并暴露定位失败原因。
 - `recollect` 模式下 Collector 只使用 `followup_queries`，不会重复执行首次采集时所有维度 query；Evidence Extractor 优先只处理本轮新增 `source_document_ids`。

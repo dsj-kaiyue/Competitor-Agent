@@ -82,6 +82,7 @@ def _qa_markdown(qa_payload: dict | None) -> str:
     passed = "通过" if qa_payload.get("passed") else "未通过"
     score = _format_confidence(qa_payload.get("score"))
     next_action = qa_payload.get("next_action_label") or qa_payload.get("next_action") or "无需返工"
+    qa_scope = qa_payload.get("qa_scope_label") or ("本轮返工维度" if qa_payload.get("qa_scope") == "partial_revision" else "完整报告")
     revision_round = qa_payload.get("revision_round") or 0
     target_nodes = qa_payload.get("target_node_labels") or qa_payload.get("target_nodes") or []
     target_node_text = "；".join(str(item) for item in target_nodes) if target_nodes else "无"
@@ -94,6 +95,7 @@ def _qa_markdown(qa_payload: dict | None) -> str:
             "| --- | --- |",
             f"| QA 结论 | {passed} |",
             f"| QA 评分 | {score} |",
+            f"| 检查范围 | {qa_scope} |",
             f"| 当前返工轮次 | 第 {revision_round} 轮 |",
             f"| 建议处理方式 | {next_action} |",
             f"| 涉及节点/维度 | {_markdown_cell(target_node_text)} |",

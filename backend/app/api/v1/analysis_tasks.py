@@ -127,6 +127,11 @@ QA_ACTION_LABELS = {
     "rewrite": "重写报告",
 }
 
+QA_SCOPE_LABELS = {
+    "full_report": "完整报告",
+    "partial_revision": "本轮返工维度",
+}
+
 QA_SEVERITY_LABELS = {
     "high": "高风险",
     "medium": "中等风险",
@@ -208,6 +213,8 @@ def _normalize_qa_payload(qa_result, db: Session | None = None) -> dict:
             "next_action_label": QA_ACTION_LABELS.get(str(next_action), str(next_action)),
             "target_nodes": target_nodes,
             "target_node_labels": [_qa_node_label(node_key, labels) for node_key in target_nodes],
+            "qa_scope": payload.get("qa_scope") or "full_report",
+            "qa_scope_label": payload.get("qa_scope_label") or QA_SCOPE_LABELS.get(str(payload.get("qa_scope") or "full_report"), "完整报告"),
             "revision_reason": payload.get("revision_reason"),
             "revision_round": payload.get("revision_round") or 0,
         }
@@ -218,6 +225,8 @@ def _normalize_qa_payload(qa_result, db: Session | None = None) -> dict:
         "next_action_label": QA_ACTION_LABELS["end"],
         "target_nodes": [],
         "target_node_labels": [],
+        "qa_scope": "full_report",
+        "qa_scope_label": QA_SCOPE_LABELS["full_report"],
         "revision_reason": None,
         "revision_round": 0,
     }

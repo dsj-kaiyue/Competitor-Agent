@@ -45,6 +45,8 @@ const targetLabels = computed(() => {
   return props.qa?.target_nodes || []
 })
 
+const qaScopeLabel = computed(() => props.qa?.qa_scope_label || (props.qa?.qa_scope === 'partial_revision' ? '本轮返工维度' : '完整报告'))
+
 const revisionReasonItems = computed(() => {
   const reason = props.qa?.revision_reason?.trim()
   if (!reason) return []
@@ -74,7 +76,7 @@ function issueActionLabel(action?: string) {
       <div class="status-mark">{{ qa.passed ? '✓' : '!' }}</div>
       <div>
         <h3>{{ qa.passed ? 'QA 通过' : 'QA 未通过，需要处理' }}</h3>
-        <p>评分 {{ qa.score ?? '-' }} · 第 {{ qa.revision_round ?? 0 }} 轮返工 · {{ actionLabel }}</p>
+        <p>评分 {{ qa.score ?? '-' }} · {{ qaScopeLabel }} · 第 {{ qa.revision_round ?? 0 }} 轮返工 · {{ actionLabel }}</p>
       </div>
     </div>
 
@@ -86,6 +88,10 @@ function issueActionLabel(action?: string) {
       <div class="overview-item">
         <span>QA 评分</span>
         <strong>{{ qa.score ?? '-' }}</strong>
+      </div>
+      <div class="overview-item">
+        <span>检查范围</span>
+        <strong>{{ qaScopeLabel }}</strong>
       </div>
       <div class="overview-item">
         <span>返工轮次</span>
@@ -187,7 +193,7 @@ function issueActionLabel(action?: string) {
 
 .qa-overview {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -231,6 +237,12 @@ function issueActionLabel(action?: string) {
 
 .reason-list li + li {
   margin-top: 6px;
+}
+
+@media (max-width: 1080px) {
+  .qa-overview {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 720px) {

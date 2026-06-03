@@ -1985,17 +1985,82 @@ Claims:
     def qa(node: AgentNode) -> None:
         plan = get_task_plan(task)
         report = db.scalar(select(Report).where(Report.task_id == task_id).order_by(Report.id.desc()))
-        claims = list(db.scalars(select(Claim).where(Claim.task_id == task_id)))
+        all_claims = list(db.scalars(select(Claim).where(Claim.task_id == task_id)))
+        all_nodes = list(db.scalars(select(AgentNode).where(AgentNode.task_id == task_id)))
+        node_key_by_id = {item.id: item.node_key for item in all_nodes}
+        node_by_key = {item.node_key: item for item in all_nodes}
+        qa_target_nodes = [
+            str(node_key)
+            for node_key in state.get("qa_target_nodes", [])
+            if str(node_key).startswith("dimension_analysis_")
+        ]
+        qa_scope = (
+            "partial_revision"
+            if int(state.get("revision_round", 0) or 0) > 0
+            and state.get("report_writer_mode") == "partial_revision"
+            and qa_target_nodes
+            else "full_report"
+        )
+        target_node_ids = {
+            node_by_key[node_key].id
+            for node_key in qa_target_nodes
+            if node_key in node_by_key
+        }
+        claims = [claim for claim in all_claims if claim.agent_node_id in target_node_ids] if qa_scope == "partial_revision" else all_claims
         claim_ids = [claim.id for claim in claims]
         linked = list(db.scalars(select(ClaimEvidence).where(ClaimEvidence.claim_id.in_(claim_ids)))) if claim_ids else []
         linked_claim_ids = {item.claim_id for item in linked}
         evidence_ids_by_claim: dict[int, list[int]] = {}
         for item in linked:
             evidence_ids_by_claim.setdefault(item.claim_id, []).append(item.evidence_chunk_id)
-        node_key_by_id = {node.id: node.node_key for node in db.scalars(select(AgentNode).where(AgentNode.task_id == task_id))}
+
+        target_aliases: set[str] = set(qa_target_nodes)
+        target_dimension_labels: list[str] = []
+        if qa_scope == "partial_revision":
+            specs = _dimension_specs_from_state()
+            for node_key in qa_target_nodes:
+                spec = specs.get(node_key) or {}
+                node_item = node_by_key.get(node_key)
+                label = spec.get("dimension_label") or spec.get("label") or (node_item.node_name if node_item else node_key)
+                if label:
+                    target_dimension_labels.append(str(label))
+                for value in (node_key, node_item.node_name if node_item else None, spec.get("dimension_key"), label):
+                    if value:
+                        target_aliases.add(_normalized_token(value))
+            for claim in claims:
+                for value in (claim.dimension_key, claim.dimension_label, claim.claim_type):
+                    if value:
+                        target_aliases.add(_normalized_token(value))
+
+        report_sections = []
+        if report and isinstance(report.report_json, dict):
+            report_sections = [section for section in report.report_json.get("sections", []) if isinstance(section, dict)]
+        if qa_scope == "partial_revision":
+            target_claim_ids = set(claim_ids)
+            scoped_sections = [
+                section
+                for section in report_sections
+                if (_section_claim_ids(section) & target_claim_ids) or _section_matches_alias(section, target_aliases)
+            ]
+            scoped_report_markdown = (
+                _render_report_markdown(
+                    {
+                        "title": report.title if report else f"{plan.topic}报告",
+                        "sections": scoped_sections,
+                    }
+                )
+                if scoped_sections
+                else ""
+            )
+        else:
+            scoped_sections = report_sections
+            scoped_report_markdown = report.content_markdown if report else ""
+
         issues = []
         for failure in state.get("dimension_failures", []):
             if not isinstance(failure, dict):
+                continue
+            if qa_scope == "partial_revision" and failure.get("node_key") not in qa_target_nodes:
                 continue
             failed_node = db.scalar(
                 select(AgentNode).where(AgentNode.task_id == task_id, AgentNode.node_key == failure.get("node_key"))
@@ -2039,13 +2104,15 @@ Claims:
                     }
                 )
         if report:
-            missing_dimensions = [dim for dim in plan.analysis_dimensions if dim not in report.content_markdown]
+            dimensions_to_check = target_dimension_labels if qa_scope == "partial_revision" else plan.analysis_dimensions
+            missing_dimensions = [dim for dim in dimensions_to_check if dim and dim not in scoped_report_markdown]
             if missing_dimensions:
                 issues.append({"type": "schema_incomplete", "severity": "medium", "message": f"报告可能未显式覆盖维度：{', '.join(missing_dimensions)}", "related_claim_id": None, "suggested_action": "rewrite"})
-            if not report.content_markdown or len(report.content_markdown) < 500 or "##" not in report.content_markdown:
+            if not scoped_report_markdown or len(scoped_report_markdown) < 300 or "##" not in scoped_report_markdown:
                 issues.append({"type": "writing_issue", "severity": "high", "message": "报告为空、过短或缺少结构化章节", "suggested_action": "rewrite"})
         if not claims:
-            issues.append({"type": "schema_incomplete", "severity": "high", "message": "所有动态维度 Agent 都未生成 Claim", "related_claim_id": None, "suggested_action": "reanalyze"})
+            message = "目标返工维度未生成 Claim" if qa_scope == "partial_revision" else "所有动态维度 Agent 都未生成 Claim"
+            issues.append({"type": "schema_incomplete", "severity": "high", "message": message, "related_claim_id": None, "suggested_action": "reanalyze"})
         dimension_targets = [
             {
                 "target_node": node_key,
@@ -2056,22 +2123,24 @@ Claims:
         ]
         qa_prompt = f"""
 请复核这份竞品分析报告是否存在明显逻辑或证据问题。
-仅基于报告和问题列表输出 JSON：
+检查范围：{"仅检查本轮返工的目标维度 section 与目标 Claim" if qa_scope == "partial_revision" else "检查全部分析维度正文与全部 Claim"}
+仅基于下方报告片段和规则检查问题输出 JSON：
 {{"passed":true/false,"score":0.0到1.0,"issues":[{{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null,"search_query":null}}]}}
 
 如果 suggested_action 是 recollect，必须提供一条具体 search_query，且 search_query 必须包含相关竞品名称。
 如果 suggested_action 是 recollect 或 reanalyze，并且问题能定位到某个动态维度，target_node 必须填写下面可用动态维度节点中的 target_node，不要填写 collector。
+如果检查范围是本轮返工目标维度，不要评价未出现在报告片段或规则检查问题里的其它维度。
 
 可用动态维度节点：
 {json.dumps(dimension_targets, ensure_ascii=False)}
 
 报告：
-{(report.content_markdown if report else '')[:6000]}
+{scoped_report_markdown[:6000]}
 
 规则检查问题：
 {json.dumps(issues, ensure_ascii=False)}
 """
-        _console("qa llm review started", {"task_id": task_id, "rule_issue_count": len(issues)})
+        _console("qa llm review started", {"task_id": task_id, "rule_issue_count": len(issues), "qa_scope": qa_scope, "target_nodes": qa_target_nodes})
         try:
             qa_json = _json_from_text(llm.complete(qa_prompt, system="你只输出合法 JSON。"))
             llm_issues = qa_json.get("issues", []) if isinstance(qa_json, dict) else []
@@ -2104,6 +2173,8 @@ Claims:
             "issues": issues,
             "next_action": next_action,
             "target_nodes": target_nodes,
+            "qa_scope": qa_scope,
+            "qa_scope_label": "本轮返工维度" if qa_scope == "partial_revision" else "完整报告",
             "revision_reason": "；".join(issue.get("message", "") for issue in issues[:4]) or None,
             "followup_queries": followup_queries,
             "revision_round": state.get("revision_round", 0),

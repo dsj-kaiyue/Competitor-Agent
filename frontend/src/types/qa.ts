@@ -25,6 +25,8 @@ export interface QAResult {
   next_action_label?: string
   target_nodes?: string[]
   target_node_labels?: string[]
+  qa_scope?: string
+  qa_scope_label?: string
   revision_reason?: string | null
   revision_round?: number
   created_at: string

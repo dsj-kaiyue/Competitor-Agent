@@ -31,6 +31,14 @@ export interface ReportQualitySummary {
   blockers?: string[]
 }
 
+export interface ReportFinalizerQa {
+  passed?: boolean
+  score?: number | string | null
+  issues?: Record<string, unknown>[]
+  revision_round?: number
+  pass_threshold?: number | string | null
+}
+
 export interface ReportItem {
   id: number
   task_id: number
@@ -42,7 +50,7 @@ export interface ReportItem {
     sections?: ReportSection[]
     quality_summary?: ReportQualitySummary
     dimension_qa_scores?: DimensionQAScore[]
-    finalizer_qa?: Record<string, unknown>
+    finalizer_qa?: ReportFinalizerQa
     [key: string]: unknown
   } | null
   created_at: string

@@ -1,8 +1,37 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import type { QAIssue, QAResult } from '@/types/qa'
+import type { ReportItem } from '@/types/report'
 
-const props = defineProps<{ qa: QAResult | null }>()
+interface DimensionQaRoundRow {
+  row_key: string
+  created_at: string
+  revision_round: number
+  display_round: number
+  qa_scope_label: string
+  dimension_label: string
+  dimension_keys?: string[]
+  score: number | string
+  passed: boolean
+  suggestion: string
+}
+
+interface DimensionQaRoundGroup {
+  key: string
+  revision_round: number
+  display_round: number
+  created_at: string
+  qa_scope_label: string
+  passed_count: number
+  total_count: number
+  rows: DimensionQaRoundRow[]
+}
+
+const props = defineProps<{
+  qa: QAResult | null
+  report?: ReportItem | null
+  dimensionQaRoundGroups?: DimensionQaRoundGroup[]
+}>()
 
 const severityType: Record<string, 'danger' | 'warning' | 'info'> = {
   high: 'danger',
@@ -47,9 +76,39 @@ const targetLabels = computed(() => {
 
 const qaScopeLabel = computed(() => props.qa?.qa_scope_label || (props.qa?.qa_scope === 'partial_revision' ? '本轮返工维度' : '完整报告'))
 
-const dimensionScores = computed(() => props.qa?.dimension_scores || [])
+const latestDimensionRows = computed<DimensionQaRoundRow[]>(() => {
+  const latestByDimension = new Map<string, DimensionQaRoundRow>()
+  for (const group of props.dimensionQaRoundGroups || []) {
+    for (const row of group.rows) {
+      const dimensionKey = row.dimension_keys?.[0] || row.dimension_label
+      if (!latestByDimension.has(dimensionKey)) {
+        latestByDimension.set(dimensionKey, row)
+      }
+    }
+  }
+  if (latestByDimension.size) {
+    return [...latestByDimension.values()].sort((a, b) => a.dimension_label.localeCompare(b.dimension_label, 'zh-Hans-CN'))
+  }
+  return (props.qa?.dimension_scores || []).map((score, index) => ({
+    row_key: `latest-${score.target_node || score.dimension_key || score.dimension_label || index}`,
+    created_at: props.qa?.created_at || '',
+    revision_round: Number(score.revision_round ?? props.qa?.revision_round ?? 0),
+    display_round: displayRevisionRound(Number(score.revision_round ?? props.qa?.revision_round ?? 0)),
+    qa_scope_label: score.qa_scope_label || score.qa_scope || qaScopeLabel.value,
+    dimension_label: score.dimension_label || score.dimension_key || score.target_node,
+    dimension_keys: [score.target_node, score.dimension_key, score.dimension_label].filter((value): value is string => Boolean(value)),
+    score: score.score ?? '-',
+    passed: Boolean(score.passed),
+    suggestion: score.issues?.[0]?.suggested_action_label || issueActionLabel(score.issues?.[0]?.suggested_action),
+  }))
+})
+const qualitySummary = computed(() => props.report?.report_json?.quality_summary || null)
+const finalizerQa = computed(() => props.report?.report_json?.finalizer_qa || null)
+const finalizerIssues = computed(() => finalizerQa.value?.issues || [])
 const activeIssueGroups = ref<string[]>([])
 const issueGroupsInitializedForQa = ref<number | null>(null)
+const activeHistoryRounds = ref<string[]>([])
+const historyRoundsInitialized = ref(false)
 
 const revisionReasonItems = computed(() => {
   const reason = props.qa?.revision_reason?.trim()
@@ -74,6 +133,14 @@ function issueActionLabel(action?: string) {
 
 function displayRevisionRound(value?: number | null) {
   return Math.max(1, Number(value ?? 0) + 1)
+}
+
+function finalizerRound(value?: number | null) {
+  return Math.max(1, Number(value ?? 0) + 1)
+}
+
+function statusTagType(passed?: boolean | null) {
+  return passed ? 'success' : 'warning'
 }
 
 function issueDimensionLabel(issue: QAIssue) {
@@ -123,7 +190,7 @@ watch(
       return
     }
     if (issueGroupsInitializedForQa.value !== props.qa.id) {
-      activeIssueGroups.value = groups.map((group) => group.key)
+      activeIssueGroups.value = []
       issueGroupsInitializedForQa.value = props.qa.id
       return
     }
@@ -132,56 +199,103 @@ watch(
   },
   { immediate: true },
 )
+
+watch(
+  () => props.dimensionQaRoundGroups || [],
+  (groups) => {
+    if (!groups.length) {
+      activeHistoryRounds.value = []
+      historyRoundsInitialized.value = false
+      return
+    }
+    if (!historyRoundsInitialized.value) {
+      activeHistoryRounds.value = [groups[0]?.key || '']
+      historyRoundsInitialized.value = true
+      return
+    }
+    const validKeys = new Set(groups.map((group) => group.key))
+    activeHistoryRounds.value = activeHistoryRounds.value.filter((key) => validKeys.has(key))
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
-  <el-empty v-if="!qa" description="暂无 QA 结果" />
+  <el-empty v-if="!qa && !qualitySummary" description="暂无 QA 结果" />
   <div v-else class="qa-panel">
-    <div class="qa-summary" :class="{ passed: qa.passed }">
-      <div class="status-mark">{{ qa.passed ? '✓' : '!' }}</div>
-      <div>
-        <h3>{{ qa.passed ? 'QA 通过' : 'QA 未通过，需要处理' }}</h3>
-        <p>评分 {{ qa.score ?? '-' }} · {{ qaScopeLabel }} · 第 {{ displayRevisionRound(qa.revision_round) }} 轮返工 · {{ actionLabel }}</p>
+    <div v-if="qualitySummary" class="qa-section">
+      <div class="section-heading">
+        <h3>最终报告结果</h3>
+        <el-tag :type="qualitySummary.final_status === '通过' ? 'success' : 'warning'">
+          {{ qualitySummary.final_status || '未通过' }}
+        </el-tag>
       </div>
-    </div>
-
-    <div class="qa-overview">
-      <div class="overview-item">
-        <span>QA 结论</span>
-        <strong>{{ qa.passed ? '通过' : '未通过' }}</strong>
+      <div class="qa-overview">
+        <div class="overview-item">
+          <span>最终结果</span>
+          <strong>{{ qualitySummary.final_status || '-' }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>最终分数</span>
+          <strong>{{ qualitySummary.final_score ?? '-' }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>维度 QA 均分</span>
+          <strong>{{ qualitySummary.dimension_avg ?? '-' }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>总结 QA 分数</span>
+          <strong>{{ qualitySummary.finalizer_score ?? '-' }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>分数构成</span>
+          <strong>{{ qualitySummary.dimension_weight ?? 0.7 }} / {{ qualitySummary.finalizer_weight ?? 0.3 }}</strong>
+        </div>
       </div>
-      <div class="overview-item">
-        <span>QA 评分</span>
-        <strong>{{ qa.score ?? '-' }}</strong>
-      </div>
-      <div class="overview-item">
-        <span>检查范围</span>
-        <strong>{{ qaScopeLabel }}</strong>
-      </div>
-      <div class="overview-item">
-        <span>返工轮次</span>
-        <strong>第 {{ displayRevisionRound(qa.revision_round) }} 轮</strong>
-      </div>
-      <div class="overview-item">
-        <span>建议处理</span>
-        <strong>{{ actionLabel }}</strong>
-      </div>
-    </div>
-
-    <div v-if="targetLabels.length" class="qa-section">
-      <div class="section-title">涉及节点/维度</div>
-      <div class="target-list">
-        <el-tag v-for="node in targetLabels" :key="node" type="warning" effect="plain">
-          {{ node }}
+      <div v-if="qualitySummary.blockers?.length" class="target-list">
+        <el-tag v-for="blocker in qualitySummary.blockers" :key="blocker" type="danger" effect="plain">
+          {{ blocker }}
         </el-tag>
       </div>
     </div>
 
-    <div v-if="dimensionScores.length" class="qa-section">
-      <div class="section-title">每维 QA 分数</div>
-      <el-table :data="dimensionScores" border>
+    <div v-if="qa" class="qa-section qa-card">
+      <div class="section-heading">
+        <h3>分析维度 QA</h3>
+        <el-tag :type="statusTagType(qa.passed)">{{ qa.passed ? '通过' : '未通过' }}</el-tag>
+      </div>
+      <div class="qa-overview">
+        <div class="overview-item">
+          <span>检查范围</span>
+          <strong>{{ qaScopeLabel }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>最新轮次分数</span>
+          <strong>{{ qa.score ?? '-' }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>最新轮次结果</span>
+          <strong>{{ qa.passed ? '通过' : '未通过' }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>返工轮次</span>
+          <strong>第 {{ displayRevisionRound(qa.revision_round) }} 轮</strong>
+        </div>
+        <div class="overview-item">
+          <span>建议处理</span>
+          <strong>{{ actionLabel }}</strong>
+        </div>
+      </div>
+
+      <div v-if="targetLabels.length" class="target-list">
+        <el-tag v-for="node in targetLabels" :key="node" type="warning" effect="plain">
+          {{ node }}
+        </el-tag>
+      </div>
+
+      <el-table v-if="latestDimensionRows.length" :data="latestDimensionRows" border>
         <el-table-column label="维度">
-          <template #default="{ row }">{{ row.dimension_label || row.dimension_key || row.target_node }}</template>
+          <template #default="{ row }">{{ row.dimension_label }}</template>
         </el-table-column>
         <el-table-column label="分数" width="100">
           <template #default="{ row }">{{ row.score ?? '-' }}</template>
@@ -193,55 +307,126 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="检查范围" width="150">
-          <template #default="{ row }">{{ row.qa_scope_label || row.qa_scope || '-' }}</template>
+        <el-table-column label="来源轮次" width="120">
+          <template #default="{ row }">第 {{ row.display_round }} 轮</template>
         </el-table-column>
-        <el-table-column label="轮次" width="100">
-          <template #default="{ row }">第 {{ displayRevisionRound(row.revision_round) }} 轮</template>
+        <el-table-column label="返工建议" min-width="140">
+          <template #default="{ row }">{{ row.suggestion || '-' }}</template>
         </el-table-column>
       </el-table>
-    </div>
 
-    <div v-if="revisionReasonItems.length && !qa.issues.length" class="qa-section">
-      <div class="section-title">返工原因</div>
-      <ol class="reason-list">
-        <li v-for="(reason, index) in revisionReasonItems" :key="`${index}-${reason}`">
-          {{ reason }}
-        </li>
-      </ol>
-    </div>
+      <div v-if="revisionReasonItems.length && !qa.issues.length">
+        <div class="section-title">返工原因</div>
+        <ol class="reason-list">
+          <li v-for="(reason, index) in revisionReasonItems" :key="`${index}-${reason}`">
+            {{ reason }}
+          </li>
+        </ol>
+      </div>
 
-    <div v-if="issueGroups.length" class="qa-section">
-      <div class="section-title">QA 问题</div>
-      <el-collapse v-model="activeIssueGroups" class="issue-collapse">
-        <el-collapse-item v-for="group in issueGroups" :key="group.key" :name="group.key">
-          <template #title>
-            <div class="issue-group-title">
-              <strong>{{ group.label }}</strong>
-              <el-tag :type="issueGroupTagType(group.maxSeverity)" size="small" effect="plain">
-                {{ issueSeverityLabel(group.maxSeverity) }}
-              </el-tag>
-              <span>{{ group.issues.length }} 个问题</span>
-            </div>
-          </template>
-          <el-table :data="group.issues" border>
-            <el-table-column label="级别" width="110">
-              <template #default="{ row }">
-                <el-tag :type="severityType[row.severity] || 'info'" size="small">
-                  {{ row.severity_label || issueSeverityLabel(row.severity) }}
+      <div v-if="issueGroups.length">
+        <div class="section-title">维度问题</div>
+        <el-collapse v-model="activeIssueGroups" class="issue-collapse">
+          <el-collapse-item v-for="group in issueGroups" :key="group.key" :name="group.key">
+            <template #title>
+              <div class="issue-group-title">
+                <strong>{{ group.label }}</strong>
+                <el-tag :type="issueGroupTagType(group.maxSeverity)" size="small" effect="plain">
+                  {{ issueSeverityLabel(group.maxSeverity) }}
                 </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="类型" width="150">
-              <template #default="{ row }">{{ row.type_label || issueTypeLabel(row.type) }}</template>
-            </el-table-column>
-            <el-table-column prop="message" label="问题" />
-            <el-table-column label="建议" width="140">
-              <template #default="{ row }">{{ row.suggested_action_label || issueActionLabel(row.suggested_action) }}</template>
-            </el-table-column>
-          </el-table>
-        </el-collapse-item>
-      </el-collapse>
+                <span>{{ group.issues.length }} 个问题</span>
+              </div>
+            </template>
+            <el-table :data="group.issues" border>
+              <el-table-column label="级别" width="110">
+                <template #default="{ row }">
+                  <el-tag :type="severityType[row.severity] || 'info'" size="small">
+                    {{ row.severity_label || issueSeverityLabel(row.severity) }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="类型" width="150">
+                <template #default="{ row }">{{ row.type_label || issueTypeLabel(row.type) }}</template>
+              </el-table-column>
+              <el-table-column prop="message" label="问题" />
+              <el-table-column label="建议" width="140">
+                <template #default="{ row }">{{ row.suggested_action_label || issueActionLabel(row.suggested_action) }}</template>
+              </el-table-column>
+            </el-table>
+          </el-collapse-item>
+        </el-collapse>
+      </div>
+
+      <div v-if="dimensionQaRoundGroups?.length">
+        <div class="section-title">每轮每维 QA 得分</div>
+        <el-collapse v-model="activeHistoryRounds" class="qa-round-collapse">
+          <el-collapse-item v-for="group in dimensionQaRoundGroups" :key="group.key" :name="group.key">
+            <template #title>
+              <div class="qa-round-title">
+                <strong>第 {{ group.display_round }} 轮</strong>
+                <el-tag :type="group.passed_count === group.total_count ? 'success' : 'warning'" size="small">
+                  {{ group.passed_count }}/{{ group.total_count }} 通过
+                </el-tag>
+                <span>{{ group.qa_scope_label }}</span>
+              </div>
+            </template>
+            <el-table :data="group.rows" border>
+              <el-table-column prop="dimension_label" label="维度" min-width="180" />
+              <el-table-column label="分数" width="100">
+                <template #default="{ row }">{{ row.score }}</template>
+              </el-table-column>
+              <el-table-column label="状态" width="100">
+                <template #default="{ row }">
+                  <el-tag :type="row.passed ? 'success' : 'warning'" size="small">
+                    {{ row.passed ? '通过' : '未通过' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="返工建议" min-width="160">
+                <template #default="{ row }">{{ row.suggestion }}</template>
+              </el-table-column>
+              <el-table-column prop="qa_scope_label" label="检查范围" width="150" />
+            </el-table>
+          </el-collapse-item>
+        </el-collapse>
+      </div>
+    </div>
+
+    <div v-if="finalizerQa || qualitySummary" class="qa-section qa-card">
+      <div class="section-heading">
+        <h3>报告总结 Agent QA</h3>
+        <el-tag :type="qualitySummary?.finalizer_grounding_status === '通过' || finalizerQa?.passed ? 'success' : 'warning'">
+          {{ qualitySummary?.finalizer_grounding_status || (finalizerQa?.passed ? '通过' : '未通过') }}
+        </el-tag>
+      </div>
+      <div class="qa-overview">
+        <div class="overview-item">
+          <span>总结 QA 结果</span>
+          <strong>{{ qualitySummary?.finalizer_grounding_status || (finalizerQa?.passed ? '通过' : '未通过') }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>总结 QA 分数</span>
+          <strong>{{ finalizerQa?.score ?? qualitySummary?.finalizer_score ?? '-' }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>通过门槛</span>
+          <strong>{{ finalizerQa?.pass_threshold ?? qualitySummary?.finalizer_pass_threshold ?? '-' }}</strong>
+        </div>
+        <div class="overview-item">
+          <span>内部轮次</span>
+          <strong>第 {{ finalizerRound(finalizerQa?.revision_round) }} 轮</strong>
+        </div>
+      </div>
+      <el-table v-if="finalizerIssues.length" :data="finalizerIssues" border>
+        <el-table-column label="级别" width="110">
+          <template #default="{ row }">
+            <el-tag :type="severityType[row.severity] || 'info'" size="small">
+              {{ issueSeverityLabel(row.severity) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="message" label="问题" />
+      </el-table>
     </div>
   </div>
 </template>
@@ -344,6 +529,29 @@ watch(
 
 .issue-collapse {
   border-top: 1px solid var(--el-border-color-light);
+}
+
+.qa-round-collapse {
+  border-top: 1px solid var(--el-border-color-light);
+}
+
+.qa-round-title {
+  display: grid;
+  width: 100%;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.qa-round-title strong {
+  color: var(--el-text-color-primary);
+}
+
+.qa-round-title span {
+  overflow: hidden;
+  color: var(--el-text-color-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .issue-group-title {

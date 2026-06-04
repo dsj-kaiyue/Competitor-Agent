@@ -12,6 +12,7 @@ import {
   getTaskLogs,
   getTaskNodes,
   getTaskQaHistory,
+  getTaskReport,
   pauseAnalysisTask,
   resumeAnalysisTask,
   retryAnalysisTask,
@@ -20,6 +21,7 @@ import type { AgentLog, AgentNode, DagEdge } from '@/types/agentNode'
 import type { AnalysisTask } from '@/types/analysisTask'
 import type { TaskMetrics } from '@/types/metrics'
 import type { QAResult } from '@/types/qa'
+import type { ReportItem } from '@/types/report'
 
 const route = useRoute()
 const taskId = Number(route.params.id)
@@ -29,6 +31,7 @@ const edges = ref<DagEdge[]>([])
 const logs = ref<AgentLog[]>([])
 const metrics = ref<TaskMetrics | null>(null)
 const qaHistory = ref<QAResult[]>([])
+const report = ref<ReportItem | null>(null)
 const activeQaRounds = ref<string[]>([])
 const activeLogRounds = ref<string[]>([])
 const activeLogAgentGroups = ref<string[]>([])
@@ -316,6 +319,7 @@ function formatDateTime(value: string) {
 function resetDetailStateForRetry() {
   logs.value = []
   qaHistory.value = []
+  report.value = null
   activeQaRounds.value = []
   activeLogRounds.value = []
   activeLogAgentGroups.value = []
@@ -372,6 +376,7 @@ async function load() {
   logs.value = await getTaskLogs(taskId)
   metrics.value = await getTaskMetrics(taskId)
   qaHistory.value = await getTaskQaHistory(taskId)
+  report.value = await getTaskReport(taskId)
 }
 
 async function runControl(action: 'pause' | 'resume' | 'cancel' | 'retry') {
@@ -488,42 +493,7 @@ onBeforeUnmount(() => {
 
     <section class="section">
       <h2>QA 结果</h2>
-      <QaResultPanel :qa="latestQa" />
-      <div class="qa-history">
-        <h3>每轮每维 QA 得分</h3>
-        <el-empty v-if="!dimensionQaRoundGroups.length" description="暂无每维 QA 分数" />
-        <el-collapse v-else v-model="activeQaRounds" class="qa-round-collapse">
-          <el-collapse-item v-for="group in dimensionQaRoundGroups" :key="group.key" :name="group.key">
-            <template #title>
-              <div class="qa-round-title">
-                <strong>第 {{ group.display_round }} 轮</strong>
-                <el-tag :type="group.passed_count === group.total_count ? 'success' : 'warning'" size="small">
-                  {{ group.passed_count }}/{{ group.total_count }} 通过
-                </el-tag>
-                <span>{{ group.qa_scope_label }}</span>
-                <time>{{ formatDateTime(group.created_at) }}</time>
-              </div>
-            </template>
-            <el-table :data="group.rows" border>
-              <el-table-column prop="dimension_label" label="维度" min-width="180" />
-              <el-table-column label="分数" width="100">
-                <template #default="{ row }">{{ row.score }}</template>
-              </el-table-column>
-              <el-table-column label="状态" width="100">
-                <template #default="{ row }">
-                  <el-tag :type="row.passed ? 'success' : 'warning'" size="small">
-                    {{ row.passed ? '通过' : '未通过' }}
-                  </el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="返工建议" min-width="160">
-                <template #default="{ row }">{{ row.suggestion }}</template>
-              </el-table-column>
-              <el-table-column prop="qa_scope_label" label="检查范围" width="150" />
-            </el-table>
-          </el-collapse-item>
-        </el-collapse>
-      </div>
+      <QaResultPanel :qa="latestQa" :report="report" :dimension-qa-round-groups="dimensionQaRoundGroups" />
     </section>
 
     <TaskMetricsPanel :metrics="metrics" />

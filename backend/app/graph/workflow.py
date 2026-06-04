@@ -1129,6 +1129,8 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         }
         seen_urls: set[str] = set(existing_urls)
         collector_mode = str(state.get("collector_mode") or "normal")
+        state["source_document_ids"] = []
+        state["recollect_no_new_documents"] = False
         dimension_specs = state.get("dimension_prompt_specs") or {}
         max_results_per_query = max(1, int(settings.firecrawl_search_results_per_query))
         max_urls_per_competitor = int(settings.firecrawl_max_urls_per_competitor)
@@ -1279,6 +1281,19 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
                     add_log(db, task_id, node.id, "Firecrawl scrape saved", {"url": url, "source_document_id": doc.id})
                     db.commit()
         if not saved_ids:
+            if collector_mode == "recollect":
+                state["recollect_no_new_documents"] = True
+                node.output_summary = "recollect 模式未采集到新的 source_document，后续将使用已有证据继续返工"
+                add_log(
+                    db,
+                    task_id,
+                    node.id,
+                    "Recollect produced no new source documents; continuing with existing evidence",
+                    {"mode": collector_mode, "followup_query_count": len(state.get("qa_followup_queries", []) or [])},
+                    log_type="warning",
+                )
+                db.commit()
+                return
             raise RuntimeError("Firecrawl did not return any usable source documents")
         node.output_summary = f"{collector_mode} 模式真实采集并保存 {len(saved_ids)} 份新增 source_document"
         state["source_document_ids"] = saved_ids
@@ -1286,6 +1301,19 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
     def evidence_extractor(node: AgentNode) -> None:
         stage_started = perf_counter()
         source_document_ids = [int(doc_id) for doc_id in state.get("source_document_ids", []) if str(doc_id).isdigit()]
+        if state.get("collector_mode") == "recollect" and state.get("recollect_no_new_documents") and not source_document_ids:
+            state["evidence_chunk_ids"] = []
+            node.output_summary = "recollect 模式没有新增 source_document，已跳过新增 evidence 抽取"
+            add_log(
+                db,
+                task_id,
+                node.id,
+                "Evidence extractor skipped because recollect produced no new documents",
+                {"mode": "recollect"},
+                log_type="warning",
+            )
+            db.commit()
+            return
         if source_document_ids:
             docs = list(
                 db.scalars(

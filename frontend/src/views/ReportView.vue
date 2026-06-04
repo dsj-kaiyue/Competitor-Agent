@@ -242,24 +242,28 @@ async function handleExport(format: 'markdown' | 'pdf') {
 .page,
 .section {
   display: grid;
-  gap: 18px;
+  gap: 22px;
 }
 
 .report-json,
 .report-section,
 .paragraph-block {
   display: grid;
-  gap: 14px;
+  gap: 16px;
 }
 
 .report-section {
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
+  padding: 24px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
 }
 
 .paragraph-block > p {
   margin: 0;
-  line-height: 1.8;
+  color: var(--ca-ink);
+  font-size: 17px;
+  line-height: 1.72;
 }
 
 .provenance {
@@ -298,6 +302,7 @@ async function handleExport(format: 'markdown' | 'pdf') {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  padding: 28px 0 8px;
 }
 
 .toolbar-actions {
@@ -309,9 +314,11 @@ async function handleExport(format: 'markdown' | 'pdf') {
 
 .quality-section {
   display: grid;
-  gap: 14px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
+  gap: 16px;
+  padding: 24px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
 }
 
 .quality-header {
@@ -330,10 +337,10 @@ async function handleExport(format: 'markdown' | 'pdf') {
 .quality-item {
   display: grid;
   gap: 4px;
-  padding: 12px;
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
-  background: var(--el-fill-color-blank);
+  padding: 16px;
+  border: 1px solid var(--ca-divider-soft);
+  border-radius: 14px;
+  background: var(--ca-pearl);
 }
 
 .quality-item span {
@@ -343,7 +350,8 @@ async function handleExport(format: 'markdown' | 'pdf') {
 
 .quality-item strong {
   color: var(--el-text-color-primary);
-  font-size: 15px;
+  font-size: 18px;
+  font-weight: 600;
 }
 
 .quality-blockers {
@@ -365,20 +373,34 @@ p {
 }
 
 h1 {
-  font-size: 22px;
+  color: var(--ca-ink);
+  font-size: 34px;
+  font-weight: 600;
+  line-height: 1.14;
+  letter-spacing: 0;
 }
 
 h2 {
-  font-size: 18px;
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
 }
 
 h3 {
-  font-size: 15px;
+  font-size: 17px;
+  font-weight: 600;
 }
 
 p {
-  margin-top: 6px;
+  margin-top: 8px;
   color: var(--el-text-color-secondary);
+}
+
+.section {
+  padding: 24px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
 }
 
 @media (max-width: 760px) {
@@ -397,6 +419,10 @@ p {
 
   .toolbar-actions {
     width: 100%;
+  }
+
+  h1 {
+    font-size: 28px;
   }
 }
 </style>

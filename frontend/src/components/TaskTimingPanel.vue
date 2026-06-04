@@ -236,6 +236,13 @@ function barWidth(value: number) {
   gap: 18px;
 }
 
+.timing-shell {
+  padding: 22px 24px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
+}
+
 header,
 .timing-label,
 .attempt-panel {
@@ -254,10 +261,10 @@ header,
 .summary-item,
 .attempt-panel,
 .timing-panel {
-  padding: 14px 16px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 8px;
-  background: #fff;
+  padding: 16px;
+  border: 1px solid var(--ca-divider-soft);
+  border-radius: 14px;
+  background: var(--ca-pearl);
 }
 
 .attempt-select {
@@ -277,7 +284,10 @@ p,
 }
 
 .summary-item strong {
-  font-size: 20px;
+  color: var(--ca-ink);
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.1;
 }
 
 .timing-row {
@@ -305,11 +315,13 @@ p {
 }
 
 h2 {
-  font-size: 18px;
+  font-size: 24px;
+  font-weight: 600;
 }
 
 h3 {
-  font-size: 15px;
+  font-size: 17px;
+  font-weight: 600;
 }
 
 @media (max-width: 760px) {

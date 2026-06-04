@@ -51,7 +51,7 @@ onMounted(load)
 <style scoped>
 .page {
   display: grid;
-  gap: 18px;
+  gap: 22px;
 }
 
 .toolbar,
@@ -64,6 +64,14 @@ onMounted(load)
 
 .filters {
   justify-content: flex-start;
+  padding: 18px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
+}
+
+.toolbar {
+  padding: 28px 0 8px;
 }
 
 h1,
@@ -72,11 +80,28 @@ p {
 }
 
 h1 {
-  font-size: 22px;
+  color: var(--ca-ink);
+  font-size: 34px;
+  font-weight: 600;
+  line-height: 1.14;
+  letter-spacing: 0;
 }
 
 p {
-  margin-top: 6px;
+  margin-top: 8px;
   color: var(--el-text-color-secondary);
+  font-size: 17px;
+}
+
+@media (max-width: 760px) {
+  .toolbar,
+  .filters {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  h1 {
+    font-size: 28px;
+  }
 }
 </style>

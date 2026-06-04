@@ -109,7 +109,7 @@ onMounted(loadHistory)
 <style scoped>
 .page {
   display: grid;
-  gap: 18px;
+  gap: 22px;
 }
 
 .toolbar,
@@ -124,6 +124,7 @@ onMounted(loadHistory)
 
 .toolbar {
   justify-content: space-between;
+  padding: 28px 0 12px;
 }
 
 .actions,
@@ -134,16 +135,16 @@ onMounted(loadHistory)
 
 .task-list {
   display: grid;
-  gap: 12px;
+  gap: 14px;
 }
 
 .task-card {
   display: grid;
-  gap: 12px;
-  padding: 16px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 8px;
-  background: #fff;
+  gap: 14px;
+  padding: 22px 24px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
 }
 
 .task-main {
@@ -158,7 +159,10 @@ onMounted(loadHistory)
 .task-title strong {
   min-width: 0;
   overflow: hidden;
-  font-size: 16px;
+  color: var(--ca-ink);
+  font-size: 21px;
+  font-weight: 600;
+  line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -168,6 +172,8 @@ onMounted(loadHistory)
   margin: 0;
   overflow: hidden;
   color: var(--el-text-color-regular);
+  font-size: 17px;
+  line-height: 1.47;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
@@ -177,7 +183,7 @@ onMounted(loadHistory)
   flex-wrap: wrap;
   gap: 12px;
   color: var(--el-text-color-secondary);
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .node-strip {
@@ -190,11 +196,11 @@ onMounted(loadHistory)
   display: block;
   height: 8px;
   border-radius: 999px;
-  background: #c0c4cc;
+  background: #d2d2d7;
 }
 
 .node-dot.running {
-  background: #409eff;
+  background: var(--ca-primary);
 }
 
 .node-dot.success {
@@ -223,12 +229,18 @@ p {
 }
 
 h1 {
-  font-size: 24px;
+  color: var(--ca-ink);
+  font-size: 40px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: 0;
 }
 
 .toolbar p {
-  margin-top: 6px;
+  margin-top: 10px;
   color: var(--el-text-color-secondary);
+  font-size: 21px;
+  line-height: 1.35;
 }
 
 @media (max-width: 760px) {
@@ -236,6 +248,14 @@ h1 {
   .task-title {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  h1 {
+    font-size: 30px;
+  }
+
+  .toolbar p {
+    font-size: 17px;
   }
 }
 </style>

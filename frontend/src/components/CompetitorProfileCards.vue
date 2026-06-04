@@ -41,16 +41,16 @@ function formatValue(data?: ProfileFieldData) {
 .profile-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 12px;
+  gap: 14px;
 }
 
 .profile-card {
   display: grid;
-  gap: 12px;
-  padding: 14px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 8px;
-  background: #fff;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
 }
 
 header {
@@ -73,7 +73,8 @@ dl {
 
 dt {
   color: var(--el-text-color-primary);
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 600;
 }
 
 dd {
@@ -81,7 +82,7 @@ dd {
   gap: 6px;
   margin: 0;
   color: var(--el-text-color-secondary);
-  line-height: 1.65;
+  line-height: 1.55;
 }
 
 .field-meta {

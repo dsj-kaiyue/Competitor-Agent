@@ -82,20 +82,39 @@ function removeDimension(index: number) {
   width: 100%;
 }
 
+.task-plan-form :deep(.el-form-item__label) {
+  color: var(--ca-muted-strong);
+  font-size: 14px;
+  font-weight: 600;
+}
+
 .chip-editor {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
   width: 100%;
 }
 
 .chip-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--ca-divider-soft);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-pearl);
 }
 
 .chip-input {
-  width: 190px;
+  min-width: 0;
+  flex: 1;
+}
+
+@media (max-width: 760px) {
+  .task-plan-form :deep(.el-col) {
+    max-width: 100%;
+    flex: 0 0 100%;
+  }
 }
 </style>

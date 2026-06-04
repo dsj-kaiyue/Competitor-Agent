@@ -179,7 +179,9 @@ async function handleCreate() {
       </div>
     </section>
 
-    <el-input v-model="userInput" type="textarea" :rows="5" resize="none" />
+    <section class="prompt-card">
+      <el-input v-model="userInput" type="textarea" :rows="6" resize="none" />
+    </section>
 
     <el-alert v-if="lastError" :title="lastError" type="error" show-icon :closable="false" />
 
@@ -198,7 +200,7 @@ async function handleCreate() {
 <style scoped>
 .page {
   display: grid;
-  gap: 20px;
+  gap: 24px;
 }
 
 .toolbar,
@@ -214,6 +216,10 @@ async function handleCreate() {
   justify-content: space-between;
 }
 
+.toolbar {
+  padding: 56px 0 40px;
+}
+
 h1,
 h2,
 p {
@@ -221,25 +227,84 @@ p {
 }
 
 h1 {
-  font-size: 24px;
+  max-width: 720px;
+  color: var(--ca-ink);
+  font-size: 46px;
+  font-weight: 600;
+  line-height: 1.08;
+  letter-spacing: 0;
 }
 
 h2 {
-  font-size: 18px;
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.16;
 }
 
 p {
-  margin-top: 6px;
+  max-width: 620px;
+  margin-top: 12px;
   color: var(--el-text-color-secondary);
+  font-size: 21px;
+  line-height: 1.35;
 }
 
 .api-base {
+  display: inline-flex;
+  margin-top: 16px;
+  padding: 7px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: var(--ca-radius-pill);
+  background: rgba(255, 255, 255, 0.68);
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace;
   font-size: 12px;
+  line-height: 1.2;
 }
 
 .section {
   display: grid;
   gap: 16px;
+  padding: 24px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
+}
+
+.prompt-card {
+  padding: 24px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
+}
+
+@media (max-width: 900px) {
+  .toolbar,
+  .section-header,
+  .actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .actions {
+    width: 100%;
+  }
+
+  h1 {
+    font-size: 34px;
+  }
+
+  p {
+    font-size: 17px;
+  }
+}
+
+@media (max-width: 520px) {
+  .toolbar {
+    padding: 36px 0 24px;
+  }
+
+  h1 {
+    font-size: 28px;
+  }
 }
 </style>

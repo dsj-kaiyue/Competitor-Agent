@@ -442,14 +442,14 @@ watch(
   align-items: center;
   gap: 14px;
   padding: 16px;
-  border: 1px solid #f3d19e;
-  border-radius: 8px;
-  background: #fdf6ec;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-pearl);
 }
 
 .qa-summary.passed {
-  border-color: #b3e19d;
-  background: #f0f9eb;
+  border-color: var(--ca-hairline);
+  background: var(--ca-pearl);
 }
 
 .status-mark {
@@ -459,9 +459,9 @@ watch(
   flex: 0 0 42px;
   place-items: center;
   border-radius: 50%;
-  background: #e6a23c;
-  color: #fff;
-  font-size: 24px;
+  background: var(--ca-primary);
+  color: #ffffff;
+  font-size: 22px;
   font-weight: 700;
 }
 
@@ -488,10 +488,10 @@ watch(
 .overview-item {
   display: grid;
   gap: 4px;
-  padding: 12px;
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
-  background: var(--el-fill-color-blank);
+  padding: 14px 16px;
+  border: 1px solid var(--ca-divider-soft);
+  border-radius: 14px;
+  background: var(--ca-pearl);
 }
 
 .overview-item span,
@@ -502,12 +502,31 @@ watch(
 
 .overview-item strong {
   color: var(--el-text-color-primary);
-  font-size: 15px;
+  font-size: 17px;
+  font-weight: 600;
 }
 
 .qa-section {
   display: grid;
-  gap: 8px;
+  gap: 14px;
+}
+
+.qa-card {
+  padding-top: 2px;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.section-heading h3 {
+  margin: 0;
+  font-size: 21px;
+  font-weight: 600;
+  line-height: 1.19;
 }
 
 .target-list {

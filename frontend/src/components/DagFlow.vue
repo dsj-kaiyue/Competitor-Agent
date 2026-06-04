@@ -9,8 +9,8 @@ const props = defineProps<{
 }>()
 
 const statusColor: Record<string, string> = {
-  pending: '#909399',
-  running: '#409eff',
+  pending: '#d2d2d7',
+  running: '#0066cc',
   success: '#67c23a',
   failed: '#f56c6c',
   paused: '#e6a23c',
@@ -88,15 +88,14 @@ const flowNodes = computed(() =>
       border: node.revision_highlight
         ? '3px solid #e6a23c'
         : `2px solid ${statusColor[node.status] ?? '#c0c4cc'}`,
-      borderRadius: '8px',
+      borderRadius: '14px',
       width: node.node_type === 'virtual_worker' ? '160px' : node.node_type === 'dimension_analyst' ? '190px' : '210px',
       padding: node.node_type === 'virtual_worker' ? '9px' : '12px',
       whiteSpace: 'pre-line',
       fontSize: node.node_type === 'virtual_worker' ? '12px' : '13px',
       background: node.revision_highlight
         ? '#fff8e8'
-        : node.node_type === 'virtual_worker' ? '#fffaf0' : node.node_type === 'dimension_analyst' ? '#f5f9ff' : '#fff',
-      boxShadow: node.revision_highlight ? '0 0 0 4px rgba(230, 162, 60, 0.16)' : undefined,
+        : node.node_type === 'virtual_worker' ? '#fafafc' : node.node_type === 'dimension_analyst' ? '#edf6ff' : '#fff',
     },
   })),
 )
@@ -112,13 +111,13 @@ const flowEdges = computed(() =>
       edge.type === 'revision'
         ? { stroke: '#e6a23c', strokeDasharray: '6 4', strokeWidth: 2 }
         : edge.type === 'parallel'
-          ? { stroke: '#409eff', strokeDasharray: '4 4', strokeWidth: 1.5 }
-        : { stroke: '#909399' },
+          ? { stroke: '#0066cc', strokeDasharray: '4 4', strokeWidth: 1.5 }
+        : { stroke: '#d2d2d7' },
     labelStyle:
       edge.type === 'revision'
         ? { fill: '#b88230', fontWeight: 600 }
         : edge.type === 'parallel'
-          ? { fill: '#409eff', fontSize: 11 }
+          ? { fill: '#0066cc', fontSize: 11 }
           : undefined,
   })),
 )
@@ -139,9 +138,9 @@ const flowEdges = computed(() =>
 <style scoped>
 .flow-shell {
   height: 860px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 8px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
   overflow: hidden;
-  background: #fbfcfe;
+  background: var(--ca-canvas);
 }
 </style>

@@ -86,11 +86,11 @@ const metricCards = computed(() => {
 <style scoped>
 .metrics-panel {
   display: grid;
-  gap: 14px;
-  padding: 14px 16px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 8px;
-  background: #fff;
+  gap: 16px;
+  padding: 22px 24px;
+  border: 1px solid var(--ca-hairline);
+  border-radius: var(--ca-radius-lg);
+  background: var(--ca-canvas);
 }
 
 header,
@@ -104,15 +104,16 @@ header,
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 10px;
+  gap: 12px;
 }
 
 .metric-card {
   display: grid;
   gap: 6px;
-  padding: 10px 12px;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--ca-divider-soft);
+  border-radius: 14px;
+  background: var(--ca-pearl);
 }
 
 .metric-card span,
@@ -121,7 +122,10 @@ header span {
 }
 
 .metric-card strong {
-  font-size: 20px;
+  color: var(--ca-ink);
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.1;
 }
 
 .progress-grid,
@@ -137,12 +141,14 @@ h3 {
 }
 
 h2 {
-  font-size: 18px;
+  font-size: 24px;
+  font-weight: 600;
 }
 
 h3 {
   margin-bottom: 8px;
-  font-size: 15px;
+  font-size: 17px;
+  font-weight: 600;
 }
 
 @media (max-width: 900px) {

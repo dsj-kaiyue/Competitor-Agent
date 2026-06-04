@@ -2,77 +2,122 @@
   <el-container class="app-shell">
     <el-header class="app-header">
       <RouterLink to="/" class="brand">Competitive Agent</RouterLink>
-      <span>AI 驱动的通用竞品分析 Agent 协作系统</span>
       <nav class="nav">
         <RouterLink to="/">新建分析</RouterLink>
         <RouterLink to="/history">历史记录</RouterLink>
       </nav>
     </el-header>
+    <div class="sub-nav">
+      <span>AI 竞品分析工作台</span>
+      <RouterLink to="/">开始分析</RouterLink>
+    </div>
     <el-main class="app-main">
       <RouterView />
     </el-main>
   </el-container>
 </template>
 
-<style>
-body {
-  margin: 0;
-  color: #1f2937;
-  background: #f6f8fb;
-  font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-}
-
-a {
-  color: var(--el-color-primary);
-  text-decoration: none;
-}
-</style>
-
 <style scoped>
 .app-shell {
   min-height: 100vh;
+  background: var(--ca-parchment);
 }
 
 .app-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
   display: flex;
   align-items: center;
-  gap: 16px;
-  height: 58px;
-  border-bottom: 1px solid var(--el-border-color);
-  background: #ffffff;
+  gap: 24px;
+  height: 44px;
+  padding: 0 max(24px, calc((100vw - 1440px) / 2 + 24px));
+  border-bottom: 0;
+  background: #000000;
+  color: #ffffff;
 }
 
 .brand {
-  color: #111827;
-  font-weight: 700;
-}
-
-.app-header span {
-  color: var(--el-text-color-secondary);
-  font-size: 14px;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
 }
 
 .nav {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 22px;
   margin-left: auto;
-  font-size: 14px;
+  font-size: 12px;
+  line-height: 1;
 }
 
 .nav a {
-  color: #4b5563;
+  color: rgba(255, 255, 255, 0.78);
 }
 
 .nav a.router-link-active {
-  color: var(--el-color-primary);
+  color: #ffffff;
   font-weight: 600;
 }
 
+.sub-nav {
+  position: sticky;
+  top: 44px;
+  z-index: 19;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 52px;
+  padding: 0 max(24px, calc((100vw - 1440px) / 2 + 24px));
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(245, 245, 247, 0.82);
+  backdrop-filter: saturate(180%) blur(20px);
+}
+
+.sub-nav span {
+  color: var(--ca-ink);
+  font-size: 21px;
+  font-weight: 600;
+  line-height: 1.19;
+}
+
+.sub-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 5px 14px;
+  border-radius: var(--ca-radius-pill);
+  background: var(--ca-primary);
+  color: #ffffff;
+  font-size: 14px;
+  line-height: 1.29;
+}
+
 .app-main {
-  width: min(1180px, calc(100vw - 32px));
+  width: min(1180px, calc(100vw - 40px));
   margin: 0 auto;
-  padding: 24px 0 48px;
+  padding: 32px 0 64px;
+}
+
+@media (max-width: 760px) {
+  .app-header,
+  .sub-nav {
+    padding-inline: 16px;
+  }
+
+  .nav {
+    gap: 14px;
+  }
+
+  .sub-nav span {
+    font-size: 18px;
+  }
+
+  .app-main {
+    width: min(100% - 24px, 1180px);
+    padding-top: 20px;
+  }
 }
 </style>

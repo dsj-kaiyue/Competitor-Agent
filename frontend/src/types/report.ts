@@ -31,10 +31,17 @@ export interface ReportQualitySummary {
   blockers?: string[]
 }
 
+export interface ReportFinalizerIssue {
+  severity?: string
+  message?: string
+  paragraph_id?: string | null
+  claim_ids?: number[]
+}
+
 export interface ReportFinalizerQa {
   passed?: boolean
   score?: number | string | null
-  issues?: Record<string, unknown>[]
+  issues?: ReportFinalizerIssue[]
   revision_round?: number
   pass_threshold?: number | string | null
 }

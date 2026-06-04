@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -23,6 +23,11 @@ class AgentNode(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str | None] = mapped_column(Text)
+    qa_passed: Mapped[bool | None] = mapped_column(Boolean)
+    qa_score: Mapped[float | None] = mapped_column(Numeric(4, 2))
+    qa_revision_round: Mapped[int | None] = mapped_column(Integer)
+    qa_issue_count: Mapped[int] = mapped_column(Integer, default=0)
+    qa_updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_bj, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_bj, onupdate=now_bj, nullable=False)
 

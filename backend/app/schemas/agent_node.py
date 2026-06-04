@@ -19,6 +19,11 @@ class AgentNodeResponse(BaseModel):
     duration_ms: int | None = None
     retry_count: int
     error_message: str | None = None
+    qa_passed: bool | None = None
+    qa_score: float | None = None
+    qa_revision_round: int | None = None
+    qa_issue_count: int = 0
+    qa_updated_at: datetime | None = None
     revision_highlight: bool = False
     revision_label: str | None = None
 

@@ -226,6 +226,11 @@ def reset_task_for_retry(db: Session, task_id: int) -> AnalysisTask | None:
         node.duration_ms = None
         node.retry_count += 1
         node.error_message = None
+        node.qa_passed = None
+        node.qa_score = None
+        node.qa_revision_round = None
+        node.qa_issue_count = 0
+        node.qa_updated_at = None
     task.status = "queued"
     task.error_message = None
     task.updated_at = now_bj()
@@ -324,6 +329,11 @@ def list_nodes(db: Session, task_id: int) -> list[dict]:
             "duration_ms": node.duration_ms,
             "retry_count": node.retry_count,
             "error_message": node.error_message,
+            "qa_passed": node.qa_passed,
+            "qa_score": float(node.qa_score) if node.qa_score is not None else None,
+            "qa_revision_round": node.qa_revision_round,
+            "qa_issue_count": node.qa_issue_count or 0,
+            "qa_updated_at": node.qa_updated_at,
             "revision_highlight": False,
             "revision_label": None,
         }

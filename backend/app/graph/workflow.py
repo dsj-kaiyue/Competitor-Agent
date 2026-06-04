@@ -491,6 +491,175 @@ def _decide_next_action(issues: list[dict]) -> tuple[str, list[str]]:
     return "end", []
 
 
+def _revision_action_for_failed_dimensions(issues: list[dict], failed_dimension_nodes: list[str]) -> tuple[str, list[str]]:
+    failed_targets = [
+        str(node_key)
+        for node_key in failed_dimension_nodes
+        if str(node_key).startswith("dimension_analysis_")
+    ]
+    if not failed_targets:
+        return "end", []
+    next_action, _ = _decide_next_action(issues)
+    if next_action in {"recollect", "reanalyze", "rewrite"}:
+        return next_action, failed_targets
+    return "reanalyze", failed_targets
+
+
+def _revision_plan_for_failed_dimensions(issues: list[dict], failed_dimension_nodes: list[str]) -> dict:
+    failed_targets = [
+        str(node_key)
+        for node_key in failed_dimension_nodes
+        if str(node_key).startswith("dimension_analysis_")
+    ]
+    action_by_node: dict[str, str] = {}
+    priority = {"rewrite": 1, "reanalyze": 2, "recollect": 3}
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        action = str(issue.get("suggested_action") or "").strip()
+        if action not in priority:
+            continue
+        for node_key in _target_nodes_from_issue(issue):
+            if node_key not in failed_targets:
+                continue
+            if node_key not in action_by_node or priority[action] > priority[action_by_node[node_key]]:
+                action_by_node[node_key] = action
+    for node_key in failed_targets:
+        action_by_node.setdefault(node_key, "reanalyze")
+    recollect_nodes = [node_key for node_key in failed_targets if action_by_node.get(node_key) == "recollect"]
+    reanalyze_nodes = [node_key for node_key in failed_targets if action_by_node.get(node_key) == "reanalyze"]
+    rewrite_nodes = [node_key for node_key in failed_targets if action_by_node.get(node_key) == "rewrite"]
+    analysis_nodes = [*recollect_nodes, *reanalyze_nodes]
+    if recollect_nodes:
+        next_action = "recollect"
+    elif reanalyze_nodes:
+        next_action = "reanalyze"
+    elif rewrite_nodes:
+        next_action = "rewrite"
+    else:
+        next_action = "end"
+    recollect_set = set(recollect_nodes)
+    recollect_followup_queries = [
+        str(issue.get("search_query")).strip()
+        for issue in issues
+        if isinstance(issue, dict)
+        and str(issue.get("target_node") or "") in recollect_set
+        and str(issue.get("search_query") or "").strip()
+    ]
+    return {
+        "next_action": next_action,
+        "target_nodes": failed_targets,
+        "recollect_nodes": recollect_nodes,
+        "reanalyze_nodes": reanalyze_nodes,
+        "rewrite_nodes": rewrite_nodes,
+        "analysis_nodes": analysis_nodes,
+        "recollect_followup_queries": _dedupe_preserve_order(recollect_followup_queries),
+        "action_by_node": action_by_node,
+    }
+
+
+def _qa_passed_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "y", "pass", "passed", "通过"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "fail", "failed", "未通过"}:
+            return False
+    return bool(value)
+
+
+def _failed_dimension_nodes_from_scores(dimension_scores: list[dict]) -> list[str]:
+    failed_nodes: list[str] = []
+    seen: set[str] = set()
+    for item in dimension_scores:
+        if not isinstance(item, dict):
+            continue
+        node_key = str(item.get("target_node") or "")
+        if not node_key.startswith("dimension_analysis_") or node_key in seen:
+            continue
+        if not _qa_passed_value(item.get("passed")):
+            failed_nodes.append(node_key)
+            seen.add(node_key)
+    return failed_nodes
+
+
+def _apply_dimension_qa_scores_to_nodes(
+    db: Session,
+    task_id: int,
+    dimension_scores: list[dict],
+    revision_round: int,
+) -> list[str]:
+    node_keys = [
+        str(item.get("target_node"))
+        for item in dimension_scores
+        if isinstance(item, dict) and str(item.get("target_node") or "").startswith("dimension_analysis_")
+    ]
+    if not node_keys:
+        return []
+    nodes_by_key = {
+        node.node_key: node
+        for node in db.scalars(
+            select(AgentNode).where(
+                AgentNode.task_id == task_id,
+                AgentNode.node_key.in_(node_keys),
+                AgentNode.node_type == "dimension_analyst",
+            )
+        )
+    }
+    missing_nodes = [node_key for node_key in node_keys if node_key not in nodes_by_key]
+    if missing_nodes:
+        _console("qa dimension state sync skipped missing nodes", {"task_id": task_id, "node_keys": missing_nodes})
+    for item in dimension_scores:
+        if not isinstance(item, dict):
+            continue
+        node = nodes_by_key.get(str(item.get("target_node") or ""))
+        if node is None:
+            continue
+        node.qa_passed = _qa_passed_value(item.get("passed"))
+        node.qa_score = Decimal(str(_score_float(item.get("score"))))
+        node.qa_revision_round = revision_round
+        issues = item.get("issues") if isinstance(item.get("issues"), list) else []
+        node.qa_issue_count = len(issues)
+        node.qa_updated_at = now_bj()
+    db.flush()
+    return node_keys
+
+
+def _failed_dimension_nodes_from_qa_state(
+    db: Session,
+    task_id: int,
+    scope_node_keys: list[str] | None = None,
+) -> list[str]:
+    stmt = select(AgentNode).where(
+        AgentNode.task_id == task_id,
+        AgentNode.node_type == "dimension_analyst",
+        AgentNode.qa_passed.is_(False),
+    )
+    if scope_node_keys is not None:
+        stmt = stmt.where(AgentNode.node_key.in_(scope_node_keys))
+    return [node.node_key for node in db.scalars(stmt.order_by(AgentNode.id))]
+
+
+def _sync_dimension_qa_state_and_get_failed_nodes(
+    db: Session,
+    task_id: int,
+    dimension_scores: list[dict],
+    revision_round: int,
+) -> list[str]:
+    scope_node_keys = _apply_dimension_qa_scores_to_nodes(db, task_id, dimension_scores, revision_round)
+    expected_failed = _failed_dimension_nodes_from_scores(dimension_scores)
+    actual_failed = _failed_dimension_nodes_from_qa_state(db, task_id, scope_node_keys)
+    if actual_failed != expected_failed:
+        _console(
+            "qa dimension state resynced from current scores",
+            {"task_id": task_id, "expected_failed": expected_failed, "actual_failed": actual_failed},
+        )
+        _apply_dimension_qa_scores_to_nodes(db, task_id, dimension_scores, revision_round)
+    return expected_failed
+
+
 def _claim_evidence_map(db: Session, claim_ids: list[int]) -> dict[int, list[int]]:
     if not claim_ids:
         return {}
@@ -599,6 +768,41 @@ def _is_global_report_section(section: dict) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
+def _is_executive_summary_section(section: dict) -> bool:
+    text = _normalized_token(f"{section.get('section_id') or ''} {section.get('title') or ''}")
+    return any(keyword in text for keyword in ("executive", "summary", "overview", "摘要", "执行摘要", "总览", "概览"))
+
+
+def _is_conclusion_section(section: dict) -> bool:
+    text = _normalized_token(f"{section.get('section_id') or ''} {section.get('title') or ''}")
+    return any(keyword in text for keyword in ("conclusion", "takeaway", "总体", "总结", "结论"))
+
+
+def _is_recommendation_or_risk_section(section: dict) -> bool:
+    text = _normalized_token(f"{section.get('section_id') or ''} {section.get('title') or ''}")
+    return any(keyword in text for keyword in ("recommend", "ranking", "risk", "warning", "建议", "推荐", "排名", "风险", "提示"))
+
+
+def _ordered_final_report_sections(body_sections: list[dict], global_sections: list[dict]) -> list[dict]:
+    allowed_global_sections = [
+        section
+        for section in global_sections
+        if not _is_recommendation_or_risk_section(section)
+    ]
+    executive_sections = [section for section in allowed_global_sections if _is_executive_summary_section(section)]
+    conclusion_sections = [
+        section
+        for section in allowed_global_sections
+        if _is_conclusion_section(section) and not _is_executive_summary_section(section)
+    ]
+    other_global_sections = [
+        section
+        for section in allowed_global_sections
+        if section not in executive_sections and section not in conclusion_sections
+    ]
+    return [*executive_sections, *body_sections, *conclusion_sections, *other_global_sections]
+
+
 def _score_float(value: object, default: float = 0.0) -> float:
     try:
         score = float(value)
@@ -692,6 +896,48 @@ def _build_quality_summary(
         "high_risk_issue_count": len(high_risk_issues),
         "blockers": blockers,
         "score_formula": "dimension_avg * 0.7 + finalizer_score * 0.3",
+    }
+
+
+def _build_finalizer_revision_context(finalizer_qa: dict, body_qa_issues: list[dict]) -> dict:
+    grounding_issues = [
+        {
+            "severity": str(issue.get("severity") or "medium"),
+            "message": str(issue.get("message") or "").strip(),
+            "paragraph_id": issue.get("paragraph_id"),
+            "claim_ids": issue.get("claim_ids") if isinstance(issue.get("claim_ids"), list) else [],
+        }
+        for issue in finalizer_qa.get("issues", [])
+        if isinstance(issue, dict) and str(issue.get("message") or "").strip()
+    ]
+    residual_body_issues = [
+        {
+            "severity": str(issue.get("severity") or "medium"),
+            "message": str(issue.get("message") or "").strip(),
+            "related_dimension": issue.get("related_dimension"),
+            "target_node": issue.get("target_node"),
+            "suggested_action": issue.get("suggested_action"),
+        }
+        for issue in body_qa_issues
+        if isinstance(issue, dict) and str(issue.get("message") or "").strip()
+    ][:10]
+    return {
+        "revision_required": bool(grounding_issues),
+        "revision_objective": (
+            "逐条修复报告总结 grounding QA 指出的问题，只改写全局总结 section，确保每个总结判断都能被 claim_ids 支撑。"
+            if grounding_issues
+            else "无内部 QA 返工要求。"
+        ),
+        "finalizer_score": _score_float(finalizer_qa.get("score"), 0.0),
+        "grounding_issues": grounding_issues,
+        "residual_body_qa_issues": residual_body_issues,
+        "rewrite_rules": [
+            "优先修复 grounding_issues 中列出的 paragraph_id；如果 paragraph_id 为空，则定位到同类总结段落修复。",
+            "每个修订后的 paragraph 必须引用能够支撑核心判断的 claim_ids。",
+            "删除或弱化没有 Claim 支撑的结论、排名、建议和风险判断。",
+            "如果正文维度 QA 仍有残留问题，只能在执行摘要或总体结论中简要说明可靠性边界，不要单独生成额外 section。",
+            "不得引入当前正文 sections、CompetitorProfiles、ComparisonMatrices 和 Claims 之外的新事实。",
+        ],
     }
 
 
@@ -1034,10 +1280,12 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         "qa_passed": None,
         "qa_next_action": None,
         "qa_target_nodes": [],
+        "qa_revision_plan": {},
         "qa_issues": [],
         "qa_followup_queries": [],
         "dimension_qa_scores": {},
         "finalizer_qa": {},
+        "finalizer_revision_context": {},
         "quality_summary": {},
         "reanalyze_dimensions": [],
         "dimension_failures": [],
@@ -1681,14 +1929,16 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
             for issue in issues
             if str(issue.get("search_query") or "").strip()
         ]
-        if not followup_queries:
+        revision_plan = state.get("qa_revision_plan") if isinstance(state.get("qa_revision_plan"), dict) else {}
+        node_action = str((revision_plan.get("action_by_node") or {}).get(node_key) or state.get("qa_next_action") or "")
+        if not followup_queries and node_action == "recollect":
             followup_queries = [
                 str(query).strip()
                 for query in state.get("qa_followup_queries", [])
                 if str(query).strip()
             ]
         return {
-            "next_action": state.get("qa_next_action"),
+            "next_action": node_action or state.get("qa_next_action"),
             "revision_round": state.get("revision_round", 0),
             "issues": issues,
             "followup_queries": _dedupe_preserve_order(followup_queries),
@@ -2101,7 +2351,14 @@ ComparisonMatrices:
             ],
             ensure_ascii=False,
         )[:9000]
-        def generate_global_sections(revision_instruction: str = "", previous_global_sections: list[dict] | None = None) -> list[dict]:
+        def generate_global_sections(revision_context: dict | None = None, previous_global_sections: list[dict] | None = None) -> list[dict]:
+            revision_payload = revision_context or {
+                "revision_required": False,
+                "revision_objective": "首次生成总结，无内部 QA 返工要求。",
+                "grounding_issues": [],
+                "residual_body_qa_issues": [],
+                "rewrite_rules": [],
+            }
             finalizer_prompt = f"""
 请基于当前最终竞品分析正文，生成最终报告的全文总结 section，只输出合法 JSON。
 
@@ -2112,20 +2369,23 @@ ComparisonMatrices:
 维度正文 QA 是否通过：{state.get("qa_passed")}
 维度正文 QA 残留问题：
 {json.dumps(state.get("qa_issues", []), ensure_ascii=False)[:5000]}
-本轮总结返工要求：{revision_instruction or "无"}
+报告总结内部 QA 定向返工上下文：
+{json.dumps(revision_payload, ensure_ascii=False)[:6000]}
 
 要求：
 1. 只输出 JSON，不要 Markdown。
 2. 只生成 global_sections，不要改写具体分析维度 section。
-3. global_sections 应包含执行摘要、总体结论、关键建议或风险提示；如需排名或推荐，必须能被正文 Claim 支撑。
+3. global_sections 只允许包含执行摘要和总体结论；不要生成其它全局 section。
 4. 每个 paragraph 必须包含 paragraph_id、text、claim_ids。
 5. claim_ids 只能引用下方已有 claim_id，不要编造。
 6. 不要输出 evidence_ids，后端会自动补齐。
 7. 不要引入正文和 Claim 中没有的新事实。
-8. 如果 QA 未通过，必须在风险提示或结论中明确说明仍存在的证据、覆盖或写作问题，不要把未通过内容包装成完全可靠结论。
+8. 如果 QA 未通过，只能在执行摘要或总体结论中简要说明仍存在的证据、覆盖或写作问题，不要把未通过内容包装成完全可靠结论。
+9. 如果“报告总结内部 QA 定向返工上下文”的 revision_required 为 true，必须逐条修复 grounding_issues，不得只做泛化改写。
+10. 对 grounding_issues 中涉及的 paragraph_id，应优先重写对应段落；对涉及 claim_ids 的问题，应重新选择或删除不匹配的 claim_ids。
 
 JSON 格式：
-{{"title":"...","global_sections":[{{"section_id":"executive_summary","title":"执行摘要","paragraphs":[{{"paragraph_id":"executive_summary_p1","text":"...","claim_ids":[1,2]}}]}}]}}
+{{"title":"...","global_sections":[{{"section_id":"executive_summary","title":"执行摘要","paragraphs":[{{"paragraph_id":"executive_summary_p1","text":"...","claim_ids":[1,2]}}]}},{{"section_id":"overall_conclusion","title":"总体结论","paragraphs":[{{"paragraph_id":"overall_conclusion_p1","text":"...","claim_ids":[1,2]}}]}}]}}
 
 上一版全局总结 sections：
 {json.dumps(previous_global_sections or [], ensure_ascii=False)[:4000]}
@@ -2144,7 +2404,12 @@ Claims:
 """
             _console(
                 "llm report finalizer started",
-                {"task_id": task_id, "body_section_count": len(body_sections), "revision_instruction": bool(revision_instruction)},
+                {
+                    "task_id": task_id,
+                    "body_section_count": len(body_sections),
+                    "revision_required": bool(revision_payload.get("revision_required")),
+                    "grounding_issue_count": len(revision_payload.get("grounding_issues", [])),
+                },
             )
             parsed = _json_from_text(llm.complete(finalizer_prompt, system="你只输出合法 JSON。"))
             if not isinstance(parsed, dict):
@@ -2157,8 +2422,10 @@ Claims:
                 valid_claim_ids,
             )
             global_sections = [
-                section for section in finalizer_json.get("sections", []) if _is_global_report_section(section)
-            ] or finalizer_json.get("sections", [])
+                section
+                for section in finalizer_json.get("sections", [])
+                if _is_global_report_section(section) and not _is_recommendation_or_risk_section(section)
+            ]
             if not global_sections:
                 raise ValueError("global_sections missing")
             return global_sections
@@ -2170,7 +2437,7 @@ Claims:
             if state.get("qa_passed"):
                 fallback_text = "本报告基于已通过 QA 的维度分析正文、结构化 Claim 和证据链生成。核心结论请以各维度正文及其 Claim/Evidence 绑定为准。"
             else:
-                fallback_text = "本报告在达到当前返工限制后生成，仍存在未通过 QA 的残留问题。请优先查看风险提示、低置信度 Claim 和证据绑定情况，核心结论需结合各维度正文及其 Claim/Evidence 绑定谨慎使用。"
+                fallback_text = "本报告在达到当前返工限制后生成，仍存在未通过 QA 的残留问题。核心结论需结合各维度正文及其 Claim/Evidence 绑定谨慎使用。"
             global_sections = [
                 {
                     "section_id": "executive_summary",
@@ -2182,17 +2449,29 @@ Claims:
                             "claim_ids": [claim.id for claim in top_claims],
                         }
                     ],
+                },
+                {
+                    "section_id": "overall_conclusion",
+                    "title": "总体结论",
+                    "paragraphs": [
+                        {
+                            "paragraph_id": "overall_conclusion_p1",
+                            "text": "总体来看，报告结论应以各分析维度正文中已绑定 Claim 和 Evidence 的判断为准。",
+                            "claim_ids": [claim.id for claim in top_claims],
+                        }
+                    ],
                 }
             ]
+            return global_sections
 
         def run_finalizer_grounding_qa(global_sections: list[dict], qa_round: int) -> dict:
             grounding_prompt = f"""
 请检查最终报告的全局总结 section 是否被正文 Claim 支撑，只输出合法 JSON。
 
 检查目标：
-1. 执行摘要、总体结论、建议、风险提示不能引入 Claim 中没有的新事实。
+1. 执行摘要、总体结论不能引入 Claim 中没有的新事实。
 2. 每个 paragraph 的 claim_ids 必须能支撑该段核心判断。
-3. 如果维度正文 QA 未通过或存在残留问题，总结必须明确披露风险，不能包装成完全可靠结论。
+3. 如果维度正文 QA 未通过或存在残留问题，总结必须说明可靠性边界，不能包装成完全可靠结论。
 
 输出格式：
 {{"passed":true/false,"score":0.0到1.0,"issues":[{{"severity":"low|medium|high","message":"中文问题","paragraph_id":null,"claim_ids":[]}}]}}
@@ -2229,32 +2508,36 @@ Claims：
 
         global_sections: list[dict] = []
         finalizer_qa: dict = {}
-        finalizer_revision_instruction = ""
+        finalizer_revision_context: dict = {}
         max_finalizer_rounds = max(0, int(settings.report_finalizer_max_revision_rounds))
         for finalizer_round in range(max_finalizer_rounds + 1):
             try:
-                global_sections = generate_global_sections(finalizer_revision_instruction, global_sections)
+                global_sections = generate_global_sections(finalizer_revision_context, global_sections)
             except Exception as exc:
                 global_sections = fallback_global_sections(exc)
             finalizer_qa = run_finalizer_grounding_qa(global_sections, finalizer_round)
             if finalizer_qa.get("passed") or finalizer_round >= max_finalizer_rounds:
                 break
-            issue_messages = [
-                str(issue.get("message"))
-                for issue in finalizer_qa.get("issues", [])
-                if isinstance(issue, dict) and issue.get("message")
-            ]
-            finalizer_revision_instruction = "；".join(issue_messages) or "总结缺少 Claim 支撑，请只基于已有 Claim 重写全局总结。"
+            finalizer_revision_context = _build_finalizer_revision_context(
+                finalizer_qa,
+                state.get("qa_issues", []),
+            )
             add_log(
                 db,
                 task_id,
                 node.id,
                 "Report finalizer grounding QA requested global section rewrite",
-                {"revision_round": finalizer_round + 1, "score": finalizer_qa.get("score"), "issues": finalizer_qa.get("issues", [])},
+                {
+                    "revision_round": finalizer_round + 1,
+                    "score": finalizer_qa.get("score"),
+                    "issues": finalizer_qa.get("issues", []),
+                    "revision_context": finalizer_revision_context,
+                },
                 log_type="warning",
             )
 
         state["finalizer_qa"] = finalizer_qa
+        state["finalizer_revision_context"] = finalizer_revision_context
         quality_summary = _build_quality_summary(
             state.get("dimension_qa_scores", {}),
             finalizer_qa,
@@ -2266,12 +2549,13 @@ Claims：
         final_report_json = {
             **body_report_json,
             "title": body_report_json.get("title") or f"{plan.topic}报告",
-            "sections": [*global_sections, *body_sections],
+            "sections": _ordered_final_report_sections(body_sections, global_sections),
             "report_finalized": True,
             "qa_passed": state.get("qa_passed"),
             "qa_issues": state.get("qa_issues", []),
             "dimension_qa_scores": list(state.get("dimension_qa_scores", {}).values()),
             "finalizer_qa": finalizer_qa,
+            "finalizer_revision_context": finalizer_revision_context,
             "quality_summary": quality_summary,
         }
         final_report_json = _sanitize_report_sections(final_report_json, valid_claim_ids)
@@ -2616,15 +2900,17 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
         for item in current_dimension_scores:
             state_dimension_scores[item["target_node"]] = item
         state["dimension_qa_scores"] = state_dimension_scores
+        qa_revision_round = int(state.get("revision_round", 0) or 0)
         passed = passed and not any(item.get("severity") == "high" for item in issues)
-        passed = passed and all(item.get("passed") for item in current_dimension_scores)
-        failed_dimension_nodes = [
-            str(item.get("target_node"))
-            for item in current_dimension_scores
-            if item.get("target_node") and not item.get("passed")
-        ]
+        passed = passed and all(_qa_passed_value(item.get("passed")) for item in current_dimension_scores)
+        failed_dimension_nodes = _sync_dimension_qa_state_and_get_failed_nodes(
+            db,
+            task_id,
+            current_dimension_scores,
+            qa_revision_round,
+        )
         failed_dimension_set = set(failed_dimension_nodes)
-        next_issues = []
+        issues_with_targets = set()
         for issue in issues:
             if not isinstance(issue, dict):
                 continue
@@ -2635,16 +2921,37 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
             ]
             if issue_targets:
                 issue["target_node"] = issue_targets[0]
-                next_issues.append(issue)
-        next_action, target_nodes = _decide_next_action(next_issues)
-        if next_action in {"recollect", "reanalyze"}:
-            target_nodes = [node_key for node_key in target_nodes if node_key in failed_dimension_set]
-            if not target_nodes:
-                target_nodes = failed_dimension_nodes
-        elif not passed and failed_dimension_nodes:
-            next_action, target_nodes = "reanalyze", failed_dimension_nodes
+                issues_with_targets.add(issue_targets[0])
+        for item in current_dimension_scores:
+            node_key = str(item.get("target_node") or "")
+            if not node_key or _qa_passed_value(item.get("passed")) or node_key in issues_with_targets:
+                continue
+            issues.append(
+                {
+                    "type": "weak_evidence",
+                    "severity": "medium",
+                    "message": f"{item.get('dimension_label') or node_key} 维度未通过本轮 QA，需要继续返工",
+                    "related_claim_id": None,
+                    "related_dimension": item.get("dimension_label") or item.get("dimension_key"),
+                    "suggested_action": "reanalyze",
+                    "target_node": node_key,
+                }
+            )
+        revision_plan = _revision_plan_for_failed_dimensions(issues, failed_dimension_nodes)
+        next_action = str(revision_plan.get("next_action") or "end")
+        target_nodes = [str(node_key) for node_key in revision_plan.get("target_nodes", [])]
         if passed:
             next_action, target_nodes = "end", []
+            revision_plan = {
+                **revision_plan,
+                "next_action": "end",
+                "target_nodes": [],
+                "recollect_nodes": [],
+                "reanalyze_nodes": [],
+                "rewrite_nodes": [],
+                "analysis_nodes": [],
+                "recollect_followup_queries": [],
+            }
         followup_queries = [str(issue.get("search_query")) for issue in issues if issue.get("search_query")]
         payload = {
             "passed": passed,
@@ -2652,13 +2959,14 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
             "issues": issues,
             "next_action": next_action,
             "target_nodes": target_nodes,
+            "revision_plan": revision_plan,
             "qa_scope": qa_scope,
             "qa_scope_label": "本轮返工维度" if qa_scope == "partial_revision" else "完整报告",
             "dimension_scores": list(state_dimension_scores.values()),
             "current_dimension_scores": current_dimension_scores,
             "revision_reason": "；".join(issue.get("message", "") for issue in issues[:4]) or None,
             "followup_queries": followup_queries,
-            "revision_round": state.get("revision_round", 0),
+            "revision_round": qa_revision_round,
         }
         qa_result = QAResult(task_id=task_id, report_id=report.id if report else None, passed=passed, score=score, issues_json=payload)
         db.add(qa_result)
@@ -2680,6 +2988,7 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
         state["qa_passed"] = passed
         state["qa_next_action"] = next_action
         state["qa_target_nodes"] = target_nodes
+        state["qa_revision_plan"] = revision_plan
         state["qa_issues"] = issues
         state["qa_followup_queries"] = followup_queries
         state["revision_reason"] = payload["revision_reason"]
@@ -2694,22 +3003,28 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
         issues = payload.get("issues") if isinstance(payload.get("issues"), list) else []
         target_nodes = payload.get("target_nodes") if isinstance(payload.get("target_nodes"), list) else []
         followup_queries = payload.get("followup_queries") if isinstance(payload.get("followup_queries"), list) else []
+        payload_revision_plan = payload.get("revision_plan") if isinstance(payload.get("revision_plan"), dict) else {}
         dimension_scores = payload.get("dimension_scores") if isinstance(payload.get("dimension_scores"), list) else []
         current_dimension_scores = (
             payload.get("current_dimension_scores")
             if isinstance(payload.get("current_dimension_scores"), list)
             else []
         )
-        failed_current_nodes = [
-            str(item.get("target_node"))
-            for item in current_dimension_scores
-            if isinstance(item, dict) and item.get("target_node") and not item.get("passed")
-        ]
-        hydrated_target_nodes = failed_current_nodes or [str(node_key) for node_key in target_nodes if str(node_key)]
+        failed_state_nodes = _failed_dimension_nodes_from_qa_state(db, task_id)
+        revision_plan = (
+            payload_revision_plan
+            if payload_revision_plan
+            else _revision_plan_for_failed_dimensions([issue for issue in issues if isinstance(issue, dict)], failed_state_nodes)
+        )
+        if latest_qa.passed:
+            revision_plan = {**revision_plan, "next_action": "end", "target_nodes": []}
+        else:
+            revision_plan = {**revision_plan, "target_nodes": failed_state_nodes}
         state["qa_result_id"] = latest_qa.id
         state["qa_passed"] = bool(latest_qa.passed)
-        state["qa_next_action"] = payload.get("next_action") or ("end" if latest_qa.passed else None)
-        state["qa_target_nodes"] = [] if latest_qa.passed else hydrated_target_nodes
+        state["qa_next_action"] = revision_plan.get("next_action") or payload.get("next_action") or ("end" if latest_qa.passed else None)
+        state["qa_target_nodes"] = [] if latest_qa.passed else failed_state_nodes
+        state["qa_revision_plan"] = revision_plan
         state["qa_issues"] = [issue for issue in issues if isinstance(issue, dict)]
         state["qa_followup_queries"] = [str(query) for query in followup_queries if str(query).strip()]
         state["revision_reason"] = payload.get("revision_reason")
@@ -2744,6 +3059,27 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
     while not state.get("qa_passed") and state.get("revision_round", 0) < state.get("max_revision_rounds", 1):
         action = state.get("qa_next_action") or "end"
         target_nodes = state.get("qa_target_nodes", [])
+        revision_plan = state.get("qa_revision_plan") if isinstance(state.get("qa_revision_plan"), dict) else {}
+        recollect_nodes = [
+            str(node_key)
+            for node_key in revision_plan.get("recollect_nodes", [])
+            if str(node_key).startswith("dimension_analysis_")
+        ]
+        reanalyze_nodes = [
+            str(node_key)
+            for node_key in revision_plan.get("reanalyze_nodes", [])
+            if str(node_key).startswith("dimension_analysis_")
+        ]
+        rewrite_nodes = [
+            str(node_key)
+            for node_key in revision_plan.get("rewrite_nodes", [])
+            if str(node_key).startswith("dimension_analysis_")
+        ]
+        analysis_nodes = [
+            str(node_key)
+            for node_key in revision_plan.get("analysis_nodes", [*recollect_nodes, *reanalyze_nodes])
+            if str(node_key).startswith("dimension_analysis_")
+        ]
         if action == "end":
             _console(
                 "qa revision stopped because no actionable revision was requested",
@@ -2760,6 +3096,7 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
             {
                 "next_action": action,
                 "target_nodes": target_nodes,
+                "revision_plan": revision_plan,
                 "issue_count": len(state.get("qa_issues", [])),
                 "revision_round": state["revision_round"],
             },
@@ -2768,36 +3105,35 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
         db.commit()
         _console(
             "qa requested revision",
-            {"task_id": task_id, "next_action": action, "target_nodes": target_nodes, "revision_round": state["revision_round"]},
+            {
+                "task_id": task_id,
+                "next_action": action,
+                "target_nodes": target_nodes,
+                "recollect_nodes": recollect_nodes,
+                "reanalyze_nodes": reanalyze_nodes,
+                "rewrite_nodes": rewrite_nodes,
+                "revision_round": state["revision_round"],
+            },
         )
-        if action == "recollect":
-            targets = [node_key for node_key in target_nodes if node_key.startswith("dimension_analysis_")]
-            if not targets:
-                raise RuntimeError("QA 要求补采资料，但没有定位到需要重跑的动态维度 Agent")
+        if not target_nodes:
+            _console("qa revision stopped because no failed dimensions were available", {"task_id": task_id})
+            break
+        if recollect_nodes:
+            original_followup_queries = list(state.get("qa_followup_queries", []))
             try:
+                state["qa_followup_queries"] = revision_plan.get("recollect_followup_queries") or original_followup_queries
                 state["collector_mode"] = "recollect"
                 _run_node(db, task_id, "collector", "collecting", collector, force=True)
                 _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor, force=True)
             finally:
                 state["collector_mode"] = "normal"
-            run_parallel_dimension_analysts(targets, force=True)
+                state["qa_followup_queries"] = original_followup_queries
+        if analysis_nodes:
+            run_parallel_dimension_analysts(analysis_nodes, force=True)
             build_dynamic_knowledge()
-            state["report_writer_mode"] = "partial_revision"
-            _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
-            _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
-        elif action == "reanalyze":
-            targets = [node_key for node_key in target_nodes if node_key.startswith("dimension_analysis_")]
-            if not targets:
-                raise RuntimeError("QA 要求重新分析，但没有定位到需要重跑的动态维度 Agent")
-            run_parallel_dimension_analysts(targets, force=True)
-            build_dynamic_knowledge()
-            state["report_writer_mode"] = "partial_revision"
-            _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
-            _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
-        elif action == "rewrite":
-            state["report_writer_mode"] = "full_write"
-            _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
-            _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
+        state["report_writer_mode"] = "partial_revision"
+        _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
+        _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
     if not state.get("qa_passed"):
         finalizer_node = _node(db, task_id, "report_finalizer")
         add_log(

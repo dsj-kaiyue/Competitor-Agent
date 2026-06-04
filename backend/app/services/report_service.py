@@ -46,6 +46,88 @@ def _split_revision_reason(value: object) -> list[str]:
     return [item.strip() for item in re.split(r"\s*(?:\r?\n|；|;)\s*", str(value)) if item.strip()]
 
 
+def _is_global_report_section(section: dict) -> bool:
+    text = f"{section.get('section_id') or ''} {section.get('title') or ''}".casefold()
+    keywords = (
+        "executive",
+        "summary",
+        "overview",
+        "conclusion",
+        "recommend",
+        "ranking",
+        "takeaway",
+        "摘要",
+        "执行摘要",
+        "总览",
+        "概览",
+        "总体",
+        "总结",
+        "结论",
+        "建议",
+        "推荐",
+        "排名",
+    )
+    return any(keyword in text for keyword in keywords)
+
+
+def _is_executive_summary_section(section: dict) -> bool:
+    text = f"{section.get('section_id') or ''} {section.get('title') or ''}".casefold()
+    return any(keyword in text for keyword in ("executive", "summary", "overview", "摘要", "执行摘要", "总览", "概览"))
+
+
+def _is_conclusion_section(section: dict) -> bool:
+    text = f"{section.get('section_id') or ''} {section.get('title') or ''}".casefold()
+    return any(keyword in text for keyword in ("conclusion", "takeaway", "总体", "总结", "结论"))
+
+
+def _is_recommendation_or_risk_section(section: dict) -> bool:
+    text = f"{section.get('section_id') or ''} {section.get('title') or ''}".casefold()
+    return any(keyword in text for keyword in ("recommend", "ranking", "risk", "warning", "建议", "推荐", "排名", "风险", "提示"))
+
+
+def _ordered_report_sections(report_json: dict | None) -> list[dict]:
+    if not isinstance(report_json, dict):
+        return []
+    sections = [section for section in report_json.get("sections", []) if isinstance(section, dict)]
+    allowed_sections = [section for section in sections if not _is_recommendation_or_risk_section(section)]
+    executive_sections = [section for section in allowed_sections if _is_executive_summary_section(section)]
+    body_sections = [section for section in allowed_sections if not _is_global_report_section(section)]
+    conclusion_sections = [
+        section
+        for section in allowed_sections
+        if _is_conclusion_section(section) and not _is_executive_summary_section(section)
+    ]
+    other_global_sections = [
+        section
+        for section in allowed_sections
+        if _is_global_report_section(section) and section not in executive_sections and section not in conclusion_sections
+    ]
+    return [*executive_sections, *body_sections, *conclusion_sections, *other_global_sections]
+
+
+def _report_body_markdown(report: Report) -> str:
+    ordered_sections = _ordered_report_sections(report.report_json)
+    if not ordered_sections:
+        return report.content_markdown or ""
+    title = report.report_json.get("title") if isinstance(report.report_json, dict) else None
+    lines: list[str] = [f"# {title or report.title or '竞品分析报告'}", ""]
+    for section in ordered_sections:
+        section_title = section.get("title")
+        if section_title:
+            lines.extend([f"## {section_title}", ""])
+        for paragraph in section.get("paragraphs", []):
+            if not isinstance(paragraph, dict):
+                continue
+            text = str(paragraph.get("text") or "").strip()
+            if not text:
+                continue
+            claim_ids = paragraph.get("claim_ids") or []
+            evidence_ids = paragraph.get("evidence_ids") or []
+            suffix = f"（Claims: {claim_ids}; Evidence: {evidence_ids}）" if claim_ids else ""
+            lines.extend([f"{text}{suffix}", ""])
+    return "\n".join(lines).strip()
+
+
 def _matrix_markdown(matrices: list[ComparisonMatrix]) -> str:
     if not matrices:
         return ""
@@ -126,6 +208,7 @@ def _quality_summary_markdown(report_json: dict | None, qa_payload: dict | None 
                 + " |"
             )
     sections.extend(_qa_issues_markdown(qa_payload, heading_level=3))
+    sections.extend(_finalizer_qa_issues_markdown(report_json.get("finalizer_qa"), heading_level=3))
     return "\n".join(sections)
 
 
@@ -175,6 +258,41 @@ def _qa_issues_markdown(qa_payload: dict | None, heading_level: int = 2) -> list
     return sections
 
 
+def _finalizer_qa_issues_markdown(finalizer_qa: dict | None, heading_level: int = 2) -> list[str]:
+    heading = "#" * heading_level
+    if not isinstance(finalizer_qa, dict):
+        return ["", f"{heading} 报告总结 Agent QA 问题", "", "暂无报告总结 Agent QA 问题。"]
+    issues = finalizer_qa.get("issues") or []
+    if not issues:
+        return ["", f"{heading} 报告总结 Agent QA 问题", "", "暂无报告总结 Agent QA 问题。"]
+    sections = [
+        "",
+        f"{heading} 报告总结 Agent QA 问题",
+        "",
+        "| # | 风险级别 | 段落 | Claim | 问题说明 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for index, issue in enumerate(issues, start=1):
+        if not isinstance(issue, dict):
+            sections.append(f"| {index} | - | - | - | {_markdown_cell(issue)} |")
+            continue
+        claim_ids = issue.get("claim_ids") if isinstance(issue.get("claim_ids"), list) else []
+        sections.append(
+            "| "
+            + " | ".join(
+                [
+                    str(index),
+                    _markdown_cell(issue.get("severity") or "-"),
+                    _markdown_cell(issue.get("paragraph_id") or "-"),
+                    _markdown_cell(", ".join(str(item) for item in claim_ids) if claim_ids else "-"),
+                    _markdown_cell(issue.get("message") or "未命名问题"),
+                ]
+            )
+            + " |"
+        )
+    return sections
+
+
 def _claims_markdown(claims_with_evidence: list[tuple[Claim, list[int]]]) -> str:
     sections = ["", "## 结构化结论"]
     if not claims_with_evidence:
@@ -215,7 +333,7 @@ def build_markdown_export(
         "-->",
         "",
     ]
-    content = "\n".join(metadata) + (report.content_markdown or "")
+    content = "\n".join(metadata) + _report_body_markdown(report)
     content += _matrix_markdown(matrices or [])
     content += _claims_markdown(claims_with_evidence or [])
     content += _quality_summary_markdown(report.report_json, qa_payload)

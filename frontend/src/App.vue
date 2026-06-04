@@ -9,7 +9,6 @@
     </el-header>
     <div class="sub-nav">
       <span>AI 竞品分析工作台</span>
-      <RouterLink to="/">开始分析</RouterLink>
     </div>
     <el-main class="app-main">
       <RouterView />
@@ -68,7 +67,6 @@
   z-index: 19;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   min-height: 52px;
   padding: 0 max(24px, calc((100vw - 1440px) / 2 + 24px));
   border-bottom: 1px solid rgba(0, 0, 0, 0.08);
@@ -81,18 +79,6 @@
   font-size: 21px;
   font-weight: 600;
   line-height: 1.19;
-}
-
-.sub-nav a {
-  display: inline-flex;
-  align-items: center;
-  min-height: 32px;
-  padding: 5px 14px;
-  border-radius: var(--ca-radius-pill);
-  background: var(--ca-primary);
-  color: #ffffff;
-  font-size: 14px;
-  line-height: 1.29;
 }
 
 .app-main {

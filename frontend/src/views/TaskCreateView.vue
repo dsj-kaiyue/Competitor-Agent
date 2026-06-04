@@ -158,9 +158,6 @@ async function handleCreate() {
         <p class="api-base">API：{{ API_BASE_URL }}</p>
       </div>
       <div class="actions">
-        <RouterLink to="/history">
-          <el-button>历史记录</el-button>
-        </RouterLink>
         <el-switch
           v-model="autoDiscoverCompetitors"
           active-text="自动发现竞品"

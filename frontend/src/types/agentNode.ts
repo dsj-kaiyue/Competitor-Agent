@@ -12,6 +12,11 @@ export interface AgentNode {
   duration_ms?: number | null
   retry_count: number
   error_message?: string | null
+  qa_passed?: boolean | null
+  qa_score?: number | null
+  qa_revision_round?: number | null
+  qa_issue_count?: number
+  qa_updated_at?: string | null
   revision_highlight?: boolean
   revision_label?: string | null
 }

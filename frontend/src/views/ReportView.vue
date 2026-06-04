@@ -21,10 +21,32 @@ const exporting = ref(false)
 
 const claimById = computed(() => new Map(claims.value.map((claim) => [claim.id, claim])))
 const evidenceById = computed(() => new Map(evidence.value.map((item) => [item.id, item])))
-const sections = computed(() => report.value?.report_json?.sections || [])
+const sections = computed(() => orderReportSections(report.value?.report_json?.sections || []))
 const qualitySummary = computed(() => report.value?.report_json?.quality_summary)
 const dimensionQaScores = computed(() => report.value?.report_json?.dimension_qa_scores || [])
+const finalizerQa = computed(() => report.value?.report_json?.finalizer_qa)
+const finalizerQaIssues = computed(() => finalizerQa.value?.issues || [])
 const qaIssues = computed(() => qa.value?.issues || [])
+
+const globalSectionKeywords = [
+  'executive',
+  'summary',
+  'overview',
+  'conclusion',
+  'recommend',
+  'ranking',
+  'takeaway',
+  '摘要',
+  '执行摘要',
+  '总览',
+  '概览',
+  '总体',
+  '总结',
+  '结论',
+  '建议',
+  '推荐',
+  '排名',
+]
 
 const severityType: Record<string, 'danger' | 'warning' | 'info'> = {
   high: 'danger',
@@ -54,6 +76,37 @@ function issueTypeLabel(type?: string) {
 
 function issueActionLabel(action?: string) {
   return action ? actionLabels[action] || action : '-'
+}
+
+function isGlobalSection(section: { section_id?: string; title?: string }) {
+  const text = `${section.section_id || ''} ${section.title || ''}`.toLowerCase()
+  return globalSectionKeywords.some((keyword) => text.includes(keyword))
+}
+
+function isExecutiveSummarySection(section: { section_id?: string; title?: string }) {
+  const text = `${section.section_id || ''} ${section.title || ''}`.toLowerCase()
+  return ['executive', 'summary', 'overview', '摘要', '执行摘要', '总览', '概览'].some((keyword) => text.includes(keyword))
+}
+
+function isConclusionSection(section: { section_id?: string; title?: string }) {
+  const text = `${section.section_id || ''} ${section.title || ''}`.toLowerCase()
+  return ['conclusion', 'takeaway', '总体', '总结', '结论'].some((keyword) => text.includes(keyword))
+}
+
+function isRecommendationOrRiskSection(section: { section_id?: string; title?: string }) {
+  const text = `${section.section_id || ''} ${section.title || ''}`.toLowerCase()
+  return ['recommend', 'ranking', 'risk', 'warning', '建议', '推荐', '排名', '风险', '提示'].some((keyword) => text.includes(keyword))
+}
+
+function orderReportSections<T extends { section_id?: string; title?: string }>(items: T[]) {
+  const allowedSections = items.filter((section) => !isRecommendationOrRiskSection(section))
+  const executiveSections = allowedSections.filter((section) => isExecutiveSummarySection(section))
+  const bodySections = allowedSections.filter((section) => !isGlobalSection(section))
+  const conclusionSections = allowedSections.filter((section) => isConclusionSection(section) && !isExecutiveSummarySection(section))
+  const otherGlobalSections = allowedSections.filter(
+    (section) => isGlobalSection(section) && !isExecutiveSummarySection(section) && !isConclusionSection(section),
+  )
+  return [...executiveSections, ...bodySections, ...conclusionSections, ...otherGlobalSections]
 }
 
 onMounted(async () => {
@@ -178,6 +231,26 @@ async function handleExport(format: 'markdown' | 'pdf') {
           <el-table-column label="建议" width="140">
             <template #default="{ row }">{{ row.suggested_action_label || issueActionLabel(row.suggested_action) }}</template>
           </el-table-column>
+        </el-table>
+      </div>
+      <div class="quality-issues">
+        <h3>报告总结 Agent QA 问题</h3>
+        <el-empty v-if="!finalizerQaIssues.length" description="暂无报告总结 Agent QA 问题" />
+        <el-table v-else :data="finalizerQaIssues" border>
+          <el-table-column label="级别" width="110">
+            <template #default="{ row }">
+              <el-tag :type="severityType[row.severity] || 'info'" size="small">
+                {{ row.severity || '-' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="段落" width="220">
+            <template #default="{ row }">{{ row.paragraph_id || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="Claim" width="160">
+            <template #default="{ row }">{{ row.claim_ids?.length ? row.claim_ids.join(', ') : '-' }}</template>
+          </el-table-column>
+          <el-table-column prop="message" label="问题" />
         </el-table>
       </div>
     </section>

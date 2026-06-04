@@ -69,6 +69,10 @@ function issueTypeLabel(type?: string) {
 function issueActionLabel(action?: string) {
   return action ? actionLabels[action] || action : '-'
 }
+
+function displayRevisionRound(value?: number | null) {
+  return Math.max(1, Number(value ?? 0) + 1)
+}
 </script>
 
 <template>
@@ -78,7 +82,7 @@ function issueActionLabel(action?: string) {
       <div class="status-mark">{{ qa.passed ? '✓' : '!' }}</div>
       <div>
         <h3>{{ qa.passed ? 'QA 通过' : 'QA 未通过，需要处理' }}</h3>
-        <p>评分 {{ qa.score ?? '-' }} · {{ qaScopeLabel }} · 第 {{ qa.revision_round ?? 0 }} 轮返工 · {{ actionLabel }}</p>
+        <p>评分 {{ qa.score ?? '-' }} · {{ qaScopeLabel }} · 第 {{ displayRevisionRound(qa.revision_round) }} 轮返工 · {{ actionLabel }}</p>
       </div>
     </div>
 
@@ -97,7 +101,7 @@ function issueActionLabel(action?: string) {
       </div>
       <div class="overview-item">
         <span>返工轮次</span>
-        <strong>第 {{ qa.revision_round ?? 0 }} 轮</strong>
+        <strong>第 {{ displayRevisionRound(qa.revision_round) }} 轮</strong>
       </div>
       <div class="overview-item">
         <span>建议处理</span>
@@ -134,7 +138,7 @@ function issueActionLabel(action?: string) {
           <template #default="{ row }">{{ row.qa_scope_label || row.qa_scope || '-' }}</template>
         </el-table-column>
         <el-table-column label="轮次" width="100">
-          <template #default="{ row }">第 {{ row.revision_round ?? 0 }} 轮</template>
+          <template #default="{ row }">第 {{ displayRevisionRound(row.revision_round) }} 轮</template>
         </el-table-column>
       </el-table>
     </div>

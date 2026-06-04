@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import DagFlow from '@/components/DagFlow.vue'
 import QaResultPanel from '@/components/QaResultPanel.vue'
 import TaskMetricsPanel from '@/components/TaskMetricsPanel.vue'
-import TaskTimingPanel from '@/components/TaskTimingPanel.vue'
 import {
   cancelAnalysisTask,
   getAnalysisTask,
@@ -30,9 +29,12 @@ const edges = ref<DagEdge[]>([])
 const logs = ref<AgentLog[]>([])
 const metrics = ref<TaskMetrics | null>(null)
 const qaHistory = ref<QAResult[]>([])
-const activeLogGroups = ref<string[]>([])
-const knownLogGroupKeys = ref(new Set<string>())
+const activeQaRounds = ref<string[]>([])
+const activeLogRounds = ref<string[]>([])
+const activeLogAgentGroups = ref<string[]>([])
 const controlLoading = ref<string | null>(null)
+const qaRoundsInitialized = ref(false)
+const logGroupsInitialized = ref(false)
 let timer: number | undefined
 
 interface AgentLogGroup {
@@ -41,6 +43,40 @@ interface AgentLogGroup {
   nodeStatus: string
   latestAt: string
   logs: AgentLog[]
+}
+
+interface AgentLogRoundGroup {
+  key: string
+  revision_round: number
+  display_round: number
+  latestAt: string
+  logCount: number
+  agentGroups: AgentLogGroup[]
+}
+
+interface DimensionQaRoundRow {
+  row_key: string
+  qa_id: number
+  created_at: string
+  revision_round: number
+  display_round: number
+  qa_scope_label: string
+  dimension_label: string
+  dimension_keys: string[]
+  score: number | string
+  passed: boolean
+  suggestion: string
+}
+
+interface DimensionQaRoundGroup {
+  key: string
+  revision_round: number
+  display_round: number
+  created_at: string
+  qa_scope_label: string
+  passed_count: number
+  total_count: number
+  rows: DimensionQaRoundRow[]
 }
 
 const baseNodeOrder = ['planner', 'dimension_planner', 'collector', 'evidence_extractor']
@@ -58,20 +94,103 @@ const orderedNodes = computed(() => {
 const currentNode = computed(() => nodes.value.find((node) => node.status === 'running'))
 const completedCount = computed(() => nodes.value.filter((node) => node.status === 'success').length)
 const latestQa = computed(() => qaHistory.value[qaHistory.value.length - 1] || null)
-const dimensionQaRoundRows = computed(() =>
+const actionLabels: Record<string, string> = {
+  recollect: '重新收集资料',
+  reanalyze: '重新分析',
+  rewrite: '重写报告',
+  ignore: '忽略',
+  end: '无需返工',
+}
+
+function displayRevisionRound(value?: number | null) {
+  return Math.max(1, Number(value ?? 0) + 1)
+}
+
+function dimensionKeys(score: {
+  dimension_label?: string | null
+  dimension_key?: string | null
+  target_node?: string | null
+}) {
+  return [score.dimension_label, score.dimension_key, score.target_node].filter((value): value is string =>
+    Boolean(value),
+  )
+}
+
+function issueMatchesDimension(issue: { related_dimension?: string | null; target_node?: string | null; target_node_label?: string | null }, keys: string[]) {
+  const issueKeys = [issue.related_dimension, issue.target_node, issue.target_node_label].filter((value): value is string =>
+    Boolean(value),
+  )
+  return issueKeys.some((issueKey) => keys.includes(issueKey))
+}
+
+function rowSuggestion(score: { passed?: boolean; issues?: { suggested_action?: string; suggested_action_label?: string }[] }, qa: QAResult, keys: string[]) {
+  if (score.passed) return '-'
+  const scoreIssues = score.issues || []
+  const matchedIssues = [
+    ...scoreIssues,
+    ...qa.issues.filter((issue) => issueMatchesDimension(issue, keys)),
+  ]
+  const labels = [...new Set(
+    matchedIssues
+      .map((issue) => issue.suggested_action_label || (issue.suggested_action ? actionLabels[issue.suggested_action] || issue.suggested_action : ''))
+      .filter(Boolean),
+  )]
+  if (labels.length) return labels.join(' / ')
+  return qa.next_action_label || (qa.next_action ? actionLabels[qa.next_action] || qa.next_action : '待处理')
+}
+
+const dimensionQaRoundRows = computed<DimensionQaRoundRow[]>(() =>
   qaHistory.value.flatMap((qa) => {
     const scores = qa.dimension_scores?.length ? qa.dimension_scores : qa.current_dimension_scores || []
-    return scores.map((score) => ({
+    const revisionRound = Number(qa.revision_round ?? 0)
+    return scores.map((score, index) => {
+      const keys = dimensionKeys(score)
+      return {
+      row_key: `${qa.id}-${score.target_node || score.dimension_key || score.dimension_label || index}`,
       qa_id: qa.id,
       created_at: qa.created_at,
-      revision_round: qa.revision_round ?? score.revision_round ?? 0,
+      revision_round: revisionRound,
+      display_round: displayRevisionRound(revisionRound),
       qa_scope_label: qa.qa_scope_label || score.qa_scope_label || qa.qa_scope || '-',
       dimension_label: score.dimension_label || score.dimension_key || score.target_node,
+      dimension_keys: keys,
       score: score.score ?? '-',
       passed: Boolean(score.passed),
-    }))
+      suggestion: rowSuggestion(score, qa, keys),
+      }
+    })
   }),
 )
+const dimensionQaRoundGroups = computed<DimensionQaRoundGroup[]>(() => {
+  const groups = new Map<string, DimensionQaRoundGroup>()
+  for (const row of dimensionQaRoundRows.value) {
+    const groupKey = String(row.revision_round)
+    const group = groups.get(groupKey)
+    if (group) {
+      group.rows.push(row)
+      group.total_count += 1
+      group.passed_count += row.passed ? 1 : 0
+      if (new Date(row.created_at).getTime() > new Date(group.created_at).getTime()) {
+        group.created_at = row.created_at
+      }
+      continue
+    }
+    groups.set(groupKey, {
+      key: groupKey,
+      revision_round: row.revision_round,
+      display_round: row.display_round,
+      created_at: row.created_at,
+      qa_scope_label: row.qa_scope_label,
+      passed_count: row.passed ? 1 : 0,
+      total_count: 1,
+      rows: [row],
+    })
+  }
+  return [...groups.values()].sort((a, b) => {
+    if (b.revision_round !== a.revision_round) return b.revision_round - a.revision_round
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  })
+})
 const canPause = computed(() =>
   ['queued', 'running', 'planned', 'planning_dimensions', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking', 'finalizing'].includes(
     task.value?.status || '',
@@ -101,17 +220,59 @@ const sortedLogs = computed(() =>
     (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
   ),
 )
-const groupedLogs = computed<AgentLogGroup[]>(() => {
-  const groups = new Map<string, AgentLogGroup>()
+const qaBoundaries = computed(() =>
+  [...qaHistory.value]
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+    .map((qa) => ({
+      createdAt: new Date(qa.created_at).getTime(),
+      revisionRound: Number(qa.revision_round ?? 0),
+    })),
+)
+const revisionMarkers = computed(() =>
+  logs.value
+    .map((log) => ({
+      createdAt: new Date(log.created_at).getTime(),
+      revisionRound: Number(log.payload?.revision_round),
+    }))
+    .filter((marker) => Number.isFinite(marker.revisionRound) && marker.revisionRound > 0)
+    .sort((a, b) => a.createdAt - b.createdAt),
+)
+
+function logRevisionRound(log: AgentLog) {
+  const payloadRound = Number(log.payload?.revision_round)
+  if (Number.isFinite(payloadRound) && payloadRound >= 0) {
+    return payloadRound
+  }
+  const logTime = new Date(log.created_at).getTime()
+  const latestMarker = [...revisionMarkers.value].reverse().find((marker) => marker.createdAt <= logTime)
+  if (latestMarker) {
+    return latestMarker.revisionRound
+  }
+  for (const boundary of qaBoundaries.value) {
+    if (logTime <= boundary.createdAt) {
+      return boundary.revisionRound
+    }
+  }
+  const latest = qaBoundaries.value[qaBoundaries.value.length - 1]
+  return latest ? latest.revisionRound : 0
+}
+
+const groupedLogRounds = computed<AgentLogRoundGroup[]>(() => {
+  const roundGroups = new Map<number, Map<string, AgentLogGroup>>()
+  const latestByRound = new Map<number, string>()
   for (const log of sortedLogs.value) {
     const node = log.node_id ? nodeById.value.get(log.node_id) : undefined
-    const key = node ? String(node.id) : 'system'
-    const group = groups.get(key)
+    const revisionRound = logRevisionRound(log)
+    const agentGroups = roundGroups.get(revisionRound) || new Map<string, AgentLogGroup>()
+    roundGroups.set(revisionRound, agentGroups)
+    latestByRound.set(revisionRound, latestByRound.get(revisionRound) || log.created_at)
+    const key = `${revisionRound}:${node ? String(node.id) : 'system'}`
+    const group = agentGroups.get(key)
     if (group) {
       group.logs.push(log)
       continue
     }
-    groups.set(key, {
+    agentGroups.set(key, {
       key,
       nodeName: node?.node_name || '系统日志',
       nodeStatus: node?.status || 'info',
@@ -119,24 +280,26 @@ const groupedLogs = computed<AgentLogGroup[]>(() => {
       logs: [log],
     })
   }
-  return [...groups.values()].sort(
-    (a, b) => new Date(b.latestAt).getTime() - new Date(a.latestAt).getTime(),
+  const result: AgentLogRoundGroup[] = []
+  for (const [revisionRound, agentGroups] of roundGroups.entries()) {
+    const agentGroupList = [...agentGroups.values()].sort(
+      (a, b) => new Date(b.latestAt).getTime() - new Date(a.latestAt).getTime(),
+    )
+    result.push({
+      key: String(revisionRound),
+      revision_round: revisionRound,
+      display_round: displayRevisionRound(revisionRound),
+      latestAt: latestByRound.get(revisionRound) || agentGroupList[0]?.latestAt || '',
+      logCount: agentGroupList.reduce((sum, group) => sum + group.logs.length, 0),
+      agentGroups: agentGroupList,
+    })
+  }
+  return result.sort((a, b) =>
+    b.revision_round !== a.revision_round
+      ? b.revision_round - a.revision_round
+      : new Date(b.latestAt).getTime() - new Date(a.latestAt).getTime(),
   )
 })
-
-function syncNewLogGroups() {
-  const nextKnown = new Set(knownLogGroupKeys.value)
-  const nextActive = new Set(activeLogGroups.value)
-  for (const group of groupedLogs.value) {
-    if (nextKnown.has(group.key)) continue
-    nextKnown.add(group.key)
-    nextActive.add(group.key)
-  }
-  knownLogGroupKeys.value = nextKnown
-  activeLogGroups.value = [...nextActive].filter((key) =>
-    groupedLogs.value.some((group) => group.key === key),
-  )
-}
 
 function formatDateTime(value: string) {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -150,6 +313,47 @@ function formatDateTime(value: string) {
   }).format(new Date(value))
 }
 
+watch(
+  dimensionQaRoundGroups,
+  (groups) => {
+    if (!groups.length) {
+      activeQaRounds.value = []
+      return
+    }
+    if (!qaRoundsInitialized.value) {
+      activeQaRounds.value = [groups[0]?.key || '']
+      qaRoundsInitialized.value = true
+      return
+    }
+    const existing = new Set(activeQaRounds.value)
+    activeQaRounds.value = [...existing].filter((key) => groups.some((group) => group.key === key))
+  },
+  { immediate: true },
+)
+
+watch(
+  groupedLogRounds,
+  (rounds) => {
+    if (!rounds.length) {
+      activeLogRounds.value = []
+      activeLogAgentGroups.value = []
+      return
+    }
+    if (!logGroupsInitialized.value) {
+      const latestRound = rounds[0]
+      activeLogRounds.value = latestRound ? [latestRound.key] : []
+      activeLogAgentGroups.value = latestRound?.agentGroups.map((group) => group.key) || []
+      logGroupsInitialized.value = true
+      return
+    }
+    const roundKeys = new Set(rounds.map((round) => round.key))
+    const agentKeys = new Set(rounds.flatMap((round) => round.agentGroups.map((group) => group.key)))
+    activeLogRounds.value = activeLogRounds.value.filter((key) => roundKeys.has(key))
+    activeLogAgentGroups.value = activeLogAgentGroups.value.filter((key) => agentKeys.has(key))
+  },
+  { immediate: true },
+)
+
 async function load() {
   task.value = await getAnalysisTask(taskId)
   const flow = await getTaskNodes(taskId)
@@ -158,7 +362,6 @@ async function load() {
   logs.value = await getTaskLogs(taskId)
   metrics.value = await getTaskMetrics(taskId)
   qaHistory.value = await getTaskQaHistory(taskId)
-  syncNewLogGroups()
 }
 
 async function runControl(action: 'pause' | 'resume' | 'cancel' | 'retry') {
@@ -270,61 +473,83 @@ onBeforeUnmount(() => {
 
     <DagFlow :nodes="nodes" :edges="edges" />
 
-    <TaskMetricsPanel :metrics="metrics" />
-
     <section class="section">
       <h2>QA 结果</h2>
       <QaResultPanel :qa="latestQa" />
       <div class="qa-history">
         <h3>每轮每维 QA 得分</h3>
-        <el-empty v-if="!dimensionQaRoundRows.length" description="暂无每维 QA 分数" />
-        <el-table v-else :data="dimensionQaRoundRows" border>
-          <el-table-column label="轮次" width="100">
-            <template #default="{ row }">第 {{ row.revision_round }} 轮</template>
-          </el-table-column>
-          <el-table-column label="时间" min-width="180">
-            <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
-          </el-table-column>
-          <el-table-column prop="dimension_label" label="维度" min-width="180" />
-          <el-table-column label="分数" width="100">
-            <template #default="{ row }">{{ row.score }}</template>
-          </el-table-column>
-          <el-table-column label="状态" width="100">
-            <template #default="{ row }">
-              <el-tag :type="row.passed ? 'success' : 'warning'" size="small">
-                {{ row.passed ? '通过' : '未通过' }}
-              </el-tag>
+        <el-empty v-if="!dimensionQaRoundGroups.length" description="暂无每维 QA 分数" />
+        <el-collapse v-else v-model="activeQaRounds" class="qa-round-collapse">
+          <el-collapse-item v-for="group in dimensionQaRoundGroups" :key="group.key" :name="group.key">
+            <template #title>
+              <div class="qa-round-title">
+                <strong>第 {{ group.display_round }} 轮</strong>
+                <el-tag :type="group.passed_count === group.total_count ? 'success' : 'warning'" size="small">
+                  {{ group.passed_count }}/{{ group.total_count }} 通过
+                </el-tag>
+                <span>{{ group.qa_scope_label }}</span>
+                <time>{{ formatDateTime(group.created_at) }}</time>
+              </div>
             </template>
-          </el-table-column>
-          <el-table-column prop="qa_scope_label" label="检查范围" width="150" />
-        </el-table>
+            <el-table :data="group.rows" border>
+              <el-table-column prop="dimension_label" label="维度" min-width="180" />
+              <el-table-column label="分数" width="100">
+                <template #default="{ row }">{{ row.score }}</template>
+              </el-table-column>
+              <el-table-column label="状态" width="100">
+                <template #default="{ row }">
+                  <el-tag :type="row.passed ? 'success' : 'warning'" size="small">
+                    {{ row.passed ? '通过' : '未通过' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="返工建议" min-width="160">
+                <template #default="{ row }">{{ row.suggestion }}</template>
+              </el-table-column>
+              <el-table-column prop="qa_scope_label" label="检查范围" width="150" />
+            </el-table>
+          </el-collapse-item>
+        </el-collapse>
       </div>
     </section>
 
-    <TaskTimingPanel :logs="logs" />
+    <TaskMetricsPanel :metrics="metrics" />
 
     <section class="section">
       <h2>Agent 日志</h2>
-      <el-collapse v-model="activeLogGroups" class="log-collapse">
-        <el-collapse-item v-for="group in groupedLogs" :key="group.key" :name="group.key">
+      <el-empty v-if="!groupedLogRounds.length" description="暂无 Agent 日志" />
+      <el-collapse v-else v-model="activeLogRounds" class="log-collapse">
+        <el-collapse-item v-for="round in groupedLogRounds" :key="round.key" :name="round.key">
           <template #title>
-            <div class="log-group-title">
-              <strong>{{ group.nodeName }}</strong>
-              <el-tag size="small" effect="plain">{{ group.nodeStatus }}</el-tag>
-              <span>{{ group.logs.length }} 条动态</span>
-              <time>{{ group.latestAt }}</time>
+            <div class="log-round-title">
+              <strong>第 {{ round.display_round }} 轮</strong>
+              <el-tag size="small" effect="plain">{{ round.agentGroups.length }} 个 Agent</el-tag>
+              <span>{{ round.logCount }} 条动态</span>
+              <time>{{ formatDateTime(round.latestAt) }}</time>
             </div>
           </template>
-          <el-timeline class="log-timeline">
-            <el-timeline-item
-              v-for="log in group.logs"
-              :key="log.id"
-              :timestamp="log.created_at"
-              :type="log.log_type === 'error' ? 'danger' : log.log_type === 'warning' ? 'warning' : 'primary'"
-            >
-              {{ log.message }}
-            </el-timeline-item>
-          </el-timeline>
+          <el-collapse v-model="activeLogAgentGroups" class="agent-log-collapse">
+            <el-collapse-item v-for="group in round.agentGroups" :key="group.key" :name="group.key">
+              <template #title>
+                <div class="log-group-title">
+                  <strong>{{ group.nodeName }}</strong>
+                  <el-tag size="small" effect="plain">{{ group.nodeStatus }}</el-tag>
+                  <span>{{ group.logs.length }} 条动态</span>
+                  <time>{{ formatDateTime(group.latestAt) }}</time>
+                </div>
+              </template>
+              <el-timeline class="log-timeline">
+                <el-timeline-item
+                  v-for="log in group.logs"
+                  :key="log.id"
+                  :timestamp="formatDateTime(log.created_at)"
+                  :type="log.log_type === 'error' ? 'danger' : log.log_type === 'warning' ? 'warning' : 'primary'"
+                >
+                  {{ log.message }}
+                </el-timeline-item>
+              </el-timeline>
+            </el-collapse-item>
+          </el-collapse>
         </el-collapse-item>
       </el-collapse>
     </section>
@@ -427,10 +652,34 @@ onBeforeUnmount(() => {
   gap: 10px;
 }
 
+.qa-round-collapse {
+  border-top: 1px solid var(--el-border-color);
+}
+
+.qa-round-title {
+  display: grid;
+  grid-template-columns: minmax(100px, auto) auto minmax(120px, 1fr) minmax(170px, auto);
+  align-items: center;
+  width: 100%;
+  gap: 10px;
+  padding-right: 12px;
+}
+
+.qa-round-title span,
+.qa-round-title time {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
 .log-collapse {
   border-top: 1px solid var(--el-border-color);
 }
 
+.agent-log-collapse {
+  border-top: 0;
+}
+
+.log-round-title,
 .log-group-title {
   display: grid;
   grid-template-columns: minmax(160px, 1fr) auto auto minmax(170px, auto);
@@ -440,6 +689,7 @@ onBeforeUnmount(() => {
   padding-right: 12px;
 }
 
+.log-round-title strong,
 .log-group-title strong {
   min-width: 0;
   overflow: hidden;
@@ -447,6 +697,8 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+.log-round-title span,
+.log-round-title time,
 .log-group-title span,
 .log-group-title time {
   color: var(--el-text-color-secondary);
@@ -482,11 +734,19 @@ p {
 }
 
 @media (max-width: 760px) {
+  .log-round-title,
   .log-group-title {
     grid-template-columns: minmax(120px, 1fr) auto;
   }
 
-  .log-group-title time {
+  .qa-round-title {
+    grid-template-columns: minmax(100px, 1fr) auto;
+  }
+
+  .log-round-title time,
+  .log-group-title time,
+  .qa-round-title time,
+  .qa-round-title span {
     grid-column: 1 / -1;
   }
 }

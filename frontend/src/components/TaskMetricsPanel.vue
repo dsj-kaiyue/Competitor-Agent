@@ -26,7 +26,6 @@ const metricCards = computed(() => {
     { label: 'Matrix', value: metrics.matrix_count },
     { label: 'Embedding 失败', value: metrics.embedding_failed_count },
     { label: 'RAG fallback', value: metrics.rag_fallback_count },
-    { label: 'QA 分数', value: metrics.qa_score ?? '-' },
   ]
 })
 </script>

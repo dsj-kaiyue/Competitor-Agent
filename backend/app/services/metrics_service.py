@@ -10,6 +10,7 @@ from app.models.comparison_matrix import ComparisonMatrix
 from app.models.competitor_profile import CompetitorProfile
 from app.models.evidence_chunk import EvidenceChunk
 from app.models.qa_result import QAResult
+from app.models.report import Report
 from app.models.source_document import SourceDocument
 from app.schemas.metrics import TaskMetricsResponse
 from app.services.task_service import get_task_plan
@@ -57,6 +58,10 @@ class MetricsService:
         matrix_count = self._count(ComparisonMatrix, task_id)
         latest_qa = self.db.scalar(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id.desc()))
         qa_results = list(self.db.scalars(select(QAResult).where(QAResult.task_id == task_id)))
+        latest_report = self.db.scalar(select(Report).where(Report.task_id == task_id).order_by(Report.id.desc()))
+        quality_summary = latest_report.report_json.get("quality_summary") if latest_report and isinstance(latest_report.report_json, dict) else None
+        final_qa_score = quality_summary.get("final_score") if isinstance(quality_summary, dict) else None
+        final_qa_passed = quality_summary.get("final_status") == "通过" if isinstance(quality_summary, dict) else None
         nodes = list(self.db.scalars(select(AgentNode).where(AgentNode.task_id == task_id).order_by(AgentNode.id)))
         logs = list(self.db.scalars(select(AgentRunLog).where(AgentRunLog.task_id == task_id)))
 
@@ -100,8 +105,8 @@ class MetricsService:
             evidence_usage_rate=round(used_evidence_count / evidence_chunk_count, 4) if evidence_chunk_count else 0.0,
             profile_count=profile_count,
             matrix_count=matrix_count,
-            qa_score=float(latest_qa.score) if latest_qa and latest_qa.score is not None else None,
-            qa_passed=latest_qa.passed if latest_qa else None,
+            qa_score=float(final_qa_score) if final_qa_score is not None else (float(latest_qa.score) if latest_qa and latest_qa.score is not None else None),
+            qa_passed=final_qa_passed if final_qa_passed is not None else (latest_qa.passed if latest_qa else None),
             revision_count=max(0, len(qa_results) - 1),
             source_diversity=source_diversity,
             competitor_coverage=competitor_coverage,

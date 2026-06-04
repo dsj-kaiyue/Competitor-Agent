@@ -47,6 +47,8 @@ const targetLabels = computed(() => {
 
 const qaScopeLabel = computed(() => props.qa?.qa_scope_label || (props.qa?.qa_scope === 'partial_revision' ? '本轮返工维度' : '完整报告'))
 
+const dimensionScores = computed(() => props.qa?.dimension_scores || [])
+
 const revisionReasonItems = computed(() => {
   const reason = props.qa?.revision_reason?.trim()
   if (!reason) return []
@@ -110,6 +112,31 @@ function issueActionLabel(action?: string) {
           {{ node }}
         </el-tag>
       </div>
+    </div>
+
+    <div v-if="dimensionScores.length" class="qa-section">
+      <div class="section-title">每维 QA 分数</div>
+      <el-table :data="dimensionScores" border>
+        <el-table-column label="维度">
+          <template #default="{ row }">{{ row.dimension_label || row.dimension_key || row.target_node }}</template>
+        </el-table-column>
+        <el-table-column label="分数" width="100">
+          <template #default="{ row }">{{ row.score ?? '-' }}</template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :type="row.passed ? 'success' : 'warning'" size="small">
+              {{ row.passed ? '通过' : '未通过' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="检查范围" width="150">
+          <template #default="{ row }">{{ row.qa_scope_label || row.qa_scope || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="轮次" width="100">
+          <template #default="{ row }">第 {{ row.revision_round ?? 0 }} 轮</template>
+        </el-table-column>
+      </el-table>
     </div>
 
     <div v-if="revisionReasonItems.length && !qa.issues.length" class="qa-section">

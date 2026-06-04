@@ -25,7 +25,7 @@ AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话�
 - 每个动态维度 Analyst 使用独立 DB Session、独立 EvidenceRetriever、独立 LLMClient 和独立 Milvus 查询上下文。
 - DAG 页面可视化展示并行采集 worker、并行证据 worker、动态维度 Analyst，并在 QA 返工时高亮本轮需要重跑的 Agent 路线。
 - Analyst Agent 使用 Milvus RAG 检索 evidence，Milvus 未命中时 fallback 到 MySQL evidence。
-- ReportWriter 输出具体分析维度正文 `report_json.sections`，QA 通过后由 Report Finalizer 生成执行摘要、总体结论和建议等全文总结 section。
+- ReportWriter 输出具体分析维度正文 `report_json.sections`，Report Finalizer 在 QA 通过或达到返工上限后生成执行摘要、总体结论和建议等全文总结 section。
 - 报告页支持导出 Markdown 文件和 PDF 文件，并导出动态对比矩阵、QA 结果、结构化 Claim 和证据链。
 - 任务控制支持暂停、恢复、取消和手动重试；Celery 不对业务失败自动反复 retry。
 - 任务规划 Agent 在正式执行时只确认用户修改后的 TaskPlan，不二次 LLM 解析覆盖前端修改。
@@ -34,7 +34,7 @@ AI 驱动的通用竞品分析 Agent 协作系统。系统把用户的一句话�
 - 创建页顶部提供“自动添加分析维度”开关；只要打开，不管用户是否已输入分析维度，解析阶段都会补充推荐维度并立即回填到前端供用户增删。
 - Planner Agent 根据用户输入场景动态推荐 `analysis_dimensions`，用户最终确认后的维度会生成动态画像 Schema。
 - 系统生成动态竞品画像 `competitor_profile` 和动态对比矩阵 `comparison_matrix`，画像字段全部存储在 JSON 中，不增加行业固定列。
-- ReportWriter 优先基于动态画像和动态矩阵组织维度正文，同时保留 Claim/Evidence 溯源；Report Finalizer 只基于已通过 QA 的正文和 Claim 生成最终总结。
+- ReportWriter 优先基于动态画像和动态矩阵组织维度正文，同时保留 Claim/Evidence 溯源；Report Finalizer 只基于当前最终正文和 Claim 生成最终总结，并通过内部 grounding QA 检查总结是否有支撑。
 - 报告接口返回动态画像和动态矩阵；报告页只展示“竞品动态对比矩阵”，避免把同一批画像信息重复显示两次。
 - `/api/v1/analysis-tasks/{task_id}/metrics` 提供任务运行指标，任务详情页提供运行指标面板。
 - 数据库新写入时间统一使用北京时间。
@@ -331,7 +331,7 @@ JSON 修正请求的 user prompt：
 | Dynamic Dimension Analyst Agent | 证据抽取完成后 | 某个维度的 prompt spec、某个竞品、RAG evidence | Claim JSON 数组 | 写入 `claim`、`claim_evidence` |
 | ReportWriter Agent | 动态维度 Analyst 完成且至少有 Claim | 画像、矩阵、Claim | 报告 JSON | 写入 `report` |
 | QA Agent | ReportWriter 完成后 | 维度正文 Markdown、本地规则检查问题 | QA 结果 JSON | 写入 `qa_result` |
-| Report Finalizer Agent | QA 通过后 | 已通过 QA 的维度正文、动态画像、矩阵、Claim | 最终执行摘要、总体结论、建议等全局 section | 写入最终 `report` |
+| Report Finalizer Agent | QA 通过后，或达到返工上限后 | 当前最终维度正文、动态画像、矩阵、Claim、残留 QA 问题 | 最终执行摘要、总体结论、建议等全局 section 和质量汇总 | 写入最终 `report` |
 
 ### 1. Planner Agent：需求解析
 
@@ -1198,7 +1198,8 @@ QA 分两步：
 
 - 首次报告生成和 `rewrite` 返工后，QA scope 是 `full_report`，会检查完整维度正文和全部 Claim。
 - `recollect` / `reanalyze` 返工后，ReportWriter 使用 `partial_revision` 只替换目标维度 section，QA scope 也是 `partial_revision`，只检查本轮返工目标维度的 section 和目标 Claim，不重新评价其它维度。
-- 因此最新 `qa_result.score` 表示最新一次 QA 的检查范围得分；前端和导出报告会显示 `qa_scope_label`，避免把局部返工得分误解成全量重新评分。
+- QA payload 会保存 `dimension_scores`：首次 `full_report` 覆盖全部维度，后续 `partial_revision` 只更新本轮目标维度，未返工维度沿用已有最新分数。
+- 因此最新 `qa_result.score` 表示最新一次 QA 的检查范围得分；最终报告分数使用每维最新分数和报告总结 grounding QA 汇总计算。
 
 输入示例：
 
@@ -1898,9 +1899,13 @@ QA Agent 至少检查：
 - `recollect`：进入增量补采流程，执行 `collector(recollect) -> evidence_extractor -> 目标 dimension_analysis_* -> build_dynamic_knowledge -> report_writer(partial_revision) -> qa`。
 - `reanalyze`：只重跑受影响的目标维度，执行 `目标 dimension_analysis_* -> build_dynamic_knowledge -> report_writer(partial_revision) -> qa`。
 - `rewrite`：整篇重写维度正文，执行 `report_writer(full_write) -> qa`。
+- 首次全局 QA 后，返工目标会合并所有 actionable 问题对应的动态维度；低于 `QA_DIMENSION_PASS_THRESHOLD` 的维度即使不是 high 风险，也会进入目标返工维度列表。
 - ReportWriter 有两种模式：`full_write` 用于首次维度正文生成和 `rewrite` 返工；`partial_revision` 用于 `recollect/reanalyze` 后，只替换目标维度 section。
 - QA 也有对应检查范围：`full_report` 会检查完整报告正文和全部 Claim；`partial_revision` 只检查本轮返工目标维度的 section 与 Claim，分数代表本轮局部复核结果。
 - `report_finalizer` 在 QA 通过后执行；如果 QA 未通过但已达到最大返工轮数，也会继续执行，基于当前可用的维度正文生成最终报告，并在执行摘要、总体结论或风险提示中明确标注残留 QA 问题，避免把未通过内容包装成完全可靠结论。
+- Report Finalizer 内部会执行 grounding QA，检查执行摘要、总体结论、建议和风险提示是否被正文 Claim 支撑；未通过时只重写全局总结 section，最多重写 `REPORT_FINALIZER_MAX_REVISION_ROUNDS` 轮。
+- 最终 QA 分数写入最终 `report.report_json.quality_summary`：`final_score = dimension_avg * 0.7 + finalizer_score * 0.3`。
+- 最终 QA 状态有硬性门槛：任一核心维度 `< QA_DIMENSION_PASS_THRESHOLD`、报告总结 `< QA_FINALIZER_PASS_THRESHOLD`、或存在 unresolved high 风险时，最终状态不能标记为通过。
 - `recollect` 和 `reanalyze` 都不会全量重跑所有动态维度 Agent，只重跑 QA 定位到的 `dimension_analysis_*` 节点；如果无法定位目标维度，系统会停止并暴露定位失败原因。
 - `recollect` 模式下 Collector 只使用 `followup_queries`，不会重复执行首次采集时所有维度 query；Evidence Extractor 优先只处理本轮新增 `source_document_ids`。
 - 返工会追加日志、追加新的 `qa_result`，不删除第一次执行日志。
@@ -2298,6 +2303,12 @@ FALLBACK_TO_LOCAL_THREAD_ON_CELERY_ERROR=true
 FALLBACK_TO_LOCAL_THREAD_WHEN_WORKER_UNAVAILABLE=true
 # QA 不通过时最多自动返工/重跑轮数；0 表示不自动返工，1 表示最多返工 1 轮。
 QA_MAX_REVISION_ROUNDS=1
+# 报告总结 Agent 内部 grounding QA 不通过时，最多自动重写全局总结 section 的次数；0 表示只检查不重写。
+REPORT_FINALIZER_MAX_REVISION_ROUNDS=2
+# 任一核心分析维度 QA 分数低于该阈值时，最终 QA 状态不能标记为通过。
+QA_DIMENSION_PASS_THRESHOLD=0.70
+# 报告总结 Agent 的 grounding QA 分数低于该阈值时，最终 QA 状态不能标记为通过。
+QA_FINALIZER_PASS_THRESHOLD=0.75
 
 CELERY_WORKER_HEARTBEAT_TTL_SECONDS=45
 CELERY_WORKER_HEARTBEAT_INTERVAL_SECONDS=10
@@ -2317,6 +2328,9 @@ EVIDENCE_EMBEDDING_BATCH_SIZE=8
 - `EVIDENCE_EXTRACTOR_MAX_WORKERS=4~8`：embedding 服务稳定时可调大；并发过高会触发限流。
 - `EVIDENCE_EMBEDDING_BATCH_SIZE=1~10`：DashScope `text-embedding-v4` 单次请求最多 10 条 input，建议 8。
 - `QA_MAX_REVISION_ROUNDS=0~3`：QA 不通过时最多自动返工/重跑几轮，默认 1；设置为 0 表示不自动返工。
+- `REPORT_FINALIZER_MAX_REVISION_ROUNDS=0~2`：报告总结 grounding QA 不通过时最多重写全局总结几轮，默认 2。
+- `QA_DIMENSION_PASS_THRESHOLD=0.70`：任一核心维度低于该分数时，最终 QA 状态不能通过。
+- `QA_FINALIZER_PASS_THRESHOLD=0.75`：报告总结 grounding QA 低于该分数时，最终 QA 状态不能通过。
 - 并发越高，越可能触发 Firecrawl / embedding / Milvus 限流。
 
 前端配置：

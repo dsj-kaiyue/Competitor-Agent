@@ -1,13 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { RouterLink, useRoute } from 'vue-router'
-import { getTaskLogs } from '@/api/analysisTaskApi'
+import { computed, ref } from 'vue'
 import type { AgentLog } from '@/types/agentNode'
 
-const taskId = Number(useRoute().params.id)
-const logs = ref<AgentLog[]>([])
-const loading = ref(false)
-const errorMessage = ref('')
+const props = defineProps<{
+  logs: AgentLog[]
+}>()
+
 const selectedMetricId = ref<number | null>(null)
 
 interface TimingMetric {
@@ -63,7 +61,7 @@ function metricFromLog(log: AgentLog): TimingMetric | null {
 }
 
 const metrics = computed(() =>
-  logs.value
+  props.logs
     .map(metricFromLog)
     .filter((metric): metric is TimingMetric => Boolean(metric))
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()),
@@ -81,6 +79,7 @@ const selectedMetric = computed(() => {
   if (!completedAttempts.value.length) return null
   return completedAttempts.value.find((metric) => metric.id === selectedMetricId.value) || completedAttempts.value[0]
 })
+
 const maxDuration = computed(() => {
   const metric = selectedMetric.value
   if (!metric) return 1
@@ -132,43 +131,22 @@ function formatDateTime(value: string) {
 function barWidth(value: number) {
   return `${Math.max(4, Math.round((value / maxDuration.value) * 100))}%`
 }
-
-async function load() {
-  loading.value = true
-  errorMessage.value = ''
-  try {
-    logs.value = await getTaskLogs(taskId)
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : String(error)
-  } finally {
-    loading.value = false
-  }
-}
-
-onMounted(load)
 </script>
 
 <template>
-  <main v-loading="loading" class="page">
-    <section class="toolbar">
+  <section class="timing-shell">
+    <header>
       <div>
-        <h1>阶段耗时</h1>
-        <p>任务 #{{ taskId }} 的证据抽取性能指标</p>
+        <h2>阶段耗时</h2>
+        <p>证据抽取性能指标</p>
       </div>
-      <div class="actions">
-        <el-button @click="load">刷新</el-button>
-        <RouterLink :to="`/tasks/${taskId}`">
-          <el-button type="primary">返回任务</el-button>
-        </RouterLink>
-      </div>
-    </section>
+    </header>
 
-    <el-alert v-if="errorMessage" :title="errorMessage" type="error" show-icon :closable="false" />
-    <el-empty v-if="!loading && !metrics.length" description="暂无阶段耗时日志" />
+    <el-empty v-if="!metrics.length" description="暂无阶段耗时日志" />
 
     <section v-if="completedAttempts.length" class="attempt-panel">
       <div>
-        <h2>证据抽取轮次</h2>
+        <h3>证据抽取轮次</h3>
         <p>QA 返工会产生多次证据抽取，默认展示最新一轮。</p>
       </div>
       <el-select v-model="selectedMetricId" placeholder="最新一轮" clearable class="attempt-select">
@@ -221,7 +199,7 @@ onMounted(load)
     </section>
 
     <section v-if="metrics.length" class="section">
-      <h2>原始指标日志</h2>
+      <h3>原始指标日志</h3>
       <el-table :data="metrics" border>
         <el-table-column label="时间" min-width="190">
           <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
@@ -247,29 +225,24 @@ onMounted(load)
         </el-table-column>
       </el-table>
     </section>
-  </main>
+  </section>
 </template>
 
 <style scoped>
-.page,
+.timing-shell,
 .section,
 .timing-panel {
   display: grid;
   gap: 18px;
 }
 
-.toolbar,
-.actions,
+header,
 .timing-label,
 .attempt-panel {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-}
-
-.actions {
-  justify-content: flex-end;
+  gap: 14px;
 }
 
 .summary-grid {
@@ -294,17 +267,17 @@ onMounted(load)
 
 .summary-item {
   display: grid;
-  gap: 8px;
+  gap: 4px;
 }
 
 .summary-item span,
-.timing-label span,
-p {
+p,
+.timing-label span {
   color: var(--el-text-color-secondary);
 }
 
 .summary-item strong {
-  font-size: 22px;
+  font-size: 20px;
 }
 
 .timing-row {
@@ -316,32 +289,33 @@ p {
   height: 10px;
   overflow: hidden;
   border-radius: 999px;
-  background: #eef1f6;
+  background: var(--el-fill-color-light);
 }
 
 .bar-fill {
   height: 100%;
   border-radius: inherit;
-  background: #409eff;
+  background: var(--el-color-primary);
 }
 
-h1,
 h2,
+h3,
 p {
   margin: 0;
-}
-
-h1 {
-  font-size: 22px;
 }
 
 h2 {
   font-size: 18px;
 }
 
+h3 {
+  font-size: 15px;
+}
+
 @media (max-width: 760px) {
-  .toolbar,
-  .attempt-panel {
+  header,
+  .attempt-panel,
+  .timing-label {
     align-items: flex-start;
     flex-direction: column;
   }

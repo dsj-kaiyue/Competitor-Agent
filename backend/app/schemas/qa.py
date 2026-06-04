@@ -30,6 +30,8 @@ class QAResultPayload(BaseModel):
     passed: bool
     score: float = Field(ge=0, le=1)
     issues: list[QAIssue] = []
+    dimension_scores: list[dict] = []
+    current_dimension_scores: list[dict] = []
     next_action: Literal["end", "recollect", "reanalyze", "rewrite"] = "end"
     target_nodes: list[str] = []
     qa_scope: Literal["full_report", "partial_revision"] = "full_report"
@@ -48,6 +50,8 @@ class QAResultItem(BaseModel):
     passed: bool
     score: Decimal | None
     issues: list[dict]
+    dimension_scores: list[dict] = []
+    current_dimension_scores: list[dict] = []
     next_action: str = "end"
     next_action_label: str = "无需返工"
     target_nodes: list[str] = []
@@ -61,3 +65,7 @@ class QAResultItem(BaseModel):
 
 class QAResultResponse(BaseModel):
     qa_result: QAResultItem | None
+
+
+class QAResultHistoryResponse(BaseModel):
+    items: list[QAResultItem]

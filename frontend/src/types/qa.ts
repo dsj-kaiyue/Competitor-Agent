@@ -14,6 +14,18 @@ export interface QAIssue {
   severity_label?: string
 }
 
+export interface DimensionQAScore {
+  target_node: string
+  dimension_key?: string | null
+  dimension_label?: string | null
+  score?: number | string | null
+  passed?: boolean
+  issues?: QAIssue[]
+  qa_scope?: string
+  qa_scope_label?: string
+  revision_round?: number
+}
+
 export interface QAResult {
   id: number
   task_id: number
@@ -21,6 +33,8 @@ export interface QAResult {
   passed: boolean
   score?: string | number | null
   issues: QAIssue[]
+  dimension_scores?: DimensionQAScore[]
+  current_dimension_scores?: DimensionQAScore[]
   next_action?: string
   next_action_label?: string
   target_nodes?: string[]

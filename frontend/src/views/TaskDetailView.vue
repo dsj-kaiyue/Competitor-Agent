@@ -3,13 +3,16 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import DagFlow from '@/components/DagFlow.vue'
+import QaResultPanel from '@/components/QaResultPanel.vue'
 import TaskMetricsPanel from '@/components/TaskMetricsPanel.vue'
+import TaskTimingPanel from '@/components/TaskTimingPanel.vue'
 import {
   cancelAnalysisTask,
   getAnalysisTask,
   getTaskMetrics,
   getTaskLogs,
   getTaskNodes,
+  getTaskQaHistory,
   pauseAnalysisTask,
   resumeAnalysisTask,
   retryAnalysisTask,
@@ -17,6 +20,7 @@ import {
 import type { AgentLog, AgentNode, DagEdge } from '@/types/agentNode'
 import type { AnalysisTask } from '@/types/analysisTask'
 import type { TaskMetrics } from '@/types/metrics'
+import type { QAResult } from '@/types/qa'
 
 const route = useRoute()
 const taskId = Number(route.params.id)
@@ -25,6 +29,7 @@ const nodes = ref<AgentNode[]>([])
 const edges = ref<DagEdge[]>([])
 const logs = ref<AgentLog[]>([])
 const metrics = ref<TaskMetrics | null>(null)
+const qaHistory = ref<QAResult[]>([])
 const activeLogGroups = ref<string[]>([])
 const knownLogGroupKeys = ref(new Set<string>())
 const controlLoading = ref<string | null>(null)
@@ -52,6 +57,21 @@ const orderedNodes = computed(() => {
 
 const currentNode = computed(() => nodes.value.find((node) => node.status === 'running'))
 const completedCount = computed(() => nodes.value.filter((node) => node.status === 'success').length)
+const latestQa = computed(() => qaHistory.value[qaHistory.value.length - 1] || null)
+const dimensionQaRoundRows = computed(() =>
+  qaHistory.value.flatMap((qa) => {
+    const scores = qa.dimension_scores?.length ? qa.dimension_scores : qa.current_dimension_scores || []
+    return scores.map((score) => ({
+      qa_id: qa.id,
+      created_at: qa.created_at,
+      revision_round: qa.revision_round ?? score.revision_round ?? 0,
+      qa_scope_label: qa.qa_scope_label || score.qa_scope_label || qa.qa_scope || '-',
+      dimension_label: score.dimension_label || score.dimension_key || score.target_node,
+      score: score.score ?? '-',
+      passed: Boolean(score.passed),
+    }))
+  }),
+)
 const canPause = computed(() =>
   ['queued', 'running', 'planned', 'planning_dimensions', 'collecting', 'extracting', 'analyzing', 'writing', 'qa_checking', 'finalizing'].includes(
     task.value?.status || '',
@@ -118,6 +138,18 @@ function syncNewLogGroups() {
   )
 }
 
+function formatDateTime(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(new Date(value))
+}
+
 async function load() {
   task.value = await getAnalysisTask(taskId)
   const flow = await getTaskNodes(taskId)
@@ -125,6 +157,7 @@ async function load() {
   edges.value = flow.edges
   logs.value = await getTaskLogs(taskId)
   metrics.value = await getTaskMetrics(taskId)
+  qaHistory.value = await getTaskQaHistory(taskId)
   syncNewLogGroups()
 }
 
@@ -201,9 +234,6 @@ onBeforeUnmount(() => {
         <RouterLink :to="`/tasks/${taskId}/evidence`">
           <el-button>证据链</el-button>
         </RouterLink>
-        <RouterLink :to="`/tasks/${taskId}/timing`">
-          <el-button>阶段耗时</el-button>
-        </RouterLink>
         <RouterLink :to="`/tasks/${taskId}/report`">
           <el-button type="primary">报告</el-button>
         </RouterLink>
@@ -241,6 +271,37 @@ onBeforeUnmount(() => {
     <DagFlow :nodes="nodes" :edges="edges" />
 
     <TaskMetricsPanel :metrics="metrics" />
+
+    <section class="section">
+      <h2>QA 结果</h2>
+      <QaResultPanel :qa="latestQa" />
+      <div class="qa-history">
+        <h3>每轮每维 QA 得分</h3>
+        <el-empty v-if="!dimensionQaRoundRows.length" description="暂无每维 QA 分数" />
+        <el-table v-else :data="dimensionQaRoundRows" border>
+          <el-table-column label="轮次" width="100">
+            <template #default="{ row }">第 {{ row.revision_round }} 轮</template>
+          </el-table-column>
+          <el-table-column label="时间" min-width="180">
+            <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column prop="dimension_label" label="维度" min-width="180" />
+          <el-table-column label="分数" width="100">
+            <template #default="{ row }">{{ row.score }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="100">
+            <template #default="{ row }">
+              <el-tag :type="row.passed ? 'success' : 'warning'" size="small">
+                {{ row.passed ? '通过' : '未通过' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="qa_scope_label" label="检查范围" width="150" />
+        </el-table>
+      </div>
+    </section>
+
+    <TaskTimingPanel :logs="logs" />
 
     <section class="section">
       <h2>Agent 日志</h2>
@@ -361,6 +422,11 @@ onBeforeUnmount(() => {
   box-shadow: 0 0 0 3px rgba(230, 162, 60, 0.14);
 }
 
+.qa-history {
+  display: grid;
+  gap: 10px;
+}
+
 .log-collapse {
   border-top: 1px solid var(--el-border-color);
 }
@@ -393,6 +459,7 @@ onBeforeUnmount(() => {
 
 h1,
 h2,
+h3,
 p {
   margin: 0;
 }
@@ -403,6 +470,10 @@ h1 {
 
 h2 {
   font-size: 18px;
+}
+
+h3 {
+  font-size: 15px;
 }
 
 p {

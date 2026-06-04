@@ -1,7 +1,7 @@
 import type { ClaimItem } from './claim'
 import type { ComparisonMatrix } from './comparisonMatrix'
 import type { CompetitorProfile } from './competitorProfile'
-import type { QAResult } from './qa'
+import type { DimensionQAScore, QAResult } from './qa'
 
 export interface ReportParagraph {
   paragraph_id: string
@@ -16,6 +16,21 @@ export interface ReportSection {
   paragraphs: ReportParagraph[]
 }
 
+export interface ReportQualitySummary {
+  dimension_body_qa_status?: string
+  finalizer_grounding_status?: string
+  final_status?: string
+  final_score?: number | string | null
+  dimension_avg?: number | string | null
+  finalizer_score?: number | string | null
+  dimension_weight?: number
+  finalizer_weight?: number
+  dimension_pass_threshold?: number
+  finalizer_pass_threshold?: number
+  high_risk_issue_count?: number
+  blockers?: string[]
+}
+
 export interface ReportItem {
   id: number
   task_id: number
@@ -25,6 +40,9 @@ export interface ReportItem {
   report_json?: {
     title?: string
     sections?: ReportSection[]
+    quality_summary?: ReportQualitySummary
+    dimension_qa_scores?: DimensionQAScore[]
+    finalizer_qa?: Record<string, unknown>
     [key: string]: unknown
   } | null
   created_at: string

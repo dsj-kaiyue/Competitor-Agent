@@ -261,25 +261,50 @@ def _latest_revision_marker(db: Session, task_id: int) -> tuple[dict | None, obj
     return log.payload_json, log.created_at
 
 
-def list_nodes(db: Session, task_id: int) -> list[dict]:
-    nodes = list(db.scalars(select(AgentNode).where(AgentNode.task_id == task_id).order_by(AgentNode.id)))
-    task = db.get(AnalysisTask, task_id)
-    payload, revision_started_at = _latest_revision_marker(db, task_id)
-    latest_qa = db.scalar(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id.desc()))
-    active_statuses = {
+def _revision_marker_is_active(
+    task: AnalysisTask | None,
+    latest_qa: QAResult | None,
+    revision_payload: dict | None,
+    revision_started_at: object | None,
+) -> bool:
+    def revision_round(value: object) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if task is None or latest_qa is None or latest_qa.passed or revision_started_at is None:
+        return False
+    if task.status not in {
         "running",
         "collecting",
         "extracting",
         "analyzing",
         "writing",
         "qa_checking",
-        "finalizing",
         "pause_requested",
         "paused",
-    }
+    }:
+        return False
+    latest_qa_payload = latest_qa.issues_json if isinstance(latest_qa.issues_json, dict) else {}
+    marker_round = revision_round((revision_payload or {}).get("revision_round"))
+    latest_qa_round = revision_round(latest_qa_payload.get("revision_round"))
+    if marker_round > 0:
+        return latest_qa_round < marker_round
+    latest_qa_created_at = getattr(latest_qa, "created_at", None)
+    if latest_qa_created_at is None:
+        return True
+    return latest_qa_created_at <= revision_started_at
+
+
+def list_nodes(db: Session, task_id: int) -> list[dict]:
+    nodes = list(db.scalars(select(AgentNode).where(AgentNode.task_id == task_id).order_by(AgentNode.id)))
+    task = db.get(AnalysisTask, task_id)
+    payload, revision_started_at = _latest_revision_marker(db, task_id)
+    latest_qa = db.scalar(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id.desc()))
     route: list[str] = []
     revision_label = None
-    if task is not None and payload and latest_qa is not None and not latest_qa.passed and task.status in active_statuses:
+    if payload and _revision_marker_is_active(task, latest_qa, payload, revision_started_at):
         route = _revision_route(payload.get("next_action"), payload.get("target_nodes") or [])
         revision_label = f"Revision {payload.get('revision_round') or ''}".strip()
     result = []

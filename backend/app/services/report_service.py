@@ -74,50 +74,75 @@ def _matrix_markdown(matrices: list[ComparisonMatrix]) -> str:
     return "\n".join(sections)
 
 
-def _qa_markdown(qa_payload: dict | None) -> str:
-    sections = ["", "## QA 结果"]
-    if not qa_payload:
-        sections.append("暂无 QA 结果。")
-        return "\n".join(sections)
-    passed = "通过" if qa_payload.get("passed") else "未通过"
-    score = _format_confidence(qa_payload.get("score"))
-    next_action = qa_payload.get("next_action_label") or qa_payload.get("next_action") or "无需返工"
-    qa_scope = qa_payload.get("qa_scope_label") or ("本轮返工维度" if qa_payload.get("qa_scope") == "partial_revision" else "完整报告")
-    revision_round = qa_payload.get("revision_round") or 0
-    target_nodes = qa_payload.get("target_node_labels") or qa_payload.get("target_nodes") or []
-    target_node_text = "；".join(str(item) for item in target_nodes) if target_nodes else "无"
-    sections.extend(
-        [
-            "",
-            "### 质检概览",
-            "",
-            "| 项目 | 结果 |",
-            "| --- | --- |",
-            f"| QA 结论 | {passed} |",
-            f"| QA 评分 | {score} |",
-            f"| 检查范围 | {qa_scope} |",
-            f"| 当前返工轮次 | 第 {revision_round} 轮 |",
-            f"| 建议处理方式 | {next_action} |",
-            f"| 涉及节点/维度 | {_markdown_cell(target_node_text)} |",
-        ]
+def _quality_summary_markdown(report_json: dict | None, qa_payload: dict | None = None) -> str:
+    if not isinstance(report_json, dict):
+        return ""
+    quality = report_json.get("quality_summary") or {}
+    if not isinstance(quality, dict) or not quality:
+        return ""
+    dimension_scores = report_json.get("dimension_qa_scores") or []
+    final_status = quality.get("final_status") or "-"
+    blockers = quality.get("blockers") or []
+    blocker_text = "；".join(str(item) for item in blockers) if isinstance(blockers, list) else str(blockers or "无")
+    score_formula = (
+        f"{_format_confidence(quality.get('dimension_avg'))} × 70% + "
+        f"{_format_confidence(quality.get('finalizer_score'))} × 30%"
     )
+    sections = [
+        "",
+        "## 报告质量概览",
+        "",
+        "| 项目 | 结果 |",
+        "| --- | --- |",
+        f"| 维度正文 QA | {_markdown_cell(quality.get('dimension_body_qa_status') or '-')} |",
+        f"| 总结溯源检查 | {_markdown_cell(quality.get('finalizer_grounding_status') or '-')} |",
+        f"| 最终 QA 分数 | {_format_confidence(quality.get('final_score'))} |",
+        f"| 分数构成 | {score_formula} |",
+        f"| 最终 QA 状态 | {_markdown_cell(final_status)} |",
+        f"| 硬性阻断原因 | {_markdown_cell(blocker_text or '无')} |",
+    ]
+    if dimension_scores:
+        sections.extend(
+            [
+                "",
+                "### 每维 QA 分数",
+                "",
+                "| 维度 | 分数 | 状态 |",
+                "| --- | --- | --- |",
+            ]
+        )
+        for item in dimension_scores:
+            if not isinstance(item, dict):
+                continue
+            sections.append(
+                "| "
+                + " | ".join(
+                    [
+                        _markdown_cell(item.get("dimension_label") or item.get("dimension_key") or item.get("target_node")),
+                        _format_confidence(item.get("score")),
+                        "通过" if item.get("passed") else "未通过",
+                    ]
+                )
+                + " |"
+            )
+    sections.extend(_qa_issues_markdown(qa_payload, heading_level=3))
+    return "\n".join(sections)
+
+
+def _qa_issues_markdown(qa_payload: dict | None, heading_level: int = 2) -> list[str]:
+    heading = "#" * heading_level
+    if not qa_payload:
+        return ["", f"{heading} QA 问题", "", "暂无 QA 问题。"]
     issues = qa_payload.get("issues") or []
     if not issues:
-        revision_reason = qa_payload.get("revision_reason")
-        if revision_reason:
-            sections.extend(["", "### 返工原因", ""])
-            sections.extend(f"{index}. {reason}" for index, reason in enumerate(_split_revision_reason(revision_reason), start=1))
-        sections.extend(["", "### QA 问题", "", "未发现需要处理的问题。"])
-        return "\n".join(sections)
-    sections.extend(
-        [
-            "",
-            "### QA 问题",
-            "",
-            "| # | 风险级别 | 问题类型 | 相关维度 | 建议动作 | 问题说明 |",
-            "| --- | --- | --- | --- | --- | --- |",
-        ]
-    )
+        return ["", f"{heading} QA 问题", "", "暂无 QA 问题。"]
+    sections = [
+        "",
+        f"{heading} QA 问题",
+        "",
+        "| # | 风险级别 | 问题类型 | 相关维度 | 建议动作 | 问题说明 |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
     for index, issue in enumerate(issues, start=1):
         if not isinstance(issue, dict):
             sections.append(f"| {index} | - | 其他问题 | - | - | {_markdown_cell(issue)} |")
@@ -147,7 +172,7 @@ def _qa_markdown(qa_payload: dict | None) -> str:
             )
             + " |"
         )
-    return "\n".join(sections)
+    return sections
 
 
 def _claims_markdown(claims_with_evidence: list[tuple[Claim, list[int]]]) -> str:
@@ -192,8 +217,8 @@ def build_markdown_export(
     ]
     content = "\n".join(metadata) + (report.content_markdown or "")
     content += _matrix_markdown(matrices or [])
-    content += _qa_markdown(qa_payload)
     content += _claims_markdown(claims_with_evidence or [])
+    content += _quality_summary_markdown(report.report_json, qa_payload)
     return content
 
 

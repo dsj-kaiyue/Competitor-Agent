@@ -21,6 +21,9 @@ class CompetitiveAnalysisState(TypedDict, total=False):
     qa_target_nodes: list[str]
     qa_issues: list[dict[str, Any]]
     qa_followup_queries: list[str]
+    dimension_qa_scores: dict[str, dict[str, Any]]
+    finalizer_qa: dict[str, Any]
+    quality_summary: dict[str, Any]
     reanalyze_dimensions: list[str]
     dimension_failures: list[dict[str, Any]]
     current_node: str

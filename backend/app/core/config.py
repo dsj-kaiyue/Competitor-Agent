@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     evidence_extractor_max_workers: int = 4
     evidence_embedding_batch_size: int = 8
     qa_max_revision_rounds: int = 1
+    report_finalizer_max_revision_rounds: int = 2
+    qa_dimension_pass_threshold: float = 0.70
+    qa_finalizer_pass_threshold: float = 0.75
 
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"])
     run_tasks_inline: bool = False

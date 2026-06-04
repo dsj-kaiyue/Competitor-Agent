@@ -115,6 +115,11 @@ export async function getTaskQa(taskId: number) {
   return data.qa_result
 }
 
+export async function getTaskQaHistory(taskId: number) {
+  const { data } = await http.get<{ items: QAResult[] }>(`/analysis-tasks/${taskId}/qa/history`)
+  return data.items
+}
+
 export async function getTaskMetrics(taskId: number) {
   const { data } = await http.get<TaskMetrics>(`/analysis-tasks/${taskId}/metrics`)
   return data

@@ -469,19 +469,24 @@ def _target_nodes_from_issue(issue: dict) -> list[str]:
 
 
 def _decide_next_action(issues: list[dict]) -> tuple[str, list[str]]:
-    high_issues = [issue for issue in issues if issue.get("severity") == "high"]
-    candidates = high_issues or issues
-    if any(issue.get("suggested_action") == "recollect" for issue in candidates):
+    actionable = [
+        issue
+        for issue in issues
+        if isinstance(issue, dict) and issue.get("suggested_action") in {"recollect", "reanalyze", "rewrite"}
+    ]
+    if any(issue.get("suggested_action") == "recollect" for issue in actionable):
         target_nodes: list[str] = []
-        for issue in candidates:
-            target_nodes.extend(_target_nodes_from_issue(issue))
+        for issue in actionable:
+            if issue.get("suggested_action") in {"recollect", "reanalyze"}:
+                target_nodes.extend(_target_nodes_from_issue(issue))
         return "recollect", sorted(set(target_nodes))
-    if any(issue.get("suggested_action") == "reanalyze" for issue in candidates):
+    if any(issue.get("suggested_action") == "reanalyze" for issue in actionable):
         target_nodes: list[str] = []
-        for issue in candidates:
-            target_nodes.extend(_target_nodes_from_issue(issue))
+        for issue in actionable:
+            if issue.get("suggested_action") == "reanalyze":
+                target_nodes.extend(_target_nodes_from_issue(issue))
         return "reanalyze", sorted(set(target_nodes))
-    if any(issue.get("suggested_action") == "rewrite" for issue in candidates):
+    if any(issue.get("suggested_action") == "rewrite" for issue in actionable):
         return "rewrite", ["report_writer"]
     return "end", []
 
@@ -592,6 +597,102 @@ def _is_global_report_section(section: dict) -> bool:
         "排名",
     )
     return any(keyword in text for keyword in keywords)
+
+
+def _score_float(value: object, default: float = 0.0) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        score = default
+    return round(max(0.0, min(1.0, score)), 2)
+
+
+def _score_decimal(value: object, default: str = "0.80") -> Decimal:
+    return Decimal(str(_score_float(value, float(default)))).quantize(Decimal("0.01"))
+
+
+def _issue_has_high_risk(issues: list[dict]) -> bool:
+    return any(isinstance(issue, dict) and issue.get("severity") == "high" for issue in issues)
+
+
+def _fallback_dimension_score(base_score: float, issues: list[dict]) -> float:
+    score = _score_float(base_score, 0.80)
+    if _issue_has_high_risk(issues):
+        return min(score, 0.65)
+    if any(isinstance(issue, dict) and issue.get("severity") == "medium" for issue in issues):
+        return min(score, 0.75)
+    if issues:
+        return min(score, 0.85)
+    return score
+
+
+def _quality_status(passed: bool, reached_limit: bool = False) -> str:
+    if passed:
+        return "通过"
+    return "达到返工上限" if reached_limit else "未通过"
+
+
+def _build_quality_summary(
+    dimension_scores: dict[str, dict],
+    finalizer_qa: dict,
+    unresolved_issues: list[dict],
+    revision_round: int,
+    max_revision_rounds: int,
+) -> dict:
+    scores = [_score_float(item.get("score")) for item in dimension_scores.values() if isinstance(item, dict)]
+    dimension_avg = round(sum(scores) / len(scores), 2) if scores else 0.0
+    finalizer_score = _score_float(finalizer_qa.get("score"), 0.0) if isinstance(finalizer_qa, dict) else 0.0
+    final_score = round(dimension_avg * 0.7 + finalizer_score * 0.3, 2)
+    dimension_threshold = _score_float(settings.qa_dimension_pass_threshold, 0.70)
+    finalizer_threshold = _score_float(settings.qa_finalizer_pass_threshold, 0.75)
+    dimension_failures = [
+        {
+            "target_node": item.get("target_node"),
+            "dimension_label": item.get("dimension_label"),
+            "score": _score_float(item.get("score")),
+        }
+        for item in dimension_scores.values()
+        if isinstance(item, dict) and _score_float(item.get("score")) < dimension_threshold
+    ]
+    score_issues = [
+        issue
+        for item in dimension_scores.values()
+        if isinstance(item, dict)
+        for issue in item.get("issues", [])
+        if isinstance(issue, dict)
+    ]
+    high_risk_issues = [
+        issue
+        for issue in [*score_issues, *unresolved_issues]
+        if isinstance(issue, dict) and issue.get("severity") == "high"
+    ]
+    dimension_passed = bool(scores) and not dimension_failures and not high_risk_issues
+    finalizer_passed = bool(finalizer_qa.get("passed")) and finalizer_score >= finalizer_threshold if isinstance(finalizer_qa, dict) else False
+    final_passed = dimension_passed and finalizer_passed and not high_risk_issues
+    reached_limit = revision_round >= max_revision_rounds and not dimension_passed
+    blockers = []
+    if dimension_failures:
+        blockers.append("存在低于维度 QA 硬性门槛的核心维度")
+    if not finalizer_passed:
+        blockers.append("报告总结 grounding check 未通过")
+    if high_risk_issues:
+        blockers.append("存在 high 风险未解决")
+    return {
+        "dimension_body_qa_status": _quality_status(dimension_passed, reached_limit),
+        "finalizer_grounding_status": "通过" if finalizer_passed else "未通过",
+        "final_status": "通过" if final_passed else "未通过",
+        "final_score": final_score,
+        "dimension_avg": dimension_avg,
+        "finalizer_score": finalizer_score,
+        "dimension_weight": 0.7,
+        "finalizer_weight": 0.3,
+        "dimension_pass_threshold": dimension_threshold,
+        "finalizer_pass_threshold": finalizer_threshold,
+        "dimension_failures": dimension_failures,
+        "high_risk_issue_count": len(high_risk_issues),
+        "blockers": blockers,
+        "score_formula": "dimension_avg * 0.7 + finalizer_score * 0.3",
+    }
 
 
 def _sanitize_report_sections(report_json: dict, valid_claim_ids: set[int]) -> dict:
@@ -868,6 +969,9 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         "qa_target_nodes": [],
         "qa_issues": [],
         "qa_followup_queries": [],
+        "dimension_qa_scores": {},
+        "finalizer_qa": {},
+        "quality_summary": {},
         "reanalyze_dimensions": [],
         "dimension_failures": [],
     }
@@ -1857,7 +1961,8 @@ ComparisonMatrices:
             ],
             ensure_ascii=False,
         )[:9000]
-        finalizer_prompt = f"""
+        def generate_global_sections(revision_instruction: str = "", previous_global_sections: list[dict] | None = None) -> list[dict]:
+            finalizer_prompt = f"""
 请基于当前最终竞品分析正文，生成最终报告的全文总结 section，只输出合法 JSON。
 
 主题：{plan.topic}
@@ -1867,6 +1972,7 @@ ComparisonMatrices:
 维度正文 QA 是否通过：{state.get("qa_passed")}
 维度正文 QA 残留问题：
 {json.dumps(state.get("qa_issues", []), ensure_ascii=False)[:5000]}
+本轮总结返工要求：{revision_instruction or "无"}
 
 要求：
 1. 只输出 JSON，不要 Markdown。
@@ -1881,6 +1987,9 @@ ComparisonMatrices:
 JSON 格式：
 {{"title":"...","global_sections":[{{"section_id":"executive_summary","title":"执行摘要","paragraphs":[{{"paragraph_id":"executive_summary_p1","text":"...","claim_ids":[1,2]}}]}}]}}
 
+上一版全局总结 sections：
+{json.dumps(previous_global_sections or [], ensure_ascii=False)[:4000]}
+
 当前最终正文 sections：
 {json.dumps(body_sections, ensure_ascii=False)[:9000]}
 
@@ -1893,8 +2002,10 @@ ComparisonMatrices:
 Claims:
 {claim_context}
 """
-        _console("llm report finalizer started", {"task_id": task_id, "body_section_count": len(body_sections)})
-        try:
+            _console(
+                "llm report finalizer started",
+                {"task_id": task_id, "body_section_count": len(body_sections), "revision_instruction": bool(revision_instruction)},
+            )
             parsed = _json_from_text(llm.complete(finalizer_prompt, system="你只输出合法 JSON。"))
             if not isinstance(parsed, dict):
                 raise ValueError("finalizer payload must be an object")
@@ -1910,8 +2021,11 @@ Claims:
             ] or finalizer_json.get("sections", [])
             if not global_sections:
                 raise ValueError("global_sections missing")
-        except Exception as exc:
-            add_log(db, task_id, node.id, "Report finalizer fallback used", {"error": str(exc)}, log_type="warning")
+            return global_sections
+
+        def fallback_global_sections(error: Exception | None = None) -> list[dict]:
+            if error is not None:
+                add_log(db, task_id, node.id, "Report finalizer fallback used", {"error": str(error)}, log_type="warning")
             top_claims = claims[: min(6, len(claims))]
             if state.get("qa_passed"):
                 fallback_text = "本报告基于已通过 QA 的维度分析正文、结构化 Claim 和证据链生成。核心结论请以各维度正文及其 Claim/Evidence 绑定为准。"
@@ -1930,6 +2044,85 @@ Claims:
                     ],
                 }
             ]
+
+        def run_finalizer_grounding_qa(global_sections: list[dict], qa_round: int) -> dict:
+            grounding_prompt = f"""
+请检查最终报告的全局总结 section 是否被正文 Claim 支撑，只输出合法 JSON。
+
+检查目标：
+1. 执行摘要、总体结论、建议、风险提示不能引入 Claim 中没有的新事实。
+2. 每个 paragraph 的 claim_ids 必须能支撑该段核心判断。
+3. 如果维度正文 QA 未通过或存在残留问题，总结必须明确披露风险，不能包装成完全可靠结论。
+
+输出格式：
+{{"passed":true/false,"score":0.0到1.0,"issues":[{{"severity":"low|medium|high","message":"中文问题","paragraph_id":null,"claim_ids":[]}}]}}
+
+维度正文 QA 是否通过：{state.get("qa_passed")}
+维度正文 QA 残留问题：
+{json.dumps(state.get("qa_issues", []), ensure_ascii=False)[:5000]}
+
+全局总结 sections：
+{json.dumps(global_sections, ensure_ascii=False)[:7000]}
+
+Claims：
+{claim_context[:9000]}
+"""
+            try:
+                parsed = _json_from_text(llm.complete(grounding_prompt, system="你只输出合法 JSON。"))
+                if not isinstance(parsed, dict):
+                    raise ValueError("finalizer grounding payload must be an object")
+                issues = parsed.get("issues", []) if isinstance(parsed.get("issues"), list) else []
+                score = _score_float(parsed.get("score"), 0.80)
+                passed = bool(parsed.get("passed", True)) and score >= _score_float(settings.qa_finalizer_pass_threshold, 0.75)
+                passed = passed and not _issue_has_high_risk([issue for issue in issues if isinstance(issue, dict)])
+            except Exception as exc:
+                issues = [{"severity": "medium", "message": f"报告总结 grounding QA 调用失败：{exc}", "paragraph_id": None, "claim_ids": []}]
+                score = 0.70
+                passed = False
+            return {
+                "passed": passed,
+                "score": score,
+                "issues": issues,
+                "revision_round": qa_round,
+                "pass_threshold": _score_float(settings.qa_finalizer_pass_threshold, 0.75),
+            }
+
+        global_sections: list[dict] = []
+        finalizer_qa: dict = {}
+        finalizer_revision_instruction = ""
+        max_finalizer_rounds = max(0, int(settings.report_finalizer_max_revision_rounds))
+        for finalizer_round in range(max_finalizer_rounds + 1):
+            try:
+                global_sections = generate_global_sections(finalizer_revision_instruction, global_sections)
+            except Exception as exc:
+                global_sections = fallback_global_sections(exc)
+            finalizer_qa = run_finalizer_grounding_qa(global_sections, finalizer_round)
+            if finalizer_qa.get("passed") or finalizer_round >= max_finalizer_rounds:
+                break
+            issue_messages = [
+                str(issue.get("message"))
+                for issue in finalizer_qa.get("issues", [])
+                if isinstance(issue, dict) and issue.get("message")
+            ]
+            finalizer_revision_instruction = "；".join(issue_messages) or "总结缺少 Claim 支撑，请只基于已有 Claim 重写全局总结。"
+            add_log(
+                db,
+                task_id,
+                node.id,
+                "Report finalizer grounding QA requested global section rewrite",
+                {"revision_round": finalizer_round + 1, "score": finalizer_qa.get("score"), "issues": finalizer_qa.get("issues", [])},
+                log_type="warning",
+            )
+
+        state["finalizer_qa"] = finalizer_qa
+        quality_summary = _build_quality_summary(
+            state.get("dimension_qa_scores", {}),
+            finalizer_qa,
+            state.get("qa_issues", []),
+            int(state.get("revision_round", 0) or 0),
+            int(state.get("max_revision_rounds", 0) or 0),
+        )
+        state["quality_summary"] = quality_summary
         final_report_json = {
             **body_report_json,
             "title": body_report_json.get("title") or f"{plan.topic}报告",
@@ -1937,6 +2130,9 @@ Claims:
             "report_finalized": True,
             "qa_passed": state.get("qa_passed"),
             "qa_issues": state.get("qa_issues", []),
+            "dimension_qa_scores": list(state.get("dimension_qa_scores", {}).values()),
+            "finalizer_qa": finalizer_qa,
+            "quality_summary": quality_summary,
         }
         final_report_json = _sanitize_report_sections(final_report_json, valid_claim_ids)
         final_report_json = _fill_paragraph_evidence(final_report_json, evidence_by_claim)
@@ -1957,8 +2153,19 @@ Claims:
         )
         db.add(report)
         db.flush()
-        node.output_summary = f"基于报告正文 #{latest_report.id} 生成最终摘要报告 #{report.id}"
-        _console("llm report finalizer completed", {"task_id": task_id, "source_report_id": latest_report.id, "report_id": report.id})
+        node.output_summary = (
+            f"基于报告正文 #{latest_report.id} 生成最终摘要报告 #{report.id}，"
+            f"最终 QA {quality_summary.get('final_status')} {quality_summary.get('final_score')}"
+        )
+        _console(
+            "llm report finalizer completed",
+            {
+                "task_id": task_id,
+                "source_report_id": latest_report.id,
+                "report_id": report.id,
+                "quality_summary": quality_summary,
+            },
+        )
         state["report_id"] = report.id
 
     def build_dynamic_knowledge() -> None:
@@ -2121,15 +2328,95 @@ Claims:
             }
             for node_key, spec in _dimension_specs_from_state().items()
         ]
+        scope_node_keys = [
+            item["target_node"]
+            for item in dimension_targets
+            if qa_scope != "partial_revision" or item["target_node"] in qa_target_nodes
+        ]
+        dimension_target_by_node = {item["target_node"]: item for item in dimension_targets}
+
+        def normalize_dimension_scores(raw_scores: object, base_score: Decimal, score_issues: list[dict]) -> list[dict]:
+            raw_items = raw_scores if isinstance(raw_scores, list) else []
+            raw_by_node: dict[str, dict] = {}
+            for raw in raw_items:
+                if not isinstance(raw, dict):
+                    continue
+                target_node = str(raw.get("target_node") or "").strip()
+                if target_node in scope_node_keys:
+                    raw_by_node[target_node] = raw
+                    continue
+                raw_label = _normalized_token(raw.get("dimension_label") or raw.get("dimension_key"))
+                for node_key in scope_node_keys:
+                    target = dimension_target_by_node.get(node_key) or {}
+                    aliases = {
+                        _normalized_token(target.get("dimension_key")),
+                        _normalized_token(target.get("dimension_label")),
+                    }
+                    if raw_label and raw_label in aliases:
+                        raw_by_node[node_key] = raw
+                        break
+
+            issues_by_node: dict[str, list[dict]] = {node_key: [] for node_key in scope_node_keys}
+            for issue in score_issues:
+                if not isinstance(issue, dict):
+                    continue
+                issue_targets = [
+                    target
+                    for target in (_target_nodes_from_issue(issue) or _dimension_targets_from_issues([issue]))
+                    if target in issues_by_node
+                ]
+                if not issue_targets and qa_scope == "partial_revision" and len(scope_node_keys) == 1:
+                    issue_targets = scope_node_keys
+                for target in issue_targets:
+                    issues_by_node[target].append(issue)
+
+            threshold = _score_float(settings.qa_dimension_pass_threshold, 0.70)
+            normalized_scores: list[dict] = []
+            for node_key in scope_node_keys:
+                target = dimension_target_by_node.get(node_key) or {}
+                raw = raw_by_node.get(node_key) or {}
+                entry_issues = issues_by_node.get(node_key, [])
+                fallback_score = _fallback_dimension_score(float(base_score), entry_issues) if entry_issues else max(float(base_score), 0.85)
+                entry_score = _score_float(raw.get("score"), fallback_score)
+                if entry_score < threshold and not entry_issues:
+                    issue = {
+                        "type": "weak_evidence",
+                        "severity": "medium",
+                        "message": f"{target.get('dimension_label') or node_key} 维度 QA 分数低于通过门槛 {threshold:.2f}",
+                        "related_claim_id": None,
+                        "related_dimension": target.get("dimension_label") or target.get("dimension_key"),
+                        "suggested_action": "reanalyze",
+                        "target_node": node_key,
+                    }
+                    score_issues.append(issue)
+                    entry_issues = [issue]
+                raw_passed = raw.get("passed")
+                entry_passed = (bool(raw_passed) if raw_passed is not None else True) and entry_score >= threshold and not _issue_has_high_risk(entry_issues)
+                normalized_scores.append(
+                    {
+                        "target_node": node_key,
+                        "dimension_key": target.get("dimension_key"),
+                        "dimension_label": target.get("dimension_label") or target.get("dimension_key") or node_key,
+                        "score": entry_score,
+                        "passed": entry_passed,
+                        "issues": entry_issues,
+                        "qa_scope": qa_scope,
+                        "qa_scope_label": "本轮返工维度" if qa_scope == "partial_revision" else "完整报告",
+                        "revision_round": state.get("revision_round", 0),
+                    }
+                )
+            return normalized_scores
+
         qa_prompt = f"""
 请复核这份竞品分析报告是否存在明显逻辑或证据问题。
 检查范围：{"仅检查本轮返工的目标维度 section 与目标 Claim" if qa_scope == "partial_revision" else "检查全部分析维度正文与全部 Claim"}
 仅基于下方报告片段和规则检查问题输出 JSON：
-{{"passed":true/false,"score":0.0到1.0,"issues":[{{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null,"search_query":null}}]}}
+{{"passed":true/false,"score":0.0到1.0,"dimension_scores":[{{"target_node":"动态维度节点 key","dimension_label":"维度名称","score":0.0到1.0,"passed":true/false}}],"issues":[{{"type":"logic_gap|unsupported_claim|weak_evidence|schema_incomplete|writing_issue","severity":"low|medium|high","message":"中文问题","related_claim_id":null,"related_dimension":"动态维度名称","suggested_action":"recollect|reanalyze|rewrite|ignore","target_node":null,"search_query":null}}]}}
 
 如果 suggested_action 是 recollect，必须提供一条具体 search_query，且 search_query 必须包含相关竞品名称。
 如果 suggested_action 是 recollect 或 reanalyze，并且问题能定位到某个动态维度，target_node 必须填写下面可用动态维度节点中的 target_node，不要填写 collector。
 如果检查范围是本轮返工目标维度，不要评价未出现在报告片段或规则检查问题里的其它维度。
+dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_report 覆盖全部维度，partial_revision 只覆盖目标维度。
 
 可用动态维度节点：
 {json.dumps(dimension_targets, ensure_ascii=False)}
@@ -2141,16 +2428,17 @@ Claims:
 {json.dumps(issues, ensure_ascii=False)}
 """
         _console("qa llm review started", {"task_id": task_id, "rule_issue_count": len(issues), "qa_scope": qa_scope, "target_nodes": qa_target_nodes})
+        raw_dimension_scores = []
         try:
             qa_json = _json_from_text(llm.complete(qa_prompt, system="你只输出合法 JSON。"))
             llm_issues = qa_json.get("issues", []) if isinstance(qa_json, dict) else []
             issues.extend(llm_issues)
-            score = Decimal(str(qa_json.get("score", 0.85))).quantize(Decimal("0.01")) if isinstance(qa_json, dict) else Decimal("0.85")
+            raw_dimension_scores = qa_json.get("dimension_scores", []) if isinstance(qa_json, dict) else []
+            score = _score_decimal(qa_json.get("score", 0.85)) if isinstance(qa_json, dict) else Decimal("0.85")
             passed = bool(qa_json.get("passed", True)) if isinstance(qa_json, dict) else True
         except Exception:
             score = Decimal("0.80")
             passed = True
-        passed = passed and not any(item.get("severity") == "high" for item in issues)
         inferred_target_nodes = _dimension_targets_from_issues(issues)
         for issue in issues:
             if issue.get("target_node") in {"collector", "report_writer"}:
@@ -2161,6 +2449,13 @@ Claims:
                     targets_for_issue = _dimension_targets_from_issues([issue])
                     if len(targets_for_issue) == 1:
                         issue["target_node"] = targets_for_issue[0]
+        current_dimension_scores = normalize_dimension_scores(raw_dimension_scores, score, issues)
+        state_dimension_scores = dict(state.get("dimension_qa_scores", {}))
+        for item in current_dimension_scores:
+            state_dimension_scores[item["target_node"]] = item
+        state["dimension_qa_scores"] = state_dimension_scores
+        passed = passed and not any(item.get("severity") == "high" for item in issues)
+        passed = passed and all(item.get("passed") for item in current_dimension_scores)
         next_action, target_nodes = _decide_next_action(issues)
         if next_action in {"recollect", "reanalyze"} and not target_nodes:
             target_nodes = inferred_target_nodes
@@ -2175,6 +2470,8 @@ Claims:
             "target_nodes": target_nodes,
             "qa_scope": qa_scope,
             "qa_scope_label": "本轮返工维度" if qa_scope == "partial_revision" else "完整报告",
+            "dimension_scores": list(state_dimension_scores.values()),
+            "current_dimension_scores": current_dimension_scores,
             "revision_reason": "；".join(issue.get("message", "") for issue in issues[:4]) or None,
             "followup_queries": followup_queries,
             "revision_round": state.get("revision_round", 0),
@@ -2192,6 +2489,7 @@ Claims:
                 "score": str(qa_result.score),
                 "next_action": next_action,
                 "target_nodes": target_nodes,
+                "current_dimension_scores": current_dimension_scores,
             },
         )
         state["qa_result_id"] = qa_result.id
@@ -2201,6 +2499,41 @@ Claims:
         state["qa_issues"] = issues
         state["qa_followup_queries"] = followup_queries
         state["revision_reason"] = payload["revision_reason"]
+
+    def hydrate_state_from_latest_qa() -> None:
+        if state.get("qa_passed") is not None:
+            return
+        latest_qa = db.scalar(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id.desc()))
+        if latest_qa is None:
+            return
+        payload = latest_qa.issues_json if isinstance(latest_qa.issues_json, dict) else {}
+        issues = payload.get("issues") if isinstance(payload.get("issues"), list) else []
+        target_nodes = payload.get("target_nodes") if isinstance(payload.get("target_nodes"), list) else []
+        followup_queries = payload.get("followup_queries") if isinstance(payload.get("followup_queries"), list) else []
+        dimension_scores = payload.get("dimension_scores") if isinstance(payload.get("dimension_scores"), list) else []
+        state["qa_result_id"] = latest_qa.id
+        state["qa_passed"] = bool(latest_qa.passed)
+        state["qa_next_action"] = payload.get("next_action") or ("end" if latest_qa.passed else None)
+        state["qa_target_nodes"] = [str(node_key) for node_key in target_nodes if str(node_key)]
+        state["qa_issues"] = [issue for issue in issues if isinstance(issue, dict)]
+        state["qa_followup_queries"] = [str(query) for query in followup_queries if str(query).strip()]
+        state["revision_reason"] = payload.get("revision_reason")
+        state["revision_round"] = int(payload.get("revision_round") or 0)
+        state["dimension_qa_scores"] = {
+            str(item.get("target_node")): item
+            for item in dimension_scores
+            if isinstance(item, dict) and item.get("target_node")
+        }
+        _console(
+            "qa state hydrated from latest result",
+            {
+                "task_id": task_id,
+                "qa_result_id": latest_qa.id,
+                "passed": latest_qa.passed,
+                "next_action": state.get("qa_next_action"),
+                "target_nodes": state.get("qa_target_nodes", []),
+            },
+        )
 
     update_task_status(db, task_id, "running")
     _run_node(db, task_id, "planner", "planned", planner)
@@ -2212,6 +2545,7 @@ Claims:
     state["report_writer_mode"] = "full_write"
     _run_node(db, task_id, "report_writer", "writing", report_writer)
     _run_node(db, task_id, "qa", "qa_checking", qa)
+    hydrate_state_from_latest_qa()
     while not state.get("qa_passed") and state.get("revision_round", 0) < state.get("max_revision_rounds", 1):
         action = state.get("qa_next_action") or "end"
         target_nodes = state.get("qa_target_nodes", [])

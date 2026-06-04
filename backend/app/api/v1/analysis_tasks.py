@@ -23,11 +23,12 @@ from app.schemas.evidence import EvidenceListResponse
 from app.schemas.matrix import ComparisonMatrixItem, ComparisonMatrixListResponse
 from app.schemas.metrics import TaskMetricsResponse
 from app.schemas.profile import CompetitorProfileItem, CompetitorProfileListResponse
-from app.schemas.qa import QAResultItem, QAResultResponse
+from app.schemas.qa import QAResultHistoryResponse, QAResultItem, QAResultResponse
 from app.schemas.report import ReportClaimItem, ReportEvidenceItem, ReportItem, ReportResponse
 from app.models.agent_node import AgentNode
 from app.models.comparison_matrix import ComparisonMatrix
 from app.models.competitor_profile import CompetitorProfile
+from app.models.qa_result import QAResult
 from app.services.claim_service import list_claims_with_evidence
 from app.services.evidence_service import list_evidence
 from app.services.log_service import list_logs
@@ -209,6 +210,8 @@ def _normalize_qa_payload(qa_result, db: Session | None = None) -> dict:
         return {
             **base_payload,
             "issues": [_decorate_qa_issue(issue, labels) for issue in payload.get("issues") or []],
+            "dimension_scores": payload.get("dimension_scores") or [],
+            "current_dimension_scores": payload.get("current_dimension_scores") or [],
             "next_action": next_action,
             "next_action_label": QA_ACTION_LABELS.get(str(next_action), str(next_action)),
             "target_nodes": target_nodes,
@@ -221,6 +224,8 @@ def _normalize_qa_payload(qa_result, db: Session | None = None) -> dict:
     return {
         **base_payload,
         "issues": [_decorate_qa_issue(issue, labels) for issue in payload] if isinstance(payload, list) else [],
+        "dimension_scores": [],
+        "current_dimension_scores": [],
         "next_action": "end",
         "next_action_label": QA_ACTION_LABELS["end"],
         "target_nodes": [],
@@ -230,6 +235,29 @@ def _normalize_qa_payload(qa_result, db: Session | None = None) -> dict:
         "revision_reason": None,
         "revision_round": 0,
     }
+
+
+def _qa_result_item(qa_result: QAResult, db: Session) -> QAResultItem:
+    payload = _normalize_qa_payload(qa_result, db)
+    return QAResultItem(
+        id=qa_result.id,
+        task_id=qa_result.task_id,
+        report_id=qa_result.report_id,
+        passed=qa_result.passed,
+        score=qa_result.score,
+        issues=payload["issues"],
+        dimension_scores=payload["dimension_scores"],
+        current_dimension_scores=payload["current_dimension_scores"],
+        next_action=payload["next_action"],
+        next_action_label=payload["next_action_label"],
+        target_nodes=payload["target_nodes"],
+        target_node_labels=payload["target_node_labels"],
+        qa_scope=payload["qa_scope"],
+        qa_scope_label=payload["qa_scope_label"],
+        revision_reason=payload["revision_reason"],
+        revision_round=payload["revision_round"],
+        created_at=qa_result.created_at,
+    )
 
 
 def _virtual_worker_status(parent_status: str) -> str:
@@ -575,21 +603,12 @@ def get_task_qa(task_id: int, db: Session = Depends(get_db)) -> QAResultResponse
     qa_result = get_qa_result(db, task_id)
     if qa_result is None:
         return QAResultResponse(qa_result=None)
-    payload = _normalize_qa_payload(qa_result, db)
-    return QAResultResponse(
-        qa_result=QAResultItem(
-            id=qa_result.id,
-            task_id=qa_result.task_id,
-            report_id=qa_result.report_id,
-            passed=qa_result.passed,
-            score=qa_result.score,
-            issues=payload["issues"],
-            next_action=payload["next_action"],
-            next_action_label=payload["next_action_label"],
-            target_nodes=payload["target_nodes"],
-            target_node_labels=payload["target_node_labels"],
-            revision_reason=payload["revision_reason"],
-            revision_round=payload["revision_round"],
-            created_at=qa_result.created_at,
-        )
-    )
+    return QAResultResponse(qa_result=_qa_result_item(qa_result, db))
+
+
+@router.get("/{task_id}/qa/history", response_model=QAResultHistoryResponse)
+def get_task_qa_history(task_id: int, db: Session = Depends(get_db)) -> QAResultHistoryResponse:
+    if get_task(db, task_id) is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    qa_results = list(db.scalars(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id)))
+    return QAResultHistoryResponse(items=[_qa_result_item(item, db) for item in qa_results])

@@ -141,7 +141,7 @@ function rowSuggestion(score: { passed?: boolean; issues?: { suggested_action?: 
 
 const dimensionQaRoundRows = computed<DimensionQaRoundRow[]>(() =>
   qaHistory.value.flatMap((qa) => {
-    const scores = qa.dimension_scores?.length ? qa.dimension_scores : qa.current_dimension_scores || []
+    const scores = qa.current_dimension_scores?.length ? qa.current_dimension_scores : qa.dimension_scores || []
     const revisionRound = Number(qa.revision_round ?? 0)
     return scores.map((score, index) => {
       const keys = dimensionKeys(score)
@@ -313,6 +313,16 @@ function formatDateTime(value: string) {
   }).format(new Date(value))
 }
 
+function resetDetailStateForRetry() {
+  logs.value = []
+  qaHistory.value = []
+  activeQaRounds.value = []
+  activeLogRounds.value = []
+  activeLogAgentGroups.value = []
+  qaRoundsInitialized.value = false
+  logGroupsInitialized.value = false
+}
+
 watch(
   dimensionQaRoundGroups,
   (groups) => {
@@ -391,6 +401,9 @@ async function runControl(action: 'pause' | 'resume' | 'cancel' | 'retry') {
       retry: retryAnalysisTask,
     }
     task.value = await handlers[action](taskId)
+    if (action === 'retry') {
+      resetDetailStateForRetry()
+    }
     await load()
     ElMessage.success({ pause: '已提交暂停请求', resume: '任务已恢复', cancel: '已提交取消请求', retry: '任务已重新入队' }[action])
   } catch (error) {

@@ -2335,6 +2335,21 @@ Claims：
         ]
         dimension_target_by_node = {item["target_node"]: item for item in dimension_targets}
 
+        def issue_allowed_in_scope(issue: dict) -> bool:
+            if qa_scope != "partial_revision":
+                return True
+            explicit_target = str(issue.get("target_node") or "").strip()
+            if explicit_target.startswith("dimension_analysis_") and explicit_target not in scope_node_keys:
+                return False
+            targets = _dimension_targets_from_issues([issue])
+            if not targets:
+                return True
+            scoped_targets = [target for target in targets if target in scope_node_keys]
+            if not scoped_targets:
+                return False
+            issue["target_node"] = scoped_targets[0]
+            return True
+
         def normalize_dimension_scores(raw_scores: object, base_score: Decimal, score_issues: list[dict]) -> list[dict]:
             raw_items = raw_scores if isinstance(raw_scores, list) else []
             raw_by_node: dict[str, dict] = {}
@@ -2432,14 +2447,18 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
         try:
             qa_json = _json_from_text(llm.complete(qa_prompt, system="你只输出合法 JSON。"))
             llm_issues = qa_json.get("issues", []) if isinstance(qa_json, dict) else []
-            issues.extend(llm_issues)
+            issues.extend([issue for issue in llm_issues if isinstance(issue, dict) and issue_allowed_in_scope(issue)])
             raw_dimension_scores = qa_json.get("dimension_scores", []) if isinstance(qa_json, dict) else []
             score = _score_decimal(qa_json.get("score", 0.85)) if isinstance(qa_json, dict) else Decimal("0.85")
             passed = bool(qa_json.get("passed", True)) if isinstance(qa_json, dict) else True
         except Exception:
             score = Decimal("0.80")
             passed = True
+        if qa_scope == "partial_revision":
+            issues = [issue for issue in issues if isinstance(issue, dict) and issue_allowed_in_scope(issue)]
         inferred_target_nodes = _dimension_targets_from_issues(issues)
+        if qa_scope == "partial_revision":
+            inferred_target_nodes = [target for target in inferred_target_nodes if target in scope_node_keys]
         for issue in issues:
             if issue.get("target_node") in {"collector", "report_writer"}:
                 issue["target_node"] = None

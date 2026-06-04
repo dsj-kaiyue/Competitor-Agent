@@ -198,6 +198,7 @@ def reset_task_for_retry(db: Session, task_id: int) -> AnalysisTask | None:
 
     claim_ids = select(Claim.id).where(Claim.task_id == task_id)
     evidence_ids = select(EvidenceChunk.id).where(EvidenceChunk.task_id == task_id)
+    db.execute(delete(AgentRunLog).where(AgentRunLog.task_id == task_id).execution_options(synchronize_session=False))
     db.execute(delete(ClaimEvidence).where(ClaimEvidence.claim_id.in_(claim_ids)).execution_options(synchronize_session=False))
     db.execute(delete(ClaimEvidence).where(ClaimEvidence.evidence_chunk_id.in_(evidence_ids)).execution_options(synchronize_session=False))
     db.execute(delete(QAResult).where(QAResult.task_id == task_id).execution_options(synchronize_session=False))

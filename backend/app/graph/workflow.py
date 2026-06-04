@@ -781,7 +781,13 @@ def _embed_chunk_batch(batch: list[dict]) -> tuple[list[dict], list[dict], int]:
     return embedded, failures, elapsed_ms
 
 
-def _run_dimension_analyst_logic(db: Session, task_id: int, node: AgentNode, prompt_spec: dict) -> list[int]:
+def _run_dimension_analyst_logic(
+    db: Session,
+    task_id: int,
+    node: AgentNode,
+    prompt_spec: dict,
+    revision_context: dict | None = None,
+) -> list[int]:
     task = db.get(AnalysisTask, task_id)
     if task is None:
         raise RuntimeError(f"Task {task_id} not found")
@@ -792,6 +798,48 @@ def _run_dimension_analyst_logic(db: Session, task_id: int, node: AgentNode, pro
     no_evidence_competitors: list[str] = []
     dimension_key = str(prompt_spec.get("dimension_key") or "").strip()
     dimension_label = str(prompt_spec.get("dimension_label") or dimension_key).strip()
+    revision_context = revision_context or {}
+    revision_issues = [issue for issue in revision_context.get("issues", []) if isinstance(issue, dict)]
+    revision_queries = [str(query) for query in revision_context.get("followup_queries", []) if str(query).strip()]
+    revision_action = str(revision_context.get("next_action") or "").strip()
+    revision_round = revision_context.get("revision_round")
+    revision_instruction = ""
+    if revision_issues or revision_queries or revision_action:
+        action_instruction = {
+            "recollect": "本轮 QA 要求先补采资料。请优先使用新增或更直接的证据；如果没有新增证据，不要硬编强结论，要降低 confidence 并明确证据不足。",
+            "reanalyze": "本轮 QA 要求重新分析。请针对 QA 指出的问题重写 Claim，修复逻辑缺口、证据不足、Claim 与 Evidence 不匹配等问题。",
+            "rewrite": "本轮 QA 主要要求报告重写。若本分析 Agent 被重跑，请生成更清晰、更可证据支撑的 Claim，避免重复上一轮问题。",
+        }.get(revision_action, "本轮为返工分析，请优先修复 QA 指出的问题。")
+        revision_issue_text = "\n".join(
+            "- "
+            + json.dumps(
+                {
+                    "type": issue.get("type"),
+                    "severity": issue.get("severity"),
+                    "message": issue.get("message"),
+                    "related_claim_id": issue.get("related_claim_id"),
+                    "suggested_action": issue.get("suggested_action"),
+                    "search_query": issue.get("search_query"),
+                },
+                ensure_ascii=False,
+            )
+            for issue in revision_issues[:8]
+        )
+        revision_query_text = "\n".join(f"- {query}" for query in revision_queries[:8])
+        revision_instruction = f"""
+
+本轮 QA 返工上下文：
+- 返工轮次：{revision_round if revision_round is not None else "未知"}
+- QA 建议动作：{revision_action or "未指定"}
+- 处理要求：{action_instruction}
+- 必须避免重复上一轮 QA 指出的问题；如果证据仍不足，输出低 confidence / high risk 的谨慎 Claim，不要编造。
+
+QA 指出的问题：
+{revision_issue_text or "- 无明确问题文本"}
+
+QA 建议补充检索：
+{revision_query_text or "- 无"}
+"""
     if not dimension_key or not dimension_label:
         raise RuntimeError(f"{node.node_key} missing dimension prompt spec")
     for competitor in plan.competitors:
@@ -832,6 +880,24 @@ def _run_dimension_analyst_logic(db: Session, task_id: int, node: AgentNode, pro
             continue
         must_answer = "\n".join(f"- {item}" for item in prompt_spec.get("must_answer", [])[:8])
         criteria = "、".join(str(item) for item in prompt_spec.get("comparison_criteria", [])[:8])
+        if revision_instruction:
+            add_log(
+                db,
+                task_id,
+                node.id,
+                "Dimension analyst running with QA revision context",
+                {
+                    "competitor": competitor,
+                    "dimension_key": dimension_key,
+                    "dimension_label": dimension_label,
+                    "revision_round": revision_round,
+                    "next_action": revision_action,
+                    "issue_count": len(revision_issues),
+                    "followup_query_count": len(revision_queries),
+                },
+                log_type="warning",
+            )
+            db.commit()
         prompt = f"""
 你是一个动态维度竞品分析 Agent。你只负责一个分析维度，不要分析其它维度。
 当前维度 key：{dimension_key}
@@ -840,6 +906,7 @@ def _run_dimension_analyst_logic(db: Session, task_id: int, node: AgentNode, pro
 比较标准：{criteria}
 必须回答：
 {must_answer}
+{revision_instruction}
 
 竞品：{competitor}
 分析主题：{plan.topic}
@@ -1595,14 +1662,53 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         local_db.execute(delete(Claim).where(Claim.task_id == task_id, Claim.agent_node_id == node.id).execution_options(synchronize_session=False))
         local_db.flush()
 
-    def _run_one_dimension_analyst_thread(node_key: str, prompt_spec: dict, force: bool = False) -> tuple[str, list[int]]:
+    def _revision_context_for_dimension(node_key: str) -> dict:
+        issues = []
+        for issue in state.get("qa_issues", []):
+            if not isinstance(issue, dict):
+                continue
+            issue_copy = dict(issue)
+            issue_target = str(issue_copy.get("target_node") or "")
+            targets = (
+                [issue_target]
+                if issue_target.startswith("dimension_analysis_")
+                else _dimension_targets_from_issues([issue_copy])
+            )
+            if node_key in targets:
+                issues.append(issue_copy)
+        followup_queries = [
+            str(issue.get("search_query")).strip()
+            for issue in issues
+            if str(issue.get("search_query") or "").strip()
+        ]
+        if not followup_queries:
+            followup_queries = [
+                str(query).strip()
+                for query in state.get("qa_followup_queries", [])
+                if str(query).strip()
+            ]
+        return {
+            "next_action": state.get("qa_next_action"),
+            "revision_round": state.get("revision_round", 0),
+            "issues": issues,
+            "followup_queries": _dedupe_preserve_order(followup_queries),
+        }
+
+    def _run_one_dimension_analyst_thread(
+        node_key: str,
+        prompt_spec: dict,
+        force: bool = False,
+        revision_context: dict | None = None,
+    ) -> tuple[str, list[int]]:
         local_db = SessionLocal()
         local_claim_ids: list[int] = []
         try:
             def run_logic(node: AgentNode) -> None:
                 if force:
                     _clear_claims_for_dimension_node(local_db, node_key)
-                local_claim_ids.extend(_run_dimension_analyst_logic(local_db, task_id, node, prompt_spec))
+                local_claim_ids.extend(
+                    _run_dimension_analyst_logic(local_db, task_id, node, prompt_spec, revision_context)
+                )
 
             _run_node(local_db, task_id, node_key, "analyzing", run_logic, force=force)
             return node_key, local_claim_ids
@@ -1620,7 +1726,13 @@ def run_competitive_analysis(db: Session, task_id: int) -> CompetitiveAnalysisSt
         db.commit()
         with ThreadPoolExecutor(max_workers=len(selected_node_keys), thread_name_prefix=f"analyst-{task_id}") as executor:
             futures = {
-                executor.submit(_run_one_dimension_analyst_thread, node_key, specs_by_node[node_key], force): node_key
+                executor.submit(
+                    _run_one_dimension_analyst_thread,
+                    node_key,
+                    specs_by_node[node_key],
+                    force,
+                    _revision_context_for_dimension(node_key) if force else None,
+                ): node_key
                 for node_key in selected_node_keys
             }
             for future in as_completed(futures):
@@ -2362,6 +2474,9 @@ Claims：
             if qa_scope != "partial_revision" or item["target_node"] in qa_target_nodes
         ]
         dimension_target_by_node = {item["target_node"]: item for item in dimension_targets}
+        scoped_dimension_targets = [
+            item for item in dimension_targets if item["target_node"] in set(scope_node_keys)
+        ]
 
         def issue_allowed_in_scope(issue: dict) -> bool:
             if qa_scope != "partial_revision":
@@ -2462,7 +2577,7 @@ Claims：
 dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_report 覆盖全部维度，partial_revision 只覆盖目标维度。
 
 可用动态维度节点：
-{json.dumps(dimension_targets, ensure_ascii=False)}
+{json.dumps(scoped_dimension_targets, ensure_ascii=False)}
 
 报告：
 {scoped_report_markdown[:6000]}
@@ -2503,9 +2618,31 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
         state["dimension_qa_scores"] = state_dimension_scores
         passed = passed and not any(item.get("severity") == "high" for item in issues)
         passed = passed and all(item.get("passed") for item in current_dimension_scores)
-        next_action, target_nodes = _decide_next_action(issues)
-        if next_action in {"recollect", "reanalyze"} and not target_nodes:
-            target_nodes = inferred_target_nodes
+        failed_dimension_nodes = [
+            str(item.get("target_node"))
+            for item in current_dimension_scores
+            if item.get("target_node") and not item.get("passed")
+        ]
+        failed_dimension_set = set(failed_dimension_nodes)
+        next_issues = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            issue_targets = [
+                target
+                for target in (_target_nodes_from_issue(issue) or _dimension_targets_from_issues([issue]))
+                if target in failed_dimension_set
+            ]
+            if issue_targets:
+                issue["target_node"] = issue_targets[0]
+                next_issues.append(issue)
+        next_action, target_nodes = _decide_next_action(next_issues)
+        if next_action in {"recollect", "reanalyze"}:
+            target_nodes = [node_key for node_key in target_nodes if node_key in failed_dimension_set]
+            if not target_nodes:
+                target_nodes = failed_dimension_nodes
+        elif not passed and failed_dimension_nodes:
+            next_action, target_nodes = "reanalyze", failed_dimension_nodes
         if passed:
             next_action, target_nodes = "end", []
         followup_queries = [str(issue.get("search_query")) for issue in issues if issue.get("search_query")]
@@ -2558,10 +2695,21 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
         target_nodes = payload.get("target_nodes") if isinstance(payload.get("target_nodes"), list) else []
         followup_queries = payload.get("followup_queries") if isinstance(payload.get("followup_queries"), list) else []
         dimension_scores = payload.get("dimension_scores") if isinstance(payload.get("dimension_scores"), list) else []
+        current_dimension_scores = (
+            payload.get("current_dimension_scores")
+            if isinstance(payload.get("current_dimension_scores"), list)
+            else []
+        )
+        failed_current_nodes = [
+            str(item.get("target_node"))
+            for item in current_dimension_scores
+            if isinstance(item, dict) and item.get("target_node") and not item.get("passed")
+        ]
+        hydrated_target_nodes = failed_current_nodes or [str(node_key) for node_key in target_nodes if str(node_key)]
         state["qa_result_id"] = latest_qa.id
         state["qa_passed"] = bool(latest_qa.passed)
         state["qa_next_action"] = payload.get("next_action") or ("end" if latest_qa.passed else None)
-        state["qa_target_nodes"] = [str(node_key) for node_key in target_nodes if str(node_key)]
+        state["qa_target_nodes"] = [] if latest_qa.passed else hydrated_target_nodes
         state["qa_issues"] = [issue for issue in issues if isinstance(issue, dict)]
         state["qa_followup_queries"] = [str(query) for query in followup_queries if str(query).strip()]
         state["revision_reason"] = payload.get("revision_reason")

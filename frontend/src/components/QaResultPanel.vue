@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import type { QAResult } from '@/types/qa'
+import { computed, ref, watch } from 'vue'
+import type { QAIssue, QAResult } from '@/types/qa'
 
 const props = defineProps<{ qa: QAResult | null }>()
 
@@ -48,6 +48,8 @@ const targetLabels = computed(() => {
 const qaScopeLabel = computed(() => props.qa?.qa_scope_label || (props.qa?.qa_scope === 'partial_revision' ? '本轮返工维度' : '完整报告'))
 
 const dimensionScores = computed(() => props.qa?.dimension_scores || [])
+const activeIssueGroups = ref<string[]>([])
+const issueGroupsInitializedForQa = ref<number | null>(null)
 
 const revisionReasonItems = computed(() => {
   const reason = props.qa?.revision_reason?.trim()
@@ -73,6 +75,63 @@ function issueActionLabel(action?: string) {
 function displayRevisionRound(value?: number | null) {
   return Math.max(1, Number(value ?? 0) + 1)
 }
+
+function issueDimensionLabel(issue: QAIssue) {
+  return issue.related_dimension || issue.target_node_label || issue.target_node || '未定位维度'
+}
+
+function issueGroupKey(issue: QAIssue) {
+  return issue.target_node || issue.target_node_label || issue.related_dimension || 'unknown_dimension'
+}
+
+function issueGroupTagType(severity?: string) {
+  if (severity === 'high') return 'danger'
+  if (severity === 'medium') return 'warning'
+  return 'info'
+}
+
+const issueGroups = computed(() => {
+  const groups = new Map<string, { key: string; label: string; issues: QAIssue[]; maxSeverity: string }>()
+  const severityRank: Record<string, number> = { high: 3, medium: 2, low: 1 }
+  for (const issue of props.qa?.issues || []) {
+    const key = issueGroupKey(issue)
+    const label = issueDimensionLabel(issue)
+    const group = groups.get(key)
+    if (group) {
+      group.issues.push(issue)
+      if ((severityRank[issue.severity] || 0) > (severityRank[group.maxSeverity] || 0)) {
+        group.maxSeverity = issue.severity
+      }
+      continue
+    }
+    groups.set(key, { key, label, issues: [issue], maxSeverity: issue.severity })
+  }
+  return [...groups.values()].sort((a, b) => {
+    const severityRankA = severityRank[a.maxSeverity] || 0
+    const severityRankB = severityRank[b.maxSeverity] || 0
+    if (severityRankA !== severityRankB) return severityRankB - severityRankA
+    return a.label.localeCompare(b.label, 'zh-Hans-CN')
+  })
+})
+
+watch(
+  issueGroups,
+  (groups) => {
+    if (!props.qa || !groups.length) {
+      activeIssueGroups.value = []
+      issueGroupsInitializedForQa.value = props.qa?.id ?? null
+      return
+    }
+    if (issueGroupsInitializedForQa.value !== props.qa.id) {
+      activeIssueGroups.value = groups.map((group) => group.key)
+      issueGroupsInitializedForQa.value = props.qa.id
+      return
+    }
+    const validKeys = new Set(groups.map((group) => group.key))
+    activeIssueGroups.value = activeIssueGroups.value.filter((key) => validKeys.has(key))
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
@@ -152,25 +211,38 @@ function displayRevisionRound(value?: number | null) {
       </ol>
     </div>
 
-    <el-table v-if="qa.issues.length" :data="qa.issues" border>
-      <el-table-column label="级别" width="110">
-        <template #default="{ row }">
-          <el-tag :type="severityType[row.severity] || 'info'" size="small">
-            {{ row.severity_label || issueSeverityLabel(row.severity) }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="类型" width="150">
-        <template #default="{ row }">{{ row.type_label || issueTypeLabel(row.type) }}</template>
-      </el-table-column>
-      <el-table-column prop="message" label="问题" />
-      <el-table-column label="维度/节点" width="180">
-        <template #default="{ row }">{{ row.related_dimension || row.target_node_label || '-' }}</template>
-      </el-table-column>
-      <el-table-column label="建议" width="140">
-        <template #default="{ row }">{{ row.suggested_action_label || issueActionLabel(row.suggested_action) }}</template>
-      </el-table-column>
-    </el-table>
+    <div v-if="issueGroups.length" class="qa-section">
+      <div class="section-title">QA 问题</div>
+      <el-collapse v-model="activeIssueGroups" class="issue-collapse">
+        <el-collapse-item v-for="group in issueGroups" :key="group.key" :name="group.key">
+          <template #title>
+            <div class="issue-group-title">
+              <strong>{{ group.label }}</strong>
+              <el-tag :type="issueGroupTagType(group.maxSeverity)" size="small" effect="plain">
+                {{ issueSeverityLabel(group.maxSeverity) }}
+              </el-tag>
+              <span>{{ group.issues.length }} 个问题</span>
+            </div>
+          </template>
+          <el-table :data="group.issues" border>
+            <el-table-column label="级别" width="110">
+              <template #default="{ row }">
+                <el-tag :type="severityType[row.severity] || 'info'" size="small">
+                  {{ row.severity_label || issueSeverityLabel(row.severity) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="类型" width="150">
+              <template #default="{ row }">{{ row.type_label || issueTypeLabel(row.type) }}</template>
+            </el-table-column>
+            <el-table-column prop="message" label="问题" />
+            <el-table-column label="建议" width="140">
+              <template #default="{ row }">{{ row.suggested_action_label || issueActionLabel(row.suggested_action) }}</template>
+            </el-table-column>
+          </el-table>
+        </el-collapse-item>
+      </el-collapse>
+    </div>
   </div>
 </template>
 
@@ -268,6 +340,30 @@ function displayRevisionRound(value?: number | null) {
 
 .reason-list li + li {
   margin-top: 6px;
+}
+
+.issue-collapse {
+  border-top: 1px solid var(--el-border-color-light);
+}
+
+.issue-group-title {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+}
+
+.issue-group-title strong {
+  overflow: hidden;
+  color: var(--el-text-color-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.issue-group-title span {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 
 @media (max-width: 1080px) {

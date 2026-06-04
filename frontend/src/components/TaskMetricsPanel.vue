@@ -19,13 +19,13 @@ const metricCards = computed(() => {
   const metrics = props.metrics
   if (!metrics) return []
   return [
-    { label: '网页来源', value: metrics.source_document_count },
-    { label: 'Evidence Chunk', value: metrics.evidence_chunk_count },
-    { label: 'Claim', value: metrics.claim_count },
-    { label: 'Profile', value: metrics.profile_count },
-    { label: 'Matrix', value: metrics.matrix_count },
-    { label: 'Embedding 失败', value: metrics.embedding_failed_count },
-    { label: 'RAG fallback', value: metrics.rag_fallback_count },
+    { label: '资料页数', value: metrics.source_document_count },
+    { label: '证据片段', value: metrics.evidence_chunk_count },
+    { label: '分析结论', value: metrics.claim_count },
+    { label: '竞品画像', value: metrics.profile_count },
+    { label: '对比表', value: metrics.matrix_count },
+    { label: '向量失败', value: metrics.embedding_failed_count },
+    { label: '检索降级', value: metrics.rag_fallback_count },
   ]
 })
 </script>
@@ -54,7 +54,7 @@ const metricCards = computed(() => {
         </div>
         <div>
           <div class="progress-title">
-            <span>Evidence 使用率</span>
+            <span>证据使用率</span>
             <strong>{{ percent(metrics.evidence_usage_rate) }}%</strong>
           </div>
           <el-progress :percentage="percent(metrics.evidence_usage_rate)" />

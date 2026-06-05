@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.celery_app import CELERY_QUEUE_NAME
 from app.core.database import SessionLocal, get_db
@@ -29,6 +30,7 @@ from app.models.agent_node import AgentNode
 from app.models.comparison_matrix import ComparisonMatrix
 from app.models.competitor_profile import CompetitorProfile
 from app.models.qa_result import QAResult
+from app.models.user import User
 from app.services.claim_service import list_claims_with_evidence
 from app.services.evidence_service import list_evidence
 from app.services.log_service import list_logs
@@ -37,7 +39,7 @@ from app.services.qa_service import get_qa_result
 from app.services.report_service import build_markdown_export, build_pdf_export, get_report, safe_report_filename
 from app.services.task_service import (
     create_task,
-    get_task,
+    get_task_visible_to_user,
     get_task_plan,
     list_edges,
     list_nodes,
@@ -56,6 +58,8 @@ router = APIRouter()
 def _to_task_response(task) -> AnalysisTaskResponse:
     return AnalysisTaskResponse(
         id=task.id,
+        user_id=task.user_id,
+        owner_username=task.owner.username if task.owner else None,
         user_input=task.user_input,
         topic=task.topic,
         industry=task.industry,
@@ -68,6 +72,13 @@ def _to_task_response(task) -> AnalysisTaskResponse:
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
+
+
+def _owned_task_or_404(db: Session, task_id: int, current_user: User):
+    task = get_task_visible_to_user(db, task_id, current_user.id, current_user.is_admin)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
 
 
 def _run_analysis_in_local_thread(task_id: int) -> None:
@@ -322,9 +333,16 @@ def _with_parallel_worker_nodes(task_id: int, nodes: list, edges: list[dict]) ->
 
 
 @router.post("", response_model=AnalysisTaskCreateResponse)
-def create_analysis_task(request: AnalysisTaskCreateRequest, db: Session = Depends(get_db)) -> AnalysisTaskCreateResponse:
-    _console("analysis task create requested", {"topic": request.task_plan.topic, "competitors": request.task_plan.competitors})
-    task = create_task(db, request)
+def create_analysis_task(
+    request: AnalysisTaskCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AnalysisTaskCreateResponse:
+    _console(
+        "analysis task create requested",
+        {"topic": request.task_plan.topic, "competitors": request.task_plan.competitors, "user_id": current_user.id},
+    )
+    task = create_task(db, request, current_user.id)
     _console("analysis task created", {"task_id": task.id, "run_tasks_inline": settings.run_tasks_inline})
     try:
         _enqueue_or_run_task(db, task.id)
@@ -348,10 +366,21 @@ def create_analysis_task(request: AnalysisTaskCreateRequest, db: Session = Depen
 def get_analysis_tasks(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    user_id: int | None = Query(default=None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> AnalysisTaskHistoryResponse:
     items = []
-    for task in list_tasks(db, limit=limit, offset=offset):
+    if user_id is not None and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+    for task in list_tasks(
+        db,
+        current_user.id,
+        limit=limit,
+        offset=offset,
+        is_admin=current_user.is_admin,
+        owner_user_id=user_id,
+    ):
         task_response = _to_task_response(task)
         nodes = sorted(task.nodes, key=lambda node: node.id)
         items.append(AnalysisTaskHistoryItem(**task_response.model_dump(), nodes=nodes))
@@ -359,15 +388,22 @@ def get_analysis_tasks(
 
 
 @router.get("/{task_id}", response_model=AnalysisTaskResponse)
-def get_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
-    task = get_task(db, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+def get_analysis_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AnalysisTaskResponse:
+    task = _owned_task_or_404(db, task_id, current_user)
     return _to_task_response(task)
 
 
 @router.post("/{task_id}/pause", response_model=AnalysisTaskResponse)
-def pause_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
+def pause_analysis_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AnalysisTaskResponse:
+    _owned_task_or_404(db, task_id, current_user)
     task = request_pause_task(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -376,7 +412,12 @@ def pause_analysis_task(task_id: int, db: Session = Depends(get_db)) -> Analysis
 
 
 @router.post("/{task_id}/resume", response_model=AnalysisTaskResponse)
-def resume_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
+def resume_analysis_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AnalysisTaskResponse:
+    _owned_task_or_404(db, task_id, current_user)
     task = mark_task_resuming(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -389,7 +430,12 @@ def resume_analysis_task(task_id: int, db: Session = Depends(get_db)) -> Analysi
 
 
 @router.post("/{task_id}/cancel", response_model=AnalysisTaskResponse)
-def cancel_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
+def cancel_analysis_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AnalysisTaskResponse:
+    _owned_task_or_404(db, task_id, current_user)
     task = request_cancel_task(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -398,10 +444,12 @@ def cancel_analysis_task(task_id: int, db: Session = Depends(get_db)) -> Analysi
 
 
 @router.post("/{task_id}/retry", response_model=AnalysisTaskResponse)
-def retry_analysis_task(task_id: int, db: Session = Depends(get_db)) -> AnalysisTaskResponse:
-    task = get_task(db, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+def retry_analysis_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AnalysisTaskResponse:
+    task = _owned_task_or_404(db, task_id, current_user)
     if task.status not in {"failed", "canceled", "paused", "success"}:
         raise HTTPException(status_code=409, detail=f"Task cannot be retried from status {task.status}")
     task = reset_task_for_retry(db, task_id)
@@ -414,15 +462,24 @@ def retry_analysis_task(task_id: int, db: Session = Depends(get_db)) -> Analysis
 
 
 @router.get("/{task_id}/nodes", response_model=AgentNodeListResponse)
-def get_task_nodes(task_id: int, db: Session = Depends(get_db)) -> AgentNodeListResponse:
-    if get_task(db, task_id) is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+def get_task_nodes(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AgentNodeListResponse:
+    _owned_task_or_404(db, task_id, current_user)
     nodes, edges = _with_parallel_worker_nodes(task_id, list_nodes(db, task_id), list_edges(db, task_id))
     return AgentNodeListResponse(nodes=nodes, edges=edges)
 
 
 @router.get("/{task_id}/logs", response_model=AgentLogListResponse)
-def get_task_logs(task_id: int, node_key: str | None = Query(default=None), db: Session = Depends(get_db)) -> AgentLogListResponse:
+def get_task_logs(
+    task_id: int,
+    node_key: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AgentLogListResponse:
+    _owned_task_or_404(db, task_id, current_user)
     logs = [
         AgentLogResponse(
             id=log.id,
@@ -444,12 +501,19 @@ def get_task_evidence(
     competitor_name: str | None = Query(default=None),
     source_type: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> EvidenceListResponse:
+    _owned_task_or_404(db, task_id, current_user)
     return EvidenceListResponse(items=list_evidence(db, task_id, competitor_name, source_type))
 
 
 @router.get("/{task_id}/claims", response_model=ClaimListResponse)
-def get_task_claims(task_id: int, db: Session = Depends(get_db)) -> ClaimListResponse:
+def get_task_claims(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ClaimListResponse:
+    _owned_task_or_404(db, task_id, current_user)
     items = [
         ClaimItem(
             id=claim.id,
@@ -470,7 +534,12 @@ def get_task_claims(task_id: int, db: Session = Depends(get_db)) -> ClaimListRes
 
 
 @router.get("/{task_id}/report", response_model=ReportResponse)
-def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportResponse:
+def get_task_report(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ReportResponse:
+    _owned_task_or_404(db, task_id, current_user)
     report = get_report(db, task_id)
     if report is None:
         return ReportResponse(report=None)
@@ -529,25 +598,34 @@ def get_task_report(task_id: int, db: Session = Depends(get_db)) -> ReportRespon
 
 
 @router.get("/{task_id}/profiles", response_model=CompetitorProfileListResponse)
-def get_task_profiles(task_id: int, db: Session = Depends(get_db)) -> CompetitorProfileListResponse:
-    if get_task(db, task_id) is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+def get_task_profiles(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CompetitorProfileListResponse:
+    _owned_task_or_404(db, task_id, current_user)
     items = list(db.scalars(select(CompetitorProfile).where(CompetitorProfile.task_id == task_id).order_by(CompetitorProfile.id)))
     return CompetitorProfileListResponse(items=[CompetitorProfileItem.model_validate(item) for item in items])
 
 
 @router.get("/{task_id}/matrices", response_model=ComparisonMatrixListResponse)
-def get_task_matrices(task_id: int, db: Session = Depends(get_db)) -> ComparisonMatrixListResponse:
-    if get_task(db, task_id) is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+def get_task_matrices(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ComparisonMatrixListResponse:
+    _owned_task_or_404(db, task_id, current_user)
     items = list(db.scalars(select(ComparisonMatrix).where(ComparisonMatrix.task_id == task_id).order_by(ComparisonMatrix.id)))
     return ComparisonMatrixListResponse(items=[ComparisonMatrixItem.model_validate(item) for item in items])
 
 
 @router.get("/{task_id}/metrics", response_model=TaskMetricsResponse)
-def get_task_metrics(task_id: int, db: Session = Depends(get_db)) -> TaskMetricsResponse:
-    if get_task(db, task_id) is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+def get_task_metrics(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TaskMetricsResponse:
+    _owned_task_or_404(db, task_id, current_user)
     return MetricsService(db).build_metrics(task_id)
 
 
@@ -556,7 +634,9 @@ def export_task_report(
     task_id: int,
     format: str = Query(default="markdown", pattern="^(markdown|md|pdf)$"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> Response:
+    _owned_task_or_404(db, task_id, current_user)
     report = get_report(db, task_id)
     if report is None:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -599,7 +679,12 @@ def export_task_report(
 
 
 @router.get("/{task_id}/qa", response_model=QAResultResponse)
-def get_task_qa(task_id: int, db: Session = Depends(get_db)) -> QAResultResponse:
+def get_task_qa(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> QAResultResponse:
+    _owned_task_or_404(db, task_id, current_user)
     qa_result = get_qa_result(db, task_id)
     if qa_result is None:
         return QAResultResponse(qa_result=None)
@@ -607,8 +692,11 @@ def get_task_qa(task_id: int, db: Session = Depends(get_db)) -> QAResultResponse
 
 
 @router.get("/{task_id}/qa/history", response_model=QAResultHistoryResponse)
-def get_task_qa_history(task_id: int, db: Session = Depends(get_db)) -> QAResultHistoryResponse:
-    if get_task(db, task_id) is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+def get_task_qa_history(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> QAResultHistoryResponse:
+    _owned_task_or_404(db, task_id, current_user)
     qa_results = list(db.scalars(select(QAResult).where(QAResult.task_id == task_id).order_by(QAResult.id)))
     return QAResultHistoryResponse(items=[_qa_result_item(item, db) for item in qa_results])

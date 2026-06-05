@@ -1,14 +1,16 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from app.api.deps import get_current_user
 from app.agents.planner_agent import parse_task_plan
 from app.graph.workflow import _console
+from app.models.user import User
 from app.schemas.task_plan import TaskPlanParseRequest, TaskPlanParseResponse
 
 router = APIRouter()
 
 
 @router.post("/parse", response_model=TaskPlanParseResponse)
-def parse_user_input(request: TaskPlanParseRequest) -> TaskPlanParseResponse:
+def parse_user_input(request: TaskPlanParseRequest, _: User = Depends(get_current_user)) -> TaskPlanParseResponse:
     _console(
         "task plan parse requested",
         {

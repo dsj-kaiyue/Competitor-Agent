@@ -3,6 +3,8 @@ import type { AgentNode } from './agentNode'
 
 export interface AnalysisTask {
   id: number
+  user_id?: number | null
+  owner_username?: string | null
   user_input: string
   topic: string
   industry?: string | null

@@ -1,14 +1,32 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { RouterLink } from 'vue-router'
+import { computed, onMounted, ref, watch } from 'vue'
+import { RouterLink, useRoute } from 'vue-router'
 import { getAnalysisTasks } from '@/api/analysisTaskApi'
+import { getUsers } from '@/api/userApi'
+import { useAuthStore } from '@/stores/authStore'
 import type { AnalysisTaskHistoryItem } from '@/types/analysisTask'
+import type { User } from '@/types/user'
 
+const route = useRoute()
 const tasks = ref<AnalysisTaskHistoryItem[]>([])
+const users = ref<User[]>([])
 const loading = ref(false)
 const errorMessage = ref('')
+const auth = useAuthStore()
+
+const targetUserId = computed(() => {
+  const queryId = Number(route.query.userId)
+  return !isNaN(queryId) && queryId > 0 ? queryId : auth.user?.id
+})
 
 const hasTasks = computed(() => tasks.value.length > 0)
+const targetUser = computed(() => users.value.find((u) => u.id === targetUserId.value))
+const pageTitle = computed(() => {
+  if (route.query.userId && targetUser.value && targetUser.value.id !== auth.user?.id) {
+    return `${targetUser.value.username} 的历史记录`
+  }
+  return '历史分析记录'
+})
 
 function statusTagType(status: string) {
   if (status === 'success') return 'success'
@@ -26,7 +44,7 @@ async function loadHistory() {
   loading.value = true
   errorMessage.value = ''
   try {
-    tasks.value = await getAnalysisTasks({ limit: 100 })
+    tasks.value = await getAnalysisTasks({ limit: 100, user_id: targetUserId.value })
   } catch (error) {
     console.error(error)
     errorMessage.value = error instanceof Error ? error.message : String(error)
@@ -35,14 +53,22 @@ async function loadHistory() {
   }
 }
 
-onMounted(loadHistory)
+async function loadInitialData() {
+  if (auth.isAdmin) {
+    users.value = await getUsers()
+  }
+  await loadHistory()
+}
+
+watch(targetUserId, loadHistory)
+onMounted(loadInitialData)
 </script>
 
 <template>
   <main v-loading="loading" class="page">
     <section class="toolbar">
       <div>
-        <h1>历史分析记录</h1>
+        <h1>{{ pageTitle }}</h1>
         <p>查看过往任务、Agent 节点状态、报告和证据链。</p>
       </div>
       <div class="actions">
@@ -67,6 +93,7 @@ onMounted(loadHistory)
           <p>{{ task.user_input }}</p>
           <div class="meta">
             <span>#{{ task.id }}</span>
+            <span v-if="auth.isAdmin">所属用户：{{ task.owner_username || '未分配' }}</span>
             <span>{{ task.industry || '未设置行业' }}</span>
             <span>{{ task.created_at }}</span>
           </div>

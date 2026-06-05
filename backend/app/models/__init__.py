@@ -9,6 +9,7 @@ from app.models.evidence_chunk import EvidenceChunk
 from app.models.qa_result import QAResult
 from app.models.report import Report
 from app.models.source_document import SourceDocument
+from app.models.user import User
 
 __all__ = [
     "AgentNode",
@@ -22,4 +23,5 @@ __all__ = [
     "QAResult",
     "Report",
     "SourceDocument",
+    "User",
 ]

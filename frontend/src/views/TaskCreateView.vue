@@ -5,7 +5,6 @@ import { ElMessage } from 'element-plus'
 import axios from 'axios'
 import TaskPlanForm from '@/components/TaskPlanForm.vue'
 import { createAnalysisTask } from '@/api/analysisTaskApi'
-import { API_BASE_URL } from '@/api/http'
 import { parseTaskPlan } from '@/api/taskPlanApi'
 import type { TaskPlan } from '@/types/taskPlan'
 
@@ -45,7 +44,7 @@ function formatError(error: unknown) {
       return `HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`
     }
     if (error.request) {
-      return `无法连接 API：${error.message}。当前 API 地址：${API_BASE_URL}`
+      return `无法连接 API：${error.message}`
     }
     return error.message
   }
@@ -155,7 +154,6 @@ async function handleCreate() {
       <div>
         <h1>竞品分析 Agent 工作台</h1>
         <p>从一句话输入生成 TaskPlan，并执行可观测的多 Agent DAG。</p>
-        <p class="api-base">API：{{ API_BASE_URL }}</p>
       </div>
       <div class="actions">
         <el-switch
@@ -244,18 +242,6 @@ p {
   color: var(--el-text-color-secondary);
   font-size: 21px;
   line-height: 1.35;
-}
-
-.api-base {
-  display: inline-flex;
-  margin-top: 16px;
-  padding: 7px 12px;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: var(--ca-radius-pill);
-  background: rgba(255, 255, 255, 0.68);
-  font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace;
-  font-size: 12px;
-  line-height: 1.2;
 }
 
 .section {

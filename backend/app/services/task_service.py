@@ -1,7 +1,7 @@
 import hashlib
 
 from sqlalchemy import delete, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.orm import Session
 
 from app.agents.planner_agent import parse_task_plan
@@ -91,9 +91,10 @@ def ensure_dimension_nodes(db: Session, task: AnalysisTask, plan: TaskPlan | Non
     return nodes
 
 
-def create_task(db: Session, request: AnalysisTaskCreateRequest) -> AnalysisTask:
+def create_task(db: Session, request: AnalysisTaskCreateRequest, user_id: int) -> AnalysisTask:
     plan = request.task_plan
     task = AnalysisTask(
+        user_id=user_id,
         user_input=request.user_input,
         topic=plan.topic,
         industry=plan.industry,
@@ -117,14 +118,36 @@ def get_task(db: Session, task_id: int) -> AnalysisTask | None:
     return db.get(AnalysisTask, task_id)
 
 
-def list_tasks(db: Session, limit: int = 50, offset: int = 0) -> list[AnalysisTask]:
+def get_task_visible_to_user(db: Session, task_id: int, user_id: int, is_admin: bool = False) -> AnalysisTask | None:
+    stmt = select(AnalysisTask).options(joinedload(AnalysisTask.owner)).where(AnalysisTask.id == task_id)
+    if not is_admin:
+        stmt = stmt.where(AnalysisTask.user_id == user_id)
+    return db.scalar(stmt)
+
+
+def list_tasks(
+    db: Session,
+    user_id: int,
+    limit: int = 50,
+    offset: int = 0,
+    is_admin: bool = False,
+    owner_user_id: int | None = None,
+) -> list[AnalysisTask]:
+    stmt = (
+        select(AnalysisTask)
+        .options(selectinload(AnalysisTask.nodes), joinedload(AnalysisTask.owner))
+        .order_by(AnalysisTask.created_at.desc(), AnalysisTask.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    if is_admin:
+        if owner_user_id is not None:
+            stmt = stmt.where(AnalysisTask.user_id == owner_user_id)
+    else:
+        stmt = stmt.where(AnalysisTask.user_id == user_id)
     return list(
         db.scalars(
-            select(AnalysisTask)
-            .options(selectinload(AnalysisTask.nodes))
-            .order_by(AnalysisTask.created_at.desc(), AnalysisTask.id.desc())
-            .offset(offset)
-            .limit(limit)
+            stmt
         )
     )
 

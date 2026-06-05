@@ -16,7 +16,7 @@ export async function createAnalysisTask(user_input: string, task_plan: TaskPlan
   return data
 }
 
-export async function getAnalysisTasks(params?: { limit?: number; offset?: number }) {
+export async function getAnalysisTasks(params?: { limit?: number; offset?: number; user_id?: number }) {
   const { data } = await http.get<{ items: AnalysisTaskHistoryItem[] }>('/analysis-tasks', {
     params,
   })

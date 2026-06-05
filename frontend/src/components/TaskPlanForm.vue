@@ -52,7 +52,7 @@ function removeDimension(index: number) {
           <el-input v-model="model.competitors[index]" class="chip-input" />
           <el-button type="danger" plain @click="removeCompetitor(index)">删除</el-button>
         </div>
-        <el-button @click="addCompetitor">添加</el-button>
+        <el-button class="add-button" @click="addCompetitor">添加</el-button>
       </div>
     </el-form-item>
     <el-form-item label="分析维度">
@@ -61,7 +61,7 @@ function removeDimension(index: number) {
           <el-input v-model="model.analysis_dimensions[index]" class="chip-input" />
           <el-button type="danger" plain @click="removeDimension(index)">删除</el-button>
         </div>
-        <el-button @click="addDimension">添加</el-button>
+        <el-button class="add-button" @click="addDimension">添加</el-button>
       </div>
     </el-form-item>
     <el-form-item label="数据来源">
@@ -109,6 +109,11 @@ function removeDimension(index: number) {
 .chip-input {
   min-width: 0;
   flex: 1;
+}
+
+.add-button {
+  height: 48px;
+  border-radius: var(--ca-radius-lg);
 }
 
 @media (max-width: 760px) {

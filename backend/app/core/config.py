@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     app_env: str = "dev"
     app_name: str = "competitive-agent-system"
+    auth_secret_key: str = "competitive-agent-dev-secret"
 
     database_url: str
     celery_broker_url: str = "redis://localhost:6379/0"

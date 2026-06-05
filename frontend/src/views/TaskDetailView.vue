@@ -437,7 +437,10 @@ onBeforeUnmount(() => {
     <section class="toolbar">
       <div>
         <h1>{{ task?.topic || '任务详情' }}</h1>
-        <p>任务 #{{ taskId }} · {{ task?.status }}</p>
+        <p>
+          任务 #{{ taskId }} · {{ task?.status }}
+          <span v-if="task?.owner_username"> · 所属用户 {{ task.owner_username }}</span>
+        </p>
       </div>
       <div class="actions">
         <el-button :disabled="!canPause" :loading="controlLoading === 'pause'" @click="runControl('pause')">
@@ -447,7 +450,7 @@ onBeforeUnmount(() => {
           恢复
         </el-button>
         <el-button :disabled="!canRetry" :loading="controlLoading === 'retry'" @click="runControl('retry')">
-          重试
+          重启
         </el-button>
         <el-button :disabled="!canCancel" :loading="controlLoading === 'cancel'" type="danger" plain @click="runControl('cancel')">
           取消

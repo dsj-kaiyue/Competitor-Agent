@@ -272,6 +272,11 @@ D:\Anaconda\envs\competitor-agent\python.exe -m alembic upgrade head
 D:\Anaconda\envs\competitor-agent\python.exe -m alembic current
 ```
 
+迁移到最新版后，系统启动时会自动创建初始账号并把未归属的历史分析任务随机分配给这些账号：
+
+- 管理员：`Admin` / `Admin`
+- 测试用户：`User1` / `User1`、`User2` / `User2`、`User3` / `User3`
+
 ### 3. 启动 Redis
 
 Redis 用于 Celery 队列、结果后端和 worker 心跳。请按本机环境启动 Redis，并确认 `CELERY_BROKER_URL` 可访问。
@@ -368,4 +373,3 @@ npm run build
 - 重试任务会清理旧报告、证据、Claim、QA 和 Agent QA 状态。
 - 数据库结构变更必须新增 Alembic migration。
 - 前端类型应与后端 Pydantic schema 保持同步。
-

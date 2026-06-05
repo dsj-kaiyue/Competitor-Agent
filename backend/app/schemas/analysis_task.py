@@ -18,6 +18,8 @@ class AnalysisTaskCreateResponse(BaseModel):
 
 class AnalysisTaskResponse(BaseModel):
     id: int
+    user_id: int | None = None
+    owner_username: str | None = None
     user_input: str
     topic: str
     industry: str | None

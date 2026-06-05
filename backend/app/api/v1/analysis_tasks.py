@@ -371,15 +371,16 @@ def get_analysis_tasks(
     current_user: User = Depends(get_current_user),
 ) -> AnalysisTaskHistoryResponse:
     items = []
-    if user_id is not None and not current_user.is_admin:
+    if user_id is not None and not current_user.is_admin and user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Admin privileges required")
+    owner_user_id = user_id if current_user.is_admin else None
     for task in list_tasks(
         db,
         current_user.id,
         limit=limit,
         offset=offset,
         is_admin=current_user.is_admin,
-        owner_user_id=user_id,
+        owner_user_id=owner_user_id,
     ):
         task_response = _to_task_response(task)
         nodes = sorted(task.nodes, key=lambda node: node.id)

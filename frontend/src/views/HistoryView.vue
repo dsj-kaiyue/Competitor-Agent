@@ -14,15 +14,15 @@ const loading = ref(false)
 const errorMessage = ref('')
 const auth = useAuthStore()
 
-const targetUserId = computed(() => {
+const routeUserId = computed(() => {
   const queryId = Number(route.query.userId)
-  return !isNaN(queryId) && queryId > 0 ? queryId : auth.user?.id
+  return !isNaN(queryId) && queryId > 0 ? queryId : undefined
 })
 
 const hasTasks = computed(() => tasks.value.length > 0)
-const targetUser = computed(() => users.value.find((u) => u.id === targetUserId.value))
+const targetUser = computed(() => users.value.find((u) => u.id === routeUserId.value))
 const pageTitle = computed(() => {
-  if (route.query.userId && targetUser.value && targetUser.value.id !== auth.user?.id) {
+  if (auth.isAdmin && routeUserId.value && targetUser.value) {
     return `${targetUser.value.username} 的历史记录`
   }
   return '历史分析记录'
@@ -44,7 +44,10 @@ async function loadHistory() {
   loading.value = true
   errorMessage.value = ''
   try {
-    tasks.value = await getAnalysisTasks({ limit: 100, user_id: targetUserId.value })
+    tasks.value = await getAnalysisTasks({
+      limit: 100,
+      user_id: auth.isAdmin ? routeUserId.value : undefined,
+    })
   } catch (error) {
     console.error(error)
     errorMessage.value = error instanceof Error ? error.message : String(error)
@@ -60,7 +63,7 @@ async function loadInitialData() {
   await loadHistory()
 }
 
-watch(targetUserId, loadHistory)
+watch(routeUserId, loadHistory)
 onMounted(loadInitialData)
 </script>
 

@@ -8,6 +8,7 @@ import re
 from time import perf_counter
 
 import markdown
+from langgraph.graph import END, START, StateGraph
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
@@ -3045,20 +3046,7 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
             },
         )
 
-    update_task_status(db, task_id, "running")
-    _run_node(db, task_id, "planner", "planned", planner)
-    _run_node(db, task_id, "dimension_planner", "planning_dimensions", dimension_planner)
-    _run_node(db, task_id, "collector", "collecting", collector)
-    _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor)
-    run_parallel_dimension_analysts()
-    build_dynamic_knowledge()
-    state["report_writer_mode"] = "full_write"
-    _run_node(db, task_id, "report_writer", "writing", report_writer)
-    _run_node(db, task_id, "qa", "qa_checking", qa)
-    hydrate_state_from_latest_qa()
-    while not state.get("qa_passed") and state.get("revision_round", 0) < state.get("max_revision_rounds", 1):
-        action = state.get("qa_next_action") or "end"
-        target_nodes = state.get("qa_target_nodes", [])
+    def revision_context() -> dict:
         revision_plan = state.get("qa_revision_plan") if isinstance(state.get("qa_revision_plan"), dict) else {}
         recollect_nodes = [
             str(node_key)
@@ -3080,13 +3068,76 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
             for node_key in revision_plan.get("analysis_nodes", [*recollect_nodes, *reanalyze_nodes])
             if str(node_key).startswith("dimension_analysis_")
         ]
+        return {
+            "action": state.get("qa_next_action") or "end",
+            "target_nodes": [str(node_key) for node_key in state.get("qa_target_nodes", [])],
+            "revision_plan": revision_plan,
+            "recollect_nodes": recollect_nodes,
+            "reanalyze_nodes": reanalyze_nodes,
+            "rewrite_nodes": rewrite_nodes,
+            "analysis_nodes": analysis_nodes,
+        }
+
+    def should_revise(_: CompetitiveAnalysisState) -> str:
+        hydrate_state_from_latest_qa()
+        if state.get("qa_passed"):
+            return "finalize"
+        if int(state.get("revision_round", 0) or 0) >= int(state.get("max_revision_rounds", 1) or 1):
+            return "finalize"
+        return "prepare_revision"
+
+    def after_prepare_revision(_: CompetitiveAnalysisState) -> str:
+        ctx = revision_context()
+        if ctx["action"] == "end":
+            return "finalize"
+        if not ctx["target_nodes"]:
+            return "finalize"
+        if ctx["recollect_nodes"]:
+            return "recollect"
+        return "analysis"
+
+    def graph_planner(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        _run_node(db, task_id, "planner", "planned", planner)
+        return state
+
+    def graph_dimension_planner(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        _run_node(db, task_id, "dimension_planner", "planning_dimensions", dimension_planner)
+        return state
+
+    def graph_collector(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        _run_node(db, task_id, "collector", "collecting", collector)
+        return state
+
+    def graph_evidence_extractor(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor)
+        return state
+
+    def graph_dimension_analysis(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        run_parallel_dimension_analysts()
+        build_dynamic_knowledge()
+        return state
+
+    def graph_full_report_writer(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        state["report_writer_mode"] = "full_write"
+        _run_node(db, task_id, "report_writer", "writing", report_writer)
+        return state
+
+    def graph_initial_qa(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        _run_node(db, task_id, "qa", "qa_checking", qa)
+        hydrate_state_from_latest_qa()
+        return state
+
+    def graph_prepare_revision(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        ctx = revision_context()
+        action = ctx["action"]
         if action == "end":
             _console(
                 "qa revision stopped because no actionable revision was requested",
                 {"task_id": task_id, "revision_round": state.get("revision_round", 0)},
             )
-            break
-        state["revision_round"] = int(state.get("revision_round", 0)) + 1
+            return state
+
+        state["revision_round"] = int(state.get("revision_round", 0) or 0) + 1
         qa_node = _node(db, task_id, "qa")
         add_log(
             db,
@@ -3095,8 +3146,8 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
             "QA requested revision",
             {
                 "next_action": action,
-                "target_nodes": target_nodes,
-                "revision_plan": revision_plan,
+                "target_nodes": ctx["target_nodes"],
+                "revision_plan": ctx["revision_plan"],
                 "issue_count": len(state.get("qa_issues", [])),
                 "revision_round": state["revision_round"],
             },
@@ -3108,50 +3159,128 @@ dimension_scores 必须覆盖本次检查范围内的每个动态维度；full_r
             {
                 "task_id": task_id,
                 "next_action": action,
-                "target_nodes": target_nodes,
-                "recollect_nodes": recollect_nodes,
-                "reanalyze_nodes": reanalyze_nodes,
-                "rewrite_nodes": rewrite_nodes,
+                "target_nodes": ctx["target_nodes"],
+                "recollect_nodes": ctx["recollect_nodes"],
+                "reanalyze_nodes": ctx["reanalyze_nodes"],
+                "rewrite_nodes": ctx["rewrite_nodes"],
                 "revision_round": state["revision_round"],
             },
         )
-        if not target_nodes:
+        if not ctx["target_nodes"]:
             _console("qa revision stopped because no failed dimensions were available", {"task_id": task_id})
-            break
-        if recollect_nodes:
-            original_followup_queries = list(state.get("qa_followup_queries", []))
-            try:
-                state["qa_followup_queries"] = revision_plan.get("recollect_followup_queries") or original_followup_queries
-                state["collector_mode"] = "recollect"
-                _run_node(db, task_id, "collector", "collecting", collector, force=True)
-                _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor, force=True)
-            finally:
-                state["collector_mode"] = "normal"
-                state["qa_followup_queries"] = original_followup_queries
-        if analysis_nodes:
-            run_parallel_dimension_analysts(analysis_nodes, force=True)
+        return state
+
+    def graph_revision_recollect(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        ctx = revision_context()
+        if not ctx["recollect_nodes"]:
+            return state
+        original_followup_queries = list(state.get("qa_followup_queries", []))
+        try:
+            state["qa_followup_queries"] = ctx["revision_plan"].get("recollect_followup_queries") or original_followup_queries
+            state["collector_mode"] = "recollect"
+            _run_node(db, task_id, "collector", "collecting", collector, force=True)
+            _run_node(db, task_id, "evidence_extractor", "extracting", evidence_extractor, force=True)
+        finally:
+            state["collector_mode"] = "normal"
+            state["qa_followup_queries"] = original_followup_queries
+        return state
+
+    def graph_revision_analysis(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        ctx = revision_context()
+        if ctx["analysis_nodes"]:
+            run_parallel_dimension_analysts(ctx["analysis_nodes"], force=True)
             build_dynamic_knowledge()
+        return state
+
+    def graph_revision_report_writer(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
         state["report_writer_mode"] = "partial_revision"
         _run_node(db, task_id, "report_writer", "writing", report_writer, force=True)
+        return state
+
+    def graph_revision_qa(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
         _run_node(db, task_id, "qa", "qa_checking", qa, force=True)
-    if not state.get("qa_passed"):
-        finalizer_node = _node(db, task_id, "report_finalizer")
-        add_log(
-            db,
-            task_id,
-            finalizer_node.id,
-            "Report finalizer running with unresolved QA issues",
-            {
-                "revision_round": state.get("revision_round", 0),
-                "max_revision_rounds": state.get("max_revision_rounds", 0),
-                "qa_next_action": state.get("qa_next_action"),
-                "issue_count": len(state.get("qa_issues", [])),
-            },
-            log_type="warning",
-        )
-        db.commit()
-    _run_node(db, task_id, "report_finalizer", "finalizing", report_finalizer, force=True)
+        hydrate_state_from_latest_qa()
+        return state
+
+    def graph_report_finalizer(_: CompetitiveAnalysisState) -> CompetitiveAnalysisState:
+        if not state.get("qa_passed"):
+            finalizer_node = _node(db, task_id, "report_finalizer")
+            add_log(
+                db,
+                task_id,
+                finalizer_node.id,
+                "Report finalizer running with unresolved QA issues",
+                {
+                    "revision_round": state.get("revision_round", 0),
+                    "max_revision_rounds": state.get("max_revision_rounds", 0),
+                    "qa_next_action": state.get("qa_next_action"),
+                    "issue_count": len(state.get("qa_issues", [])),
+                },
+                log_type="warning",
+            )
+            db.commit()
+        _run_node(db, task_id, "report_finalizer", "finalizing", report_finalizer, force=True)
+        return state
+
+    graph_builder = StateGraph(CompetitiveAnalysisState)
+    graph_builder.add_node("planner", graph_planner)
+    graph_builder.add_node("dimension_planner", graph_dimension_planner)
+    graph_builder.add_node("collector", graph_collector)
+    graph_builder.add_node("evidence_extractor", graph_evidence_extractor)
+    graph_builder.add_node("dimension_analysis", graph_dimension_analysis)
+    graph_builder.add_node("full_report_writer", graph_full_report_writer)
+    graph_builder.add_node("initial_qa", graph_initial_qa)
+    graph_builder.add_node("prepare_revision", graph_prepare_revision)
+    graph_builder.add_node("revision_recollect", graph_revision_recollect)
+    graph_builder.add_node("revision_analysis", graph_revision_analysis)
+    graph_builder.add_node("revision_report_writer", graph_revision_report_writer)
+    graph_builder.add_node("revision_qa", graph_revision_qa)
+    graph_builder.add_node("report_finalizer", graph_report_finalizer)
+
+    graph_builder.add_edge(START, "planner")
+    graph_builder.add_edge("planner", "dimension_planner")
+    graph_builder.add_edge("dimension_planner", "collector")
+    graph_builder.add_edge("collector", "evidence_extractor")
+    graph_builder.add_edge("evidence_extractor", "dimension_analysis")
+    graph_builder.add_edge("dimension_analysis", "full_report_writer")
+    graph_builder.add_edge("full_report_writer", "initial_qa")
+    graph_builder.add_conditional_edges(
+        "initial_qa",
+        should_revise,
+        {
+            "prepare_revision": "prepare_revision",
+            "finalize": "report_finalizer",
+        },
+    )
+    graph_builder.add_conditional_edges(
+        "prepare_revision",
+        after_prepare_revision,
+        {
+            "recollect": "revision_recollect",
+            "analysis": "revision_analysis",
+            "finalize": "report_finalizer",
+        },
+    )
+    graph_builder.add_edge("revision_recollect", "revision_analysis")
+    graph_builder.add_edge("revision_analysis", "revision_report_writer")
+    graph_builder.add_edge("revision_report_writer", "revision_qa")
+    graph_builder.add_conditional_edges(
+        "revision_qa",
+        should_revise,
+        {
+            "prepare_revision": "prepare_revision",
+            "finalize": "report_finalizer",
+        },
+    )
+    graph_builder.add_edge("report_finalizer", END)
+
+    update_task_status(db, task_id, "running")
+    compiled_graph = graph_builder.compile()
+    recursion_limit = max(25, 10 + int(state.get("max_revision_rounds", 1) or 1) * 8)
+    graph_result = compiled_graph.invoke(state, config={"recursion_limit": recursion_limit})
+    if isinstance(graph_result, dict):
+        state.update(graph_result)
     _check_task_control(db, task_id)
     update_task_status(db, task_id, "success")
-    _console("analysis workflow completed", {"task_id": task_id})
+    _console("analysis workflow completed", {"task_id": task_id, "runner": "langgraph"})
     return state

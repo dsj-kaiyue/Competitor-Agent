@@ -18,6 +18,10 @@ Competitive Agent 是一个 AI 驱动的通用竞品分析 Agent 协作系统。
 - 维度 Agent QA 状态：每个分析 Agent 的数据库记录保存当前 QA 状态，作为下一轮返工调度的权威来源。
 - DAG 可视化：前端展示 Agent 执行图、并行 worker、节点状态、日志、耗时和返工高亮。
 - 任务控制：支持暂停、恢复、取消、重试和历史任务查看。
+- 用户登录与注册：用户必须登录才能使用系统，支持新用户注册；用户名唯一，已被使用时不能重复注册。
+- 密码管理：已登录用户可以修改自己的密码，用户名不可修改。
+- 任务权限隔离：普通用户只能查看和操作自己账户下的分析任务。
+- 管理员管理：管理员可查看所有用户、启用或停用普通账户，并可查看、暂停、恢复或重启其他用户的任务。
 
 ## 系统架构
 
@@ -46,7 +50,7 @@ Workflow Graph
     -> Report Finalizer
 
 Storage:
-  MySQL  : tasks, agent nodes, logs, source documents, evidence, claims, reports, QA history
+  MySQL  : users, tasks, agent nodes, logs, source documents, evidence, claims, reports, QA history
   Milvus : vector index for evidence chunks
   Redis  : Celery broker/result backend and worker heartbeat
 ```
@@ -154,7 +158,8 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 
 | 表 | 说明 |
 | --- | --- |
-| `analysis_task` | 分析任务主表，保存用户输入、任务状态和最终 TaskPlan |
+| `app_user` | 用户表，保存登录账号、密码哈希、管理员标记和启停用状态 |
+| `analysis_task` | 分析任务主表，保存用户输入、所属用户、任务状态和最终 TaskPlan |
 | `agent_node` | DAG 节点表，包含每个 Agent 的运行状态和动态维度 Agent 的当前 QA 状态 |
 | `agent_run_log` | Agent 执行日志 |
 | `source_document` | 采集到的网页资料 |
@@ -168,6 +173,7 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 
 最新迁移：
 
+- `0005_user_management.py`：增加用户表、任务所属用户字段和用户管理相关索引。
 - `0004_agent_node_qa_state.py`：为 `agent_node` 增加维度 Agent 当前 QA 状态字段。
 
 ## API 概览
@@ -176,9 +182,15 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 
 | Method | Path | 说明 |
 | --- | --- | --- |
+| `POST` | `/auth/login` | 用户登录 |
+| `POST` | `/auth/register` | 用户注册，用户名必须唯一 |
+| `GET` | `/auth/me` | 获取当前登录用户 |
+| `POST` | `/auth/password` | 修改当前用户密码，用户名不可修改 |
+| `GET` | `/users` | 管理员查看用户列表 |
+| `PATCH` | `/users/{user_id}/active` | 管理员启用或停用普通账户 |
 | `POST` | `/task-plans/parse` | 解析需求、自动发现竞品、自动补充维度 |
 | `POST` | `/analysis-tasks` | 创建分析任务并入队 |
-| `GET` | `/analysis-tasks` | 任务历史 |
+| `GET` | `/analysis-tasks` | 任务历史；普通用户只返回自己的任务，管理员返回全部任务，可通过 `user_id` 筛选 |
 | `GET` | `/analysis-tasks/{task_id}` | 任务详情 |
 | `POST` | `/analysis-tasks/{task_id}/pause` | 暂停任务 |
 | `POST` | `/analysis-tasks/{task_id}/resume` | 恢复任务 |
@@ -272,10 +284,18 @@ D:\Anaconda\envs\competitor-agent\python.exe -m alembic upgrade head
 D:\Anaconda\envs\competitor-agent\python.exe -m alembic current
 ```
 
-迁移到最新版后，系统启动时会自动创建初始账号并把未归属的历史分析任务随机分配给这些账号：
+迁移到最新版后，系统启动时会自动创建初始账号并把未归属的历史分析任务随机分配给这些账号。已有账号的密码和启停用状态不会被启动逻辑覆盖：
 
 - 管理员：`Admin` / `Admin`
 - 测试用户：`User1` / `User1`、`User2` / `User2`、`User3` / `User3`
+
+账号规则：
+
+- 新用户可在登录页切换到注册模式创建账号。
+- 用户名是唯一标识，注册后不能修改。
+- 普通用户只能查看自己的分析任务。
+- 管理员可在“用户管理”页启用或停用普通账户；停用后该用户不能登录。
+- 管理员可在“历史记录”页查看所有用户任务，筛选某个用户后进入任务详情页执行暂停、恢复或重启。
 
 ### 3. 启动 Redis
 
@@ -313,7 +333,7 @@ npm run dev
 
 ## 典型使用流程
 
-1. 打开前端创建页。
+1. 打开前端登录页，使用默认账号登录，或切换到注册模式创建新账号。
 2. 输入分析需求，例如：
 
    ```text
@@ -326,6 +346,7 @@ npm run dev
 6. 在任务详情页查看 DAG、日志、耗时、证据、Claim、QA 和报告。
 7. 如 QA 不通过，系统会根据配置自动返工。
 8. 报告完成后可导出 Markdown 或 PDF。
+9. 管理员可进入“用户管理”页启用或停用普通账户，也可在“历史记录”页查看其他用户任务并进行暂停、恢复或重启。
 
 ## 测试与验证
 

@@ -1,29 +1,33 @@
-# Competitive Agent
+# Competitive Agent 🚀
 
 Competitive Agent 是一个 AI 驱动的通用竞品分析 Agent 协作系统。用户输入一句竞品分析需求后，系统会解析任务计划、自动发现竞品、生成动态分析维度，并通过多 Agent 协作完成资料采集、证据抽取、RAG 检索、结构化 Claim 生成、报告撰写、QA 复核、自动返工和报告导出。
 
 系统面向需要可追溯竞品研究、产品调研、市场分析和技术选型评估的团队。它不是只生成一段总结文本，而是把分析过程拆成可观察、可返工、可审计的流水线。
 
-## 功能特性
+## ✨ 功能特性
 
-- 一句话需求解析：将自然语言需求解析为 `TaskPlan`，包含主题、行业、竞品、分析维度、报告深度和输出语言。
-- 自动发现竞品：可根据目标产品和行业自动补充候选竞品。
-- 自动补充分析维度：可根据业务场景推荐额外分析维度，用户仍可在前端确认、增删和编辑。
-- 动态维度 Agent：每个分析维度都会创建一个独立的 `dimension_analysis_*` Agent，并行执行，只负责该维度的分析。
-- 资料采集与证据抽取：基于 Firecrawl 采集网页内容，抽取 evidence chunk，并写入 MySQL 与 Milvus。
-- RAG 支撑结论：动态维度 Agent 基于 Milvus 检索结果生成结构化 Claim，并保留 Claim 到 Evidence 的绑定。
-- 动态画像和对比矩阵：根据用户确认的分析维度生成竞品画像和矩阵，不依赖固定行业字段。
-- 报告生成与段落溯源：报告正文由 Claim 和 Evidence 支撑，可导出 Markdown 和 PDF。
-- QA 自动复核与返工：QA Agent 对每个分析维度打分，自动决定补采、重分析或重写。
-- 维度 Agent QA 状态：每个分析 Agent 的数据库记录保存当前 QA 状态，作为下一轮返工调度的权威来源。
-- DAG 可视化：前端展示 Agent 执行图、并行 worker、节点状态、日志、耗时和返工高亮。
-- 任务控制：支持暂停、恢复、取消、重试和历史任务查看。
-- 用户登录与注册：用户必须登录才能使用系统，支持新用户注册；用户名唯一，已被使用时不能重复注册。
-- 密码管理：已登录用户可以修改自己的密码，用户名不可修改。
-- 任务权限隔离：普通用户只能查看和操作自己账户下的分析任务。
-- 管理员管理：管理员可查看所有用户、启用或停用普通账户，并可查看、暂停、恢复或重启其他用户的任务。
+- 🧠 一句话需求解析：将自然语言需求解析为 `TaskPlan`，包含主题、行业、竞品、分析维度、报告深度和输出语言。
+- 🔎 自动发现竞品：可根据目标产品和行业自动补充候选竞品。
+- 🧩 自动补充分析维度：可根据业务场景推荐额外分析维度，用户仍可在前端确认、增删和编辑。
+- 🤖 动态维度 Agent：每个分析维度都会创建一个独立的 `dimension_analysis_*` Agent，并行执行，只负责该维度的分析。
+- 📚 资料采集与证据抽取：基于 Firecrawl 采集网页内容，抽取 evidence chunk，并写入 MySQL 与 Milvus。
+- 🧭 RAG 支撑结论：动态维度 Agent 基于 Milvus 检索结果生成结构化 Claim，并保留 Claim 到 Evidence 的绑定。
+- 📊 动态画像和对比矩阵：根据用户确认的分析维度生成竞品画像和矩阵，不依赖固定行业字段。
+- 📝 报告生成与段落溯源：报告正文由 Claim 和 Evidence 支撑，可导出 Markdown 和 PDF。
+- ✅ QA 自动复核与返工：QA Agent 对每个分析维度打分，自动决定补采、重分析或重写。
+- 🧷 维度 Agent QA 状态：每个分析 Agent 的数据库记录保存当前 QA 状态，作为下一轮返工调度的权威来源。
+- 🕸️ DAG 可视化：前端展示 Agent 执行图、并行 worker、节点状态、日志、耗时和返工高亮。
+- ⏯️ 任务控制：支持暂停、恢复、取消、重试和历史任务查看。
+- 🔐 用户登录与注册：用户必须登录才能使用系统，支持新用户注册；用户名唯一，已被使用时不能重复注册。
+- 🔑 密码管理：已登录用户可以修改自己的密码，用户名不可修改。
+- 🛡️ 任务权限隔离：普通用户只能查看和操作自己账户下的分析任务。
+- 👤 管理员管理：管理员可查看所有用户、启用或停用普通账户，并可查看、暂停、恢复或重启其他用户的任务。
 
-## 系统架构
+## 🏗️ 系统架构
+
+![Competitive Agent 系统架构](assets/readme/架构图.png)
+
+上图展示了系统从前端、后端 API、任务调度、Workflow Graph 到存储与外部服务的整体分层。普通用户和管理员共用同一套分析流水线，但通过登录态、任务所属用户和管理员权限实现访问隔离。
 
 ```text
 Frontend (Vue 3)
@@ -55,7 +59,7 @@ Storage:
   Redis  : Celery broker/result backend and worker heartbeat
 ```
 
-## 技术栈
+## 🧰 技术栈
 
 后端：
 
@@ -79,7 +83,11 @@ Storage:
 - ECharts
 - Pinia
 
-## Agent 流程
+## 🔄 Agent 流程
+
+![Competitive Agent 分析流程](assets/readme/agent流程图.png)
+
+上图展示了从登录/注册、需求解析、任务创建到资料采集、证据抽取、维度 Agent 并行分析、画像与对比矩阵、报告生成、QA 复核和自动返工的端到端流程。
 
 | Agent | 职责 | 主要产物 |
 | --- | --- | --- |
@@ -94,7 +102,7 @@ Storage:
 | QA Agent | 规则检查 + LLM 复核 + 返工决策 | `qa_result` 和 `agent_node` QA 状态 |
 | Report Finalizer Agent | 生成执行摘要、总体结论、建议和风险提示 | 最终 `report` |
 
-## QA 与返工机制
+## 🧪 QA 与返工机制
 
 QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_scores`。系统同时维护两类 QA 数据：
 
@@ -125,7 +133,7 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 
 `QA_MAX_REVISION_ROUNDS` 控制自动返工上限。达到上限后，系统仍会进入 Report Finalizer，但最终报告会保留 QA 残留问题和质量摘要。
 
-## 项目结构
+## 📁 项目结构
 
 ```text
 .
@@ -150,11 +158,10 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 │   │   ├── types/
 │   │   └── views/
 │   └── package.json
-├── tests/
 └── README.md
 ```
 
-## 数据库模型概览
+## 🗄️ 数据库模型概览
 
 | 表 | 说明 |
 | --- | --- |
@@ -176,7 +183,7 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 - `0005_user_management.py`：增加用户表、任务所属用户字段和用户管理相关索引。
 - `0004_agent_node_qa_state.py`：为 `agent_node` 增加维度 Agent 当前 QA 状态字段。
 
-## API 概览
+## 🔌 API 概览
 
 基础前缀：`/api/v1`
 
@@ -209,7 +216,7 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 | `GET` | `/analysis-tasks/{task_id}/qa` | 最新 QA 结果 |
 | `GET` | `/analysis-tasks/{task_id}/qa/history` | QA 历史 |
 
-## 环境变量
+## ⚙️ 环境变量
 
 后端读取 `backend/.env`。
 
@@ -259,9 +266,9 @@ CELERY_VISIBILITY_TIMEOUT_SECONDS=120
 CELERY_QUEUED_RECOVERY_MAX_AGE_SECONDS=1800
 ```
 
-## 本地启动
+## ▶️ 本地启动
 
-### 1. 后端依赖
+### 1. 🐍 后端依赖
 
 ```powershell
 cd backend
@@ -269,7 +276,7 @@ conda activate competitor-agent
 pip install -r requirements.txt
 ```
 
-### 2. 数据库迁移
+### 2. 🧱 数据库迁移
 
 确保 MySQL 数据库已创建，并且 `backend/.env` 或 `backend/alembic.ini` 中的连接串正确。
 
@@ -287,7 +294,7 @@ D:\Anaconda\envs\competitor-agent\python.exe -m alembic current
 迁移到最新版后，系统启动时会自动创建初始账号并把未归属的历史分析任务随机分配给这些账号。已有账号的密码和启停用状态不会被启动逻辑覆盖：
 
 - 管理员：`Admin` / `Admin`
-- 测试用户：`User1` / `User1`、`User2` / `User2`、`User3` / `User3`
+- 初始普通用户：`User1` / `User1`、`User2` / `User2`、`User3` / `User3`
 
 账号规则：
 
@@ -297,18 +304,18 @@ D:\Anaconda\envs\competitor-agent\python.exe -m alembic current
 - 管理员可在“用户管理”页启用或停用普通账户；停用后该用户不能登录。
 - 管理员可在“历史记录”页查看所有用户任务，筛选某个用户后进入任务详情页执行暂停、恢复或重启。
 
-### 3. 启动 Redis
+### 3. 🔴 启动 Redis
 
 Redis 用于 Celery 队列、结果后端和 worker 心跳。请按本机环境启动 Redis，并确认 `CELERY_BROKER_URL` 可访问。
 
-### 4. 启动后端 API
+### 4. 🚪 启动后端 API
 
 ```powershell
 cd backend
 D:\Anaconda\envs\competitor-agent\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-### 5. 启动 Celery Worker
+### 5. 🧵 启动 Celery Worker
 
 ```powershell
 cd backend
@@ -317,7 +324,7 @@ D:\Anaconda\envs\competitor-agent\python.exe -m celery -A app.worker worker --lo
 
 开发时如果 Celery 不可用，系统可根据配置回退到本地线程执行任务。
 
-### 6. 启动前端
+### 6. 🖥️ 启动前端
 
 ```powershell
 cd frontend
@@ -331,7 +338,7 @@ npm run dev
 - 后端：`http://127.0.0.1:8000`
 - OpenAPI：`http://127.0.0.1:8000/docs`
 
-## 典型使用流程
+## 🧭 典型使用流程
 
 1. 打开前端登录页，使用默认账号登录，或切换到注册模式创建新账号。
 2. 输入分析需求，例如：
@@ -348,36 +355,7 @@ npm run dev
 8. 报告完成后可导出 Markdown 或 PDF。
 9. 管理员可进入“用户管理”页启用或停用普通账户，也可在“历史记录”页查看其他用户任务并进行暂停、恢复或重启。
 
-## 测试与验证
-
-运行后端回归测试：
-
-```powershell
-D:\Anaconda\envs\competitor-agent\python.exe -m pytest tests/test_qa_revision_targets.py
-```
-
-编译检查：
-
-```powershell
-D:\Anaconda\envs\competitor-agent\python.exe -m py_compile backend/app/graph/workflow.py
-```
-
-前端构建：
-
-```powershell
-cd frontend
-npm run build
-```
-
-当前已验证：
-
-- QA 返工目标不会漏掉未通过维度。
-- 第一轮全局 QA 后，所有未通过维度都会进入下一轮返工目标。
-- partial QA 后，未通过维度集合只会从上一轮失败集合中收缩。
-- `agent_node` 当前 QA 状态可作为返工调度的权威来源。
-- 前端生产构建通过。构建时可能出现 Element Plus / Rolldown 的 pure annotation 和 chunk size 警告，不影响运行。
-
-## 当前能力边界
+## 🚧 当前能力边界
 
 - 系统依赖 Firecrawl、LLM API、Embedding API、Milvus、MySQL 和 Redis；外部服务不可用会影响完整流程。
 - 自动竞品发现和自动维度推荐依赖 LLM 输出质量，前端保留人工确认入口。
@@ -386,7 +364,7 @@ npm run build
 - QA 能发现常见证据缺失、维度遗漏、弱证据和写作结构问题，但仍建议对关键商业结论进行人工复核。
 - PDF 导出依赖 `reportlab` 和字体环境，复杂宽表会按列分块以降低溢出风险。
 
-## 开发约定
+## 🤝 开发约定
 
 - 每个用户确认的分析维度对应一个动态维度 Agent。
 - 动态维度 Agent 的真实执行失败会中断 workflow，避免生成空报告。

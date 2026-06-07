@@ -1,0 +1,197 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-this-root-password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-competitor_agent}
+      MYSQL_USER: ${MYSQL_USER:-competitor_agent}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change-this-password}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - milvus_etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    command: ["minio", "server", "/minio_data", "--console-address", ":9001"]
+    volumes:
+      - milvus_minio_data:/minio_data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus:
+    image: milvusdb/milvus:v3.0-beta
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    user: root
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MQ_TYPE: woodpecker
+    volumes:
+      - milvus_data:/var/lib/milvus
+      - ./milvus/user.yaml:/milvus/configs/user.yaml:ro
+    ports:
+      - "${MILVUS_PORT:-19530}:19530"
+      - "${MILVUS_HEALTH_PORT:-9091}:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+
+  migrate:
+    build:
+      context: ./backend
+      args:
+        APT_DEBIAN_MIRROR: ${APT_DEBIAN_MIRROR:-http://mirrors.tencentyun.com/debian}
+        APT_DEBIAN_SECURITY_MIRROR: ${APT_DEBIAN_SECURITY_MIRROR:-http://mirrors.tencentyun.com/debian-security}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-mirrors.cloud.tencent.com}
+    env_file:
+      - .env.docker
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    build:
+      context: ./backend
+      args:
+        APT_DEBIAN_MIRROR: ${APT_DEBIAN_MIRROR:-http://mirrors.tencentyun.com/debian}
+        APT_DEBIAN_SECURITY_MIRROR: ${APT_DEBIAN_SECURITY_MIRROR:-http://mirrors.tencentyun.com/debian-security}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-mirrors.cloud.tencent.com}
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build:
+      context: ./backend
+      args:
+        APT_DEBIAN_MIRROR: ${APT_DEBIAN_MIRROR:-http://mirrors.tencentyun.com/debian}
+        APT_DEBIAN_SECURITY_MIRROR: ${APT_DEBIAN_SECURITY_MIRROR:-http://mirrors.tencentyun.com/debian-security}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-mirrors.cloud.tencent.com}
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["python", "-m", "celery", "-A", "app.worker", "worker", "--loglevel=info", "--pool=solo"]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: /api/v1
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://mirrors.cloud.tencent.com/npm/}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-80}:80"
+
+volumes:
+  mysql_data:
+  redis_data:
+  milvus_etcd_data:
+  milvus_minio_data:
+  milvus_data:

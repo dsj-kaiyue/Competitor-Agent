@@ -339,6 +339,7 @@ def _register_pdf_font() -> str:
     from pathlib import Path
 
     from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
     from reportlab.pdfbase.ttfonts import TTFont
 
     candidates = [
@@ -347,15 +348,22 @@ def _register_pdf_font() -> str:
         Path(r"C:\Windows\Fonts\simhei.ttf"),
         Path("/System/Library/Fonts/PingFang.ttc"),
         Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf"),
         Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
         Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
     ]
     for path in candidates:
         if path.exists():
-            font_name = "CompetitorAgentCJK"
-            pdfmetrics.registerFont(TTFont(font_name, str(path)))
-            return font_name
-    return "Helvetica"
+            try:
+                font_name = "CompetitorAgentCJK"
+                pdfmetrics.registerFont(TTFont(font_name, str(path)))
+                return font_name
+            except Exception:
+                continue
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    return "STSong-Light"
 
 
 def _is_table_separator(line: str) -> bool:

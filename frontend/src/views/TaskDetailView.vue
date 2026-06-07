@@ -456,7 +456,7 @@ onBeforeUnmount(() => {
           取消
         </el-button>
         <RouterLink :to="`/tasks/${taskId}/evidence`">
-          <el-button>证据链</el-button>
+          <el-button>结论与证据</el-button>
         </RouterLink>
         <RouterLink :to="`/tasks/${taskId}/report`">
           <el-button type="primary">报告</el-button>

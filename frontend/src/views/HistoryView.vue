@@ -72,7 +72,7 @@ onMounted(loadInitialData)
     <section class="toolbar">
       <div>
         <h1>{{ pageTitle }}</h1>
-        <p>查看过往任务、Agent 节点状态、报告和证据链。</p>
+        <p>查看过往任务、Agent 节点状态、报告和结论与证据。</p>
       </div>
       <div class="actions">
         <el-button @click="loadHistory">刷新</el-button>
@@ -128,7 +128,7 @@ onMounted(loadInitialData)
             <el-button type="primary">报告</el-button>
           </RouterLink>
           <RouterLink :to="`/tasks/${task.id}/evidence`">
-            <el-button>证据链</el-button>
+            <el-button>结论与证据</el-button>
           </RouterLink>
         </div>
       </article>

@@ -6,6 +6,9 @@ defineProps<{ items: EvidenceItem[] }>()
 
 <template>
   <el-table :data="items" border>
+    <el-table-column label="证据编号" width="100">
+      <template #default="{ row }">#{{ row.id }}</template>
+    </el-table-column>
     <el-table-column prop="competitor_name" label="竞品" width="150" />
     <el-table-column prop="source_type" label="来源类型" width="150" />
     <el-table-column label="证据片段" min-width="360">

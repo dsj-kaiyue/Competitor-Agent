@@ -121,10 +121,7 @@ def _report_body_markdown(report: Report) -> str:
             text = str(paragraph.get("text") or "").strip()
             if not text:
                 continue
-            claim_ids = paragraph.get("claim_ids") or []
-            evidence_ids = paragraph.get("evidence_ids") or []
-            suffix = f"（Claims: {claim_ids}; Evidence: {evidence_ids}）" if claim_ids else ""
-            lines.extend([f"{text}{suffix}", ""])
+            lines.extend([text, ""])
     return "\n".join(lines).strip()
 
 
@@ -298,19 +295,17 @@ def _claims_markdown(claims_with_evidence: list[tuple[Claim, list[int]]]) -> str
     if not claims_with_evidence:
         sections.append("暂无结构化结论。")
         return "\n".join(sections)
-    sections.extend(["", "| ID | 竞品 | 维度 | 结论 | 置信度 | 风险 | Evidence |", "| --- | --- | --- | --- | --- | --- | --- |"])
-    for claim, evidence_ids in claims_with_evidence:
+    sections.extend(["", "| 竞品 | 维度 | 结论 | 置信度 | 风险 |", "| --- | --- | --- | --- | --- |"])
+    for claim, _evidence_ids in claims_with_evidence:
         sections.append(
             "| "
             + " | ".join(
                 [
-                    str(claim.id),
                     _markdown_cell(claim.competitor_name or "-"),
                     _markdown_cell(claim.dimension_label or claim.dimension_key or "-"),
                     _markdown_cell(claim.claim_text),
                     _format_confidence(claim.confidence),
                     _markdown_cell(claim.risk_level or "-"),
-                    _markdown_cell(", ".join(str(item) for item in evidence_ids) if evidence_ids else "-"),
                 ]
             )
             + " |"

@@ -1,11 +1,22 @@
 <script setup lang="ts">
 import type { EvidenceItem } from '@/types/evidence'
 
-defineProps<{ items: EvidenceItem[] }>()
+const props = defineProps<{ 
+  items: EvidenceItem[]
+  highlightId?: number | null
+}>()
+
+function getRowClassName({ row }: { row: EvidenceItem }) {
+  const classes = [`evidence-row-${row.id}`]
+  if (props.highlightId && row.id === props.highlightId) {
+    classes.push('highlight-row-active')
+  }
+  return classes.join(' ')
+}
 </script>
 
 <template>
-  <el-table :data="items" border>
+  <el-table :data="items" border :row-class-name="getRowClassName">
     <el-table-column label="证据编号" width="100">
       <template #default="{ row }">#{{ row.id }}</template>
     </el-table-column>
@@ -25,5 +36,12 @@ defineProps<{ items: EvidenceItem[] }>()
 .chunk {
   margin-bottom: 6px;
   line-height: 1.55;
+}
+</style>
+
+<style>
+.el-table .highlight-row-active {
+  --el-table-tr-bg-color: var(--el-color-primary-light-8);
+  transition: background-color 0.3s;
 }
 </style>

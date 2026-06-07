@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import { ArrowDown, ArrowRight } from '@element-plus/icons-vue'
 import EvidenceList from '@/components/EvidenceList.vue'
@@ -7,7 +7,8 @@ import { getTaskClaims, getTaskEvidence } from '@/api/analysisTaskApi'
 import type { ClaimItem } from '@/types/claim'
 import type { EvidenceItem } from '@/types/evidence'
 
-const taskId = Number(useRoute().params.id)
+const route = useRoute()
+const taskId = Number(route.params.id)
 const items = ref<EvidenceItem[]>([])
 const claims = ref<ClaimItem[]>([])
 const dimension = ref('')
@@ -15,6 +16,7 @@ const competitor = ref('')
 const sourceType = ref('')
 const claimTableCollapsed = ref(false)
 const evidenceTableCollapsed = ref(false)
+const listHighlightId = ref<number | null>(null)
 
 const evidenceById = computed(() => new Map(items.value.map((item) => [item.id, item])))
 const dimensions = computed(() =>
@@ -70,8 +72,47 @@ function claimDimension(claim: ClaimItem) {
   return claim.dimension_label || claim.dimension_key || claim.claim_type || ''
 }
 
+function scrollToEvidence(id: number) {
+  evidenceTableCollapsed.value = false
+  listHighlightId.value = id
+  
+  // Wait for table to possibly uncollapse
+  setTimeout(() => {
+    const el = document.querySelector(`.evidence-row-${id}`)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }, 100)
+
+  // Remove highlight after a delay
+  setTimeout(() => {
+    if (listHighlightId.value === id) {
+      listHighlightId.value = null
+    }
+  }, 2500)
+}
+
+watch(
+  () => route.query.evidence,
+  (newVal) => {
+    if (newVal) {
+      const evidenceId = Number(newVal)
+      if (!isNaN(evidenceId)) {
+        setTimeout(() => scrollToEvidence(evidenceId), 100)
+      }
+    }
+  }
+)
+
 onMounted(async () => {
   await Promise.all([load(), loadClaims()])
+
+  if (route.query.evidence) {
+    const evidenceId = Number(route.query.evidence)
+    if (!isNaN(evidenceId)) {
+      setTimeout(() => scrollToEvidence(evidenceId), 100)
+    }
+  }
 })
 </script>
 
@@ -125,7 +166,19 @@ onMounted(async () => {
           </el-table-column>
           <el-table-column prop="claim_text" label="结论内容" min-width="260" />
           <el-table-column label="关联证据编号" min-width="150">
-            <template #default="{ row }">{{ evidenceIdsText(row.evidence_ids) }}</template>
+            <template #default="{ row }">
+              <span v-if="!row.evidence_ids?.length">-</span>
+              <div v-else class="evidence-tags">
+                <el-tag
+                  v-for="id in row.evidence_ids"
+                  :key="id"
+                  class="evidence-tag-link"
+                  @click="scrollToEvidence(id)"
+                >
+                  #{{ id }}
+                </el-tag>
+              </div>
+            </template>
           </el-table-column>
         </el-table>
       </section>
@@ -142,7 +195,7 @@ onMounted(async () => {
             />
           </div>
         </div>
-        <EvidenceList v-show="!evidenceTableCollapsed" :items="filteredEvidence" />
+        <EvidenceList v-show="!evidenceTableCollapsed" :items="filteredEvidence" :highlight-id="listHighlightId" />
       </div>
     </section>
   </main>
@@ -224,6 +277,23 @@ onMounted(async () => {
   width: 28px;
   height: 28px;
   padding: 0;
+}
+
+.evidence-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.evidence-tag-link {
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.evidence-tag-link:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+  filter: brightness(0.95);
 }
 
 h1,

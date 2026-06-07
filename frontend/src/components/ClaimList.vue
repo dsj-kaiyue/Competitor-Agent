@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { RouterLink } from 'vue-router'
 import type { ClaimItem } from '@/types/claim'
 
 defineProps<{ items: ClaimItem[] }>()
@@ -19,8 +20,43 @@ defineProps<{ items: ClaimItem[] }>()
     <el-table-column label="风险" width="90">
       <template #default="{ row }">{{ row.risk_level || '-' }}</template>
     </el-table-column>
-    <el-table-column label="证据" width="160">
-      <template #default="{ row }">#{{ row.evidence_ids.join(', #') }}</template>
+    <el-table-column label="证据" min-width="160">
+      <template #default="{ row }">
+        <span v-if="!row.evidence_ids?.length">-</span>
+        <div v-else class="evidence-tags">
+          <RouterLink
+            v-for="id in row.evidence_ids"
+            :key="id"
+            :to="`/tasks/${row.task_id}/evidence?evidence=${id}`"
+            class="evidence-tag-wrapper"
+          >
+            <el-tag class="evidence-tag-link">#{{ id }}</el-tag>
+          </RouterLink>
+        </div>
+      </template>
     </el-table-column>
   </el-table>
 </template>
+
+<style scoped>
+.evidence-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.evidence-tag-wrapper {
+  text-decoration: none;
+}
+
+.evidence-tag-link {
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.evidence-tag-link:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+  filter: brightness(0.95);
+}
+</style>

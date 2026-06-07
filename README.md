@@ -372,3 +372,14 @@ npm run dev
 - 重试任务会清理旧报告、证据、Claim、QA 和 Agent QA 状态。
 - 数据库结构变更必须新增 Alembic migration。
 - 前端类型应与后端 Pydantic schema 保持同步。
+
+## 📈 Star History
+
+<a href="https://star-history.com/#dsj-kaiyue/Competitor-Agent&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=dsj-kaiyue/Competitor-Agent&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=dsj-kaiyue/Competitor-Agent&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=dsj-kaiyue/Competitor-Agent&type=Date" />
+  </picture>
+</a>
+

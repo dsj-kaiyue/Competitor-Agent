@@ -62,7 +62,7 @@ const metricCards = computed(() => {
       </div>
       <div class="metrics-columns">
         <div>
-          <h3>来源分布</h3>
+          <h3>证据来源分布</h3>
           <el-table :data="Object.entries(metrics.source_diversity).map(([type, count]) => ({ type, count }))" size="small">
             <el-table-column prop="type" label="来源" />
             <el-table-column prop="count" label="数量" width="90" />

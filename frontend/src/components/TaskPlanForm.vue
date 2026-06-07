@@ -34,18 +34,6 @@ function removeDimension(index: number) {
         </el-form-item>
       </el-col>
     </el-row>
-    <el-row :gutter="16">
-      <el-col :span="12">
-        <el-form-item label="报告深度">
-          <el-segmented v-model="model.report_depth" :options="['simple', 'standard', 'deep']" />
-        </el-form-item>
-      </el-col>
-      <el-col :span="12">
-        <el-form-item label="输出语言">
-          <el-input v-model="model.output_language" />
-        </el-form-item>
-      </el-col>
-    </el-row>
     <el-form-item label="竞品列表">
       <div class="chip-editor">
         <div v-for="(_, index) in model.competitors" :key="index" class="chip-row">
@@ -63,16 +51,6 @@ function removeDimension(index: number) {
         </div>
         <el-button class="add-button" @click="addDimension">添加</el-button>
       </div>
-    </el-form-item>
-    <el-form-item label="数据来源">
-      <el-checkbox-group v-model="model.data_sources">
-        <el-checkbox-button label="official_website" />
-        <el-checkbox-button label="pricing_page" />
-        <el-checkbox-button label="docs" />
-        <el-checkbox-button label="blog" />
-        <el-checkbox-button label="news" />
-        <el-checkbox-button label="reviews" />
-      </el-checkbox-group>
     </el-form-item>
   </el-form>
 </template>

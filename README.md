@@ -158,6 +158,8 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 │   │   ├── types/
 │   │   └── views/
 │   └── package.json
+├── docker-compose.yml
+├── DEPLOY_DOCKER.md             # Docker Compose 生产部署说明
 └── README.md
 ```
 
@@ -265,6 +267,132 @@ CELERY_WORKER_HEARTBEAT_INTERVAL_SECONDS=10
 CELERY_VISIBILITY_TIMEOUT_SECONDS=120
 CELERY_QUEUED_RECOVERY_MAX_AGE_SECONDS=1800
 ```
+
+## 🐳 Docker Compose 部署
+
+项目已支持使用 Docker Compose 在单台 Linux 服务器上一键部署。当前线上 Demo 已通过 Docker 方式部署在：
+
+- 在线地址：`http://43.143.122.92/`
+
+Compose 会启动前端 Nginx、FastAPI API、Celery Worker、MySQL、Redis、Milvus standalone、etcd 和 MinIO，并通过一次性 `migrate` 服务自动执行 Alembic 数据库迁移。服务器只需要提前安装 Docker Engine 和 Docker Compose v2。
+
+### 1. 准备服务器环境
+
+```bash
+docker version
+docker compose version
+```
+
+如果当前用户没有 Docker 权限，后续命令可加 `sudo`。
+
+### 2. 拉取项目代码
+
+```bash
+git clone <your-repo-url> Competitor-Agent
+cd Competitor-Agent
+```
+
+如果不是通过 Git 上传，请确保服务器项目根目录至少包含：
+
+```text
+docker-compose.yml
+.env.docker.example
+backend/Dockerfile
+frontend/Dockerfile
+frontend/nginx.conf
+milvus/user.yaml
+```
+
+### 3. 配置生产环境变量
+
+```bash
+cp .env.docker.example .env.docker
+nano .env.docker
+```
+
+至少需要修改：
+
+```env
+AUTH_SECRET_KEY=换成足够长的随机密钥
+MYSQL_ROOT_PASSWORD=换成强密码
+MYSQL_PASSWORD=换成强密码
+DATABASE_URL=mysql+pymysql://competitor_agent:这里要和MYSQL_PASSWORD一致@mysql:3306/competitor_agent?charset=utf8mb4
+
+FIRECRAWL_API_KEY=你的Firecrawl Key
+
+LLM_BASE_URL=你的LLM接口地址
+LLM_API_KEY=你的LLM Key
+LLM_MODEL=你的LLM模型名
+
+EMBEDDING_BASE_URL=你的Embedding接口地址
+EMBEDDING_API_KEY=你的Embedding Key
+EMBEDDING_MODEL=你的Embedding模型名
+EMBEDDING_DIM=你的Embedding维度
+```
+
+默认会使用 Compose 内置 Milvus：
+
+```env
+MILVUS_URI=http://milvus:19530
+MILVUS_TOKEN=root:Milvus
+MILVUS_COLLECTION=evidence_chunks
+WEB_PORT=80
+```
+
+`.env.docker` 包含真实密钥和密码，不要提交到 Git 仓库。
+
+### 4. 构建并启动
+
+```bash
+docker compose --env-file .env.docker up -d --build
+```
+
+启动完成后访问：
+
+```text
+http://服务器IP/
+```
+
+健康检查地址：
+
+```text
+http://服务器IP/health
+```
+
+### 5. 验证和常用命令
+
+查看容器状态：
+
+```bash
+docker compose --env-file .env.docker ps
+```
+
+查看日志：
+
+```bash
+docker compose --env-file .env.docker logs -f api worker frontend
+```
+
+手动执行迁移：
+
+```bash
+docker compose --env-file .env.docker run --rm migrate
+```
+
+更新代码后重新构建：
+
+```bash
+git pull
+docker compose --env-file .env.docker up -d --build
+```
+
+停止服务但保留数据卷：
+
+```bash
+docker compose --env-file .env.docker down
+```
+
+更完整的端口说明、Milvus 配置、数据持久化、端口冲突和故障排查见 [DEPLOY_DOCKER.md](DEPLOY_DOCKER.md)。
 
 ## ▶️ 本地启动
 
@@ -382,4 +510,3 @@ npm run dev
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=dsj-kaiyue/Competitor-Agent&type=Date" />
   </picture>
 </a>
-

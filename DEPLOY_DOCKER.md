@@ -71,20 +71,8 @@ MySQL 和 Redis 没有映射宿主机端口，因此不会和服务器上已有�
 将项目代码上传到服务器，例如：
 
 ```bash
-cd /home/ubuntu/code
-git clone <your-repo-url> Competitor-Agent
+git clone https://github.com/dsj-kaiyue/Competitor-Agent.git
 cd Competitor-Agent
-```
-
-如果不是通过 Git 上传，也需要确保服务器项目根目录包含以下文件：
-
-```text
-docker-compose.yml
-.env.docker.example
-backend/Dockerfile
-frontend/Dockerfile
-frontend/nginx.conf
-milvus/user.yaml
 ```
 
 ## 5. 配置环境变量
@@ -342,11 +330,6 @@ Compose 使用 Docker named volumes 保存数据：
 
 只要不执行 `docker compose down -v` 或手动删除 Docker volume，重启容器不会丢失数据。
 
-建议定期备份：
-
-- MySQL 数据库
-- Milvus 相关数据卷
-- `.env.docker`
 
 ## 11. 从 Windows 本机 MySQL 迁移数据
 

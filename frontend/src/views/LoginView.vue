@@ -9,29 +9,34 @@ const router = useRouter()
 const auth = useAuthStore()
 const loading = ref(false)
 const mode = ref<'login' | 'register'>('login')
+const registrationPausedMessage = '感谢关注！由于当前 Token 额度有限，暂时关闭新用户注册。考核老师可使用管理员账号或测试账号登录体验，感谢理解。'
 const form = reactive({
   username: '',
   password: '',
   confirmPassword: '',
 })
 
+function showRegistrationPausedMessage() {
+  ElMessage({
+    message: registrationPausedMessage,
+    type: 'warning',
+    customClass: 'registration-paused-message',
+  })
+}
+
 async function submit() {
-  if (mode.value === 'register' && form.password !== form.confirmPassword) {
-    ElMessage.warning('两次输入的密码不一致')
+  if (mode.value === 'register') {
+    showRegistrationPausedMessage()
     return
   }
   loading.value = true
   try {
-    if (mode.value === 'register') {
-      await auth.register(form.username, form.password)
-    } else {
-      await auth.login(form.username, form.password)
-    }
+    await auth.login(form.username, form.password)
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     await router.replace(redirect)
   } catch (error) {
     console.error(error)
-    ElMessage.error(mode.value === 'register' ? '注册失败，用户名可能已被使用' : '用户名或密码错误')
+    ElMessage.error('用户名或密码错误')
   } finally {
     loading.value = false
   }
@@ -39,6 +44,9 @@ async function submit() {
 
 function switchMode(nextMode: 'login' | 'register') {
   mode.value = nextMode
+  if (nextMode === 'register') {
+    showRegistrationPausedMessage()
+  }
   form.username = ''
   form.password = ''
   form.confirmPassword = ''
@@ -191,5 +199,18 @@ h2 {
   .hero-copy p:last-child {
     font-size: 19px;
   }
+}
+</style>
+
+<style>
+.registration-paused-message {
+  --el-message-bg-color: #fff4d8;
+  --el-message-border-color: #f1c36d;
+  --el-message-text-color: #8a5a12;
+  box-shadow: 0 10px 30px rgb(138 90 18 / 10%);
+}
+
+.registration-paused-message .el-message__icon {
+  color: #b7791f;
 }
 </style>

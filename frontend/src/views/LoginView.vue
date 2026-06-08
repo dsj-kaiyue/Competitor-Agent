@@ -10,8 +10,8 @@ const auth = useAuthStore()
 const loading = ref(false)
 const mode = ref<'login' | 'register'>('login')
 const form = reactive({
-  username: 'Admin',
-  password: 'Admin',
+  username: '',
+  password: '',
   confirmPassword: '',
 })
 
@@ -39,15 +39,9 @@ async function submit() {
 
 function switchMode(nextMode: 'login' | 'register') {
   mode.value = nextMode
-  if (nextMode === 'register') {
-    form.username = ''
-    form.password = ''
-    form.confirmPassword = ''
-  } else {
-    form.username = 'Admin'
-    form.password = 'Admin'
-    form.confirmPassword = ''
-  }
+  form.username = ''
+  form.password = ''
+  form.confirmPassword = ''
 }
 </script>
 

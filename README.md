@@ -133,6 +133,29 @@ QA Agent 会对本轮检查范围内的每个动态维度输出 `dimension_score
 
 `QA_MAX_REVISION_ROUNDS` 控制自动返工上限。达到上限后，系统仍会进入 Report Finalizer，但最终报告会保留 QA 残留问题和质量摘要。
 
+### Reflection 设计范式实现
+
+当前系统的 QA 返工机制可以视为一种面向多 Agent 工作流的 Reflection 设计范式：系统不是一次性生成报告后直接结束，而是由 QA Agent 对中间产物和最终正文进行自我复核，把发现的问题结构化保存，再把这些反馈注入下一轮 Agent 执行上下文中，形成“生成 -> 反思 -> 修正 -> 再复核”的闭环。
+
+对应实现：
+
+| Reflection 环节 | 系统实现 | 关键数据 |
+| --- | --- | --- |
+| 初始生成 | Collector、Evidence Extractor、动态维度 Agent、Report Writer 生成证据、Claim 和报告正文 | `source_document`、`evidence_chunk`、`claim`、`report` |
+| 反思评估 | QA Agent 检查报告和 Claim 是否存在证据不足、逻辑缺口、维度遗漏、写作问题等 | `qa_result.issues_json`、`dimension_scores` |
+| 生成修正计划 | QA 根据问题给出 `suggested_action`，并定位需要返工的动态维度节点 | `next_action`、`target_nodes`、`revision_plan` |
+| 反馈注入 | 返工节点读取 QA issue、返工轮次、目标维度和补充检索 query，作为下一轮提示词或检索条件 | `qa_issues`、`qa_followup_queries`、`revision_reason` |
+| 局部修正 | 只对失败维度执行补采、重分析或局部重写，避免全量重跑造成成本浪费 | `recollect_nodes`、`reanalyze_nodes`、`rewrite_nodes` |
+| 再次复核 | partial QA 只检查本轮返工目标维度，更新对应维度 Agent 的 QA 状态 | `agent_node.qa_passed`、`qa_score`、`qa_revision_round` |
+
+三类返工动作并不是简单重复执行，而是会根据 QA 反馈改进后续 Agent 的上下文：
+
+- `recollect`：QA issue 可以携带 `search_query`。返工时 Collector 进入 `recollect` 模式，优先使用 QA 给出的补充检索词重新搜索和抓取资料；如果没有采到新增资料，系统会继续使用已有证据并要求后续分析降低确定性，避免编造结论。
+- `reanalyze`：目标动态维度 Agent 会收到本轮 QA 返工上下文，包括返工轮次、建议动作、问题类型、严重级别、问题描述、相关 Claim 和补充检索建议。提示词会明确要求修复上一轮的问题，重新生成更可被证据支撑的 Claim。
+- `rewrite`：Report Writer 会进入 `partial_revision` 模式，只重写被 QA 标记的目标维度 section。它会读取上一版目标 section、目标维度 Claims、全部 Claims 和 `revision_reason`，要求只修改目标维度，不改动其它已通过内容。
+
+因此，本项目中的 Reflection 不是单 Agent 内部的自由反思文本，而是被工程化为可持久化、可路由、可观测的多 Agent 反馈控制机制：QA 输出结构化问题和动作，Workflow Graph 根据这些结构化结果决定下一跳，并把反馈显式写入补采、重分析和重写节点的输入。
+
 ## 📁 项目结构
 
 ```text
